@@ -3,8 +3,15 @@ jdk:
 before_install:
   - sdk install maven 3.9.9
   - sdk use maven 3.9.9
-  - curl -fsSL https://unofficial-builds.nodejs.org/download/release/v18.20.8/node-v18.20.8-linux-x64-glibc-217.tar.gz -o /tmp/node-v18.tar.gz
-  - mkdir -p /tmp/node18 && tar xzf /tmp/node-v18.tar.gz -C /tmp/node18 --strip-components=1
-  - sed -i 's|<npmVersion>10.9.2</npmVersion>|<npmVersion>10.9.2</npmVersion>\n  <nodeExecutable>/tmp/node18/bin/node</nodeExecutable>\n  <npmExecutable>/tmp/node18/bin/npm</npmExecutable>|' agentscope-examples/agents/agentscope-builder/pom.xml
+  - curl -fsSL https://unofficial-builds.nodejs.org/download/release/v18.20.8/node-v18.20.8-linux-x64-glibc-217.tar.gz -o /tmp/node18.tar.gz
+  - mkdir -p /tmp/node18 && tar xzf /tmp/node18.tar.gz -C /tmp/node18 --strip-components=1
+  - mkdir -p /tmp/fake-v20/node-v20.19.2-linux-x64/bin
+  - cp /tmp/node18/bin/node /tmp/fake-v20/node-v20.19.2-linux-x64/bin/
+  - cp -r /tmp/node18/lib/node_modules/npm /tmp/fake-v20/node-v20.19.2-linux-x64/lib/node_modules/
+  - ln -sf ../lib/node_modules/npm/bin/npm-cli.js /tmp/fake-v20/node-v20.19.2-linux-x64/bin/npm
+  - ln -sf ../lib/node_modules/npm/bin/npx-cli.js /tmp/fake-v20/node-v20.19.2-linux-x64/bin/npx
+  - cd /tmp/fake-v20 && tar czf /tmp/node-v20.19.2-linux-x64.tar.gz node-v20.19.2-linux-x64
+  - mkdir -p ~/.m2/repository/com/github/eirslett/node/20.19.2/
+  - cp -f /tmp/node-v20.19.2-linux-x64.tar.gz ~/.m2/repository/com/github/eirslett/node/20.19.2/
 install:
   - mvn clean install -DskipTests -Dspotless.check.skip=true -Drevision=$VERSION
