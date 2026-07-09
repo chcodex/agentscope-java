@@ -42,10 +42,7 @@ import org.slf4j.LoggerFactory;
  * deleting skills on the file system. It is designed to be shared by multiple
  * repositories such as file system and Git based repositories.
  *
- * @deprecated since 2.0.0. The skill package is removed; manage markdown skill catalogs in
- *     application code.
  */
-@Deprecated(since = "2.0.0")
 public final class SkillFileSystemHelper {
 
     private static final Logger logger = LoggerFactory.getLogger(SkillFileSystemHelper.class);
@@ -240,25 +237,63 @@ public final class SkillFileSystemHelper {
         try {
             for (AgentSkill skill : skills) {
                 String skillName = skill.getName();
-                Path skillDir = validateAndResolvePath(baseDir, skillName);
-
-                if (Files.exists(skillDir)) {
-                    if (!force) {
-                        logger.info(
-                                "Skill directory already exists and force=false: {}", skillName);
-                        continue; // Skip to the next skill if force=false
-                    } else {
-                        logger.info("Overwriting existing skill directory: {}", skillName);
-                        deleteDirectory(skillDir);
+                Path skillDir;
+                Path skillFile;
+                // Root-level skill: baseDir itself contains SKILL.md
+                if (hasSkillFile(baseDir)) {
+                    if (skills.size() > 1) {
+                        throw new IllegalArgumentException(
+                                "Root-level skill repository can only contain one skill, but got: "
+                                        + skills.size());
                     }
+                    skillDir = baseDir.toAbsolutePath().normalize();
+                    skillFile = skillDir.resolve(SKILL_FILE_NAME);
+                    if (Files.exists(skillFile)) {
+                        if (!force) {
+                            logger.info("Root skill already exists and force=false: {}", skillName);
+                            continue;
+                        } else {
+                            logger.info("Overwriting existing root skill: {}", skillName);
+                            // Delete all contents except baseDir itself
+                            try (Stream<Path> paths = Files.walk(skillDir)) {
+                                paths.sorted(Comparator.reverseOrder())
+                                        .filter(path -> !path.equals(skillDir))
+                                        .forEach(
+                                                path -> {
+                                                    try {
+                                                        Files.delete(path);
+                                                    } catch (IOException e) {
+                                                        throw new RuntimeException(
+                                                                "Failed to delete: " + path, e);
+                                                    }
+                                                });
+                            } catch (IOException e) {
+                                throw new RuntimeException(
+                                        "Failed to clean root skill directory", e);
+                            }
+                        }
+                    }
+                } else {
+                    // Subdirectory skill: create a new subdirectory
+                    skillDir = validateAndResolvePath(baseDir, skillName);
+                    if (Files.exists(skillDir)) {
+                        if (!force) {
+                            logger.info(
+                                    "Skill directory already exists and force=false: {}",
+                                    skillName);
+                            continue; // Skip to the next skill if force=false
+                        } else {
+                            logger.info("Overwriting existing skill directory: {}", skillName);
+                            deleteDirectory(skillDir);
+                        }
+                    }
+                    Files.createDirectories(skillDir);
+                    skillFile = skillDir.resolve(SKILL_FILE_NAME);
                 }
-
-                Files.createDirectories(skillDir);
 
                 String skillMdContent =
                         MarkdownSkillParser.generate(skill.getMetadata(), skill.getSkillContent());
 
-                Path skillFile = skillDir.resolve(SKILL_FILE_NAME);
                 Files.writeString(skillFile, skillMdContent, StandardCharsets.UTF_8);
 
                 Map<String, String> resources = skill.getResources();
@@ -266,12 +301,14 @@ public final class SkillFileSystemHelper {
                     Path resourceFile = skillDir.resolve(entry.getKey());
                     Files.createDirectories(resourceFile.getParent());
                     String content = entry.getValue();
-                    if (content != null && content.startsWith("base64:")) {
-                        String base64 = content.substring("base64:".length());
-                        byte[] bytes = Base64.getDecoder().decode(base64);
-                        Files.write(resourceFile, bytes);
-                    } else {
-                        Files.writeString(resourceFile, content, StandardCharsets.UTF_8);
+                    if (content != null) {
+                        if (content.startsWith("base64:")) {
+                            String base64 = content.substring("base64:".length());
+                            byte[] bytes = Base64.getDecoder().decode(base64);
+                            Files.write(resourceFile, bytes);
+                        } else {
+                            Files.writeString(resourceFile, content, StandardCharsets.UTF_8);
+                        }
                     }
                 }
 
@@ -304,8 +341,16 @@ public final class SkillFileSystemHelper {
             return false;
         }
 
+        Path dirToDelete = skillDir.get().toAbsolutePath().normalize();
+        Path absoluteBaseDir = baseDir.toAbsolutePath().normalize();
+
         try {
-            deleteDirectory(skillDir.get());
+            if (dirToDelete.equals(absoluteBaseDir)) {
+                // Root-level skill: only remove SKILL.md, keep other files intact
+                Files.deleteIfExists(dirToDelete.resolve(SKILL_FILE_NAME));
+            } else {
+                deleteDirectory(dirToDelete);
+            }
             logger.info("Successfully deleted skill: {}", skillName);
             return true;
         } catch (IOException e) {

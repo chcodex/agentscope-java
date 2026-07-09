@@ -562,6 +562,24 @@ class SkillFileSystemHelperTest {
     }
 
     @Test
+    @DisplayName("Should only delete SKILL.md for root-level skill, keep other files")
+    void testDeleteSkill_RootLevelSkill() throws IOException {
+        Path rootSkillDir = tempDir.resolve("root-skill-delete");
+        Files.createDirectories(rootSkillDir);
+        Files.writeString(
+                rootSkillDir.resolve("SKILL.md"),
+                "---\nname: root-del-skill\ndescription: Root Delete\n---\nContent",
+                StandardCharsets.UTF_8);
+        Files.writeString(rootSkillDir.resolve("extra.txt"), "important data");
+
+        assertTrue(SkillFileSystemHelper.deleteSkill(rootSkillDir, "root-del-skill"));
+        assertFalse(Files.exists(rootSkillDir.resolve("SKILL.md")));
+        assertTrue(Files.exists(rootSkillDir.resolve("extra.txt")));
+        assertTrue(Files.exists(rootSkillDir));
+        assertFalse(SkillFileSystemHelper.skillExists(rootSkillDir, "root-del-skill"));
+    }
+
+    @Test
     @DisplayName("Should throw when root skill name does not match requested name")
     void testLoadSkill_RootLevelSkillNameMismatch() throws IOException {
         Path rootSkillDir = tempDir.resolve("root-skill-dir5");
@@ -574,6 +592,144 @@ class SkillFileSystemHelperTest {
         assertThrows(
                 IllegalArgumentException.class,
                 () -> SkillFileSystemHelper.loadSkill(rootSkillDir, "wrong-name", "source"));
+    }
+
+    @Test
+    @DisplayName("Should overwrite root skill directly in baseDir without creating subdirectory")
+    void testSaveSkills_RootLevel_Overwrite() throws IOException {
+        Path rootSkillDir = tempDir.resolve("root-skills-save-1");
+        Files.createDirectories(rootSkillDir);
+        Files.writeString(
+                rootSkillDir.resolve("SKILL.md"),
+                "---\nname: root-save-skill\ndescription: Root Save\n---\nContent",
+                StandardCharsets.UTF_8);
+
+        AgentSkill updated =
+                new AgentSkill("root-save-skill", "Updated Root", "Updated content", null);
+        boolean result = SkillFileSystemHelper.saveSkills(rootSkillDir, List.of(updated), true);
+        assertTrue(result);
+
+        // Should have overwritten baseDir/SKILL.md, not created subdirectory
+        assertTrue(Files.exists(rootSkillDir.resolve("SKILL.md")));
+        assertFalse(Files.exists(rootSkillDir.resolve("root-save-skill")));
+
+        String savedContent =
+                Files.readString(rootSkillDir.resolve("SKILL.md"), StandardCharsets.UTF_8);
+        assertTrue(savedContent.contains("Updated content"));
+    }
+
+    @Test
+    @DisplayName("Should skip saving root skill when force=false and SKILL.md exists")
+    void testSaveSkills_RootLevel_ForceDisabled() throws IOException {
+        Path rootSkillDir = tempDir.resolve("root-skills-save-2");
+        Files.createDirectories(rootSkillDir);
+        Files.writeString(
+                rootSkillDir.resolve("SKILL.md"),
+                "---\nname: root-save-skill2\ndescription: Original\n---\nOriginal content",
+                StandardCharsets.UTF_8);
+
+        AgentSkill updated = new AgentSkill("root-save-skill2", "Updated", "Updated content", null);
+        boolean result = SkillFileSystemHelper.saveSkills(rootSkillDir, List.of(updated), false);
+        assertFalse(result);
+
+        String savedContent =
+                Files.readString(rootSkillDir.resolve("SKILL.md"), StandardCharsets.UTF_8);
+        assertTrue(savedContent.contains("Original content"));
+    }
+
+    @Test
+    @DisplayName("Should overwrite root skill when force=true")
+    void testSaveSkills_RootLevel_ForceEnabled() throws IOException {
+        Path rootSkillDir = tempDir.resolve("root-skills-save-3");
+        Files.createDirectories(rootSkillDir);
+        Files.writeString(
+                rootSkillDir.resolve("SKILL.md"),
+                "---\nname: root-save-skill3\ndescription: Original\n---\nOriginal",
+                StandardCharsets.UTF_8);
+
+        AgentSkill updated =
+                new AgentSkill("root-save-skill3", "Overwritten", "Overwritten content", null);
+        boolean result = SkillFileSystemHelper.saveSkills(rootSkillDir, List.of(updated), true);
+        assertTrue(result);
+
+        String savedContent =
+                Files.readString(rootSkillDir.resolve("SKILL.md"), StandardCharsets.UTF_8);
+        assertTrue(savedContent.contains("Overwritten content"));
+    }
+
+    @Test
+    @DisplayName("Should save root skill with resources to baseDir directly")
+    void testSaveSkills_RootLevel_WithResources() throws IOException {
+        Path rootSkillDir = tempDir.resolve("root-skills-save-4");
+        Files.createDirectories(rootSkillDir);
+        Files.writeString(
+                rootSkillDir.resolve("SKILL.md"),
+                "---\nname: root-save-skill4\ndescription: Root With Resources\n---\nContent",
+                StandardCharsets.UTF_8);
+
+        Map<String, String> resources = Map.of("references/guide.md", "# Guide");
+        AgentSkill skill =
+                new AgentSkill("root-save-skill4", "Root With Resources", "Content", resources);
+        boolean result = SkillFileSystemHelper.saveSkills(rootSkillDir, List.of(skill), true);
+        assertTrue(result);
+
+        assertTrue(Files.exists(rootSkillDir.resolve("references/guide.md")));
+        assertEquals(
+                "# Guide",
+                Files.readString(
+                        rootSkillDir.resolve("references/guide.md"), StandardCharsets.UTF_8));
+    }
+
+    @Test
+    @DisplayName("Should clear old resources when force=true for root skill")
+    void testSaveSkills_RootLevel_ForceEnabled_ClearsOldResources() throws IOException {
+        Path rootSkillDir = tempDir.resolve("root-skills-save-5");
+        Files.createDirectories(rootSkillDir);
+        Files.writeString(
+                rootSkillDir.resolve("SKILL.md"),
+                "---\nname: root-save-skill5\ndescription: Old\n---\nOld content",
+                StandardCharsets.UTF_8);
+        // Old resource that should be deleted
+        Files.createDirectories(rootSkillDir.resolve("references"));
+        Files.writeString(rootSkillDir.resolve("references/old-doc.md"), "old doc");
+
+        Map<String, String> resources = Map.of("references/readme.md", "# New Readme");
+        AgentSkill skill = new AgentSkill("root-save-skill5", "Updated", "New content", resources);
+        boolean result = SkillFileSystemHelper.saveSkills(rootSkillDir, List.of(skill), true);
+        assertTrue(result);
+
+        // Old files should be gone
+        assertFalse(Files.exists(rootSkillDir.resolve("references/old-doc.md")));
+        // New files should be present
+        assertTrue(Files.exists(rootSkillDir.resolve("references/readme.md")));
+        // Updated SKILL.md content
+        String savedContent =
+                Files.readString(rootSkillDir.resolve("SKILL.md"), StandardCharsets.UTF_8);
+        assertTrue(savedContent.contains("New content"));
+        // baseDir should still exist
+        assertTrue(Files.exists(rootSkillDir));
+    }
+
+    @Test
+    @DisplayName("Should throw when saving multiple skills to root-level repository")
+    void testSaveSkills_RootLevel_MultipleSkillsThrows() throws IOException {
+        Path rootSkillDir = tempDir.resolve("root-skills-multi");
+        Files.createDirectories(rootSkillDir);
+        Files.writeString(
+                rootSkillDir.resolve("SKILL.md"),
+                "---\nname: root-multi\ndescription: Root Multi\n---\nContent",
+                StandardCharsets.UTF_8);
+
+        AgentSkill skill1 = new AgentSkill("root-multi", "Desc1", "Content1", null);
+        AgentSkill skill2 = new AgentSkill("root-multi", "Desc2", "Content2", null);
+
+        IllegalArgumentException ex =
+                assertThrows(
+                        IllegalArgumentException.class,
+                        () ->
+                                SkillFileSystemHelper.saveSkills(
+                                        rootSkillDir, List.of(skill1, skill2), true));
+        assertTrue(ex.getMessage().contains("only contain one skill"));
     }
 
     private void createSampleSkill(String name, String description, String content)
