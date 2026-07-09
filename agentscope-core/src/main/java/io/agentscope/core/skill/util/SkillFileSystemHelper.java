@@ -237,11 +237,15 @@ public final class SkillFileSystemHelper {
         try {
             for (AgentSkill skill : skills) {
                 String skillName = skill.getName();
-
                 Path skillDir;
                 Path skillFile;
                 // Root-level skill: baseDir itself contains SKILL.md
                 if (hasSkillFile(baseDir)) {
+                    if (skills.size() > 1) {
+                        throw new IllegalArgumentException(
+                                "Root-level skill repository can only contain one skill, but got: "
+                                        + skills.size());
+                    }
                     skillDir = baseDir.toAbsolutePath().normalize();
                     skillFile = skillDir.resolve(SKILL_FILE_NAME);
                     if (Files.exists(skillFile)) {

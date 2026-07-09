@@ -710,6 +710,28 @@ class SkillFileSystemHelperTest {
         assertTrue(Files.exists(rootSkillDir));
     }
 
+    @Test
+    @DisplayName("Should throw when saving multiple skills to root-level repository")
+    void testSaveSkills_RootLevel_MultipleSkillsThrows() throws IOException {
+        Path rootSkillDir = tempDir.resolve("root-skills-multi");
+        Files.createDirectories(rootSkillDir);
+        Files.writeString(
+                rootSkillDir.resolve("SKILL.md"),
+                "---\nname: root-multi\ndescription: Root Multi\n---\nContent",
+                StandardCharsets.UTF_8);
+
+        AgentSkill skill1 = new AgentSkill("root-multi", "Desc1", "Content1", null);
+        AgentSkill skill2 = new AgentSkill("root-multi", "Desc2", "Content2", null);
+
+        IllegalArgumentException ex =
+                assertThrows(
+                        IllegalArgumentException.class,
+                        () ->
+                                SkillFileSystemHelper.saveSkills(
+                                        rootSkillDir, List.of(skill1, skill2), true));
+        assertTrue(ex.getMessage().contains("only contain one skill"));
+    }
+
     private void createSampleSkill(String name, String description, String content)
             throws IOException {
         Path skillDir = skillsBaseDir.resolve(name);
