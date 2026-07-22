@@ -125,4 +125,9 @@ public class E2bFilesystemSpec extends SandboxFilesystemSpec {
     protected WorkspaceSpec workspaceSpec() {
         return defaultWorkspaceSpec;
     }
+
+    @Override
+    public E2bSandboxFilesystem createFilesystem() {
+        return new E2bSandboxFilesystem();
+    }
 }
