@@ -210,6 +210,7 @@ class E2bEnvdProcessClientTest {
                 .setField(startResponseDesc.findFieldByName("event"), event)
                 .build();
     }
+
     // Connect protocol: final envelope (flags bit 1) is EndStreamMessage JSON.
     // Python SDK ServerStreamParser: if "error" in data → raise make_error(data["error"])
     // https://connectrpc.com/docs/protocol/#error-end-stream
@@ -590,6 +591,7 @@ class E2bEnvdProcessClientTest {
         assertEquals(SandboxErrorCode.WORKSPACE_ARCHIVE_READ_ERROR, ex.getErrorCode());
         assertTrue(ex.getMessage().contains("404"));
     }
+
     private static int drainStartStream(
             E2bEnvdProcessClient client,
             byte[] connectFrame,
@@ -641,18 +643,6 @@ class E2bEnvdProcessClientTest {
 
     private static byte[] connectFrame(byte[] payload) {
         return envelope(0x00, payload);
-    }
-
-    private static byte[] endStreamFrame(String json) {
-        return envelope(0x02, json.getBytes(StandardCharsets.UTF_8));
-    }
-
-    private static byte[] concatFrames(byte[]... frames) {
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        for (byte[] frame : frames) {
-            out.writeBytes(frame);
-        }
-        return out.toByteArray();
     }
 
     private static byte[] connectFrames(String... jsons) {
