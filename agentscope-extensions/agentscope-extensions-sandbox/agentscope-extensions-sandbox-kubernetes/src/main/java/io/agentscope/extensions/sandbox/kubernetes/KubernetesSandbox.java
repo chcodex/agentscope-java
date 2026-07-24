@@ -241,7 +241,7 @@ public class KubernetesSandbox extends AbstractBaseSandbox implements SandboxFil
     }
 
     @Override
-    protected String getWorkspaceRoot() {
+    public String getWorkspaceRoot() {
         return k8sState.getWorkspaceRoot();
     }
 
