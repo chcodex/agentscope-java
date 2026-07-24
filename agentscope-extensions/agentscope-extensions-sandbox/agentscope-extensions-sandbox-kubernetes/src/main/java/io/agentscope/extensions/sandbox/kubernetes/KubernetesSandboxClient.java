@@ -76,6 +76,7 @@ public class KubernetesSandboxClient implements SandboxClient<KubernetesSandboxC
         state.setWorkspaceSpec(workspaceSpec);
         state.setNamespace(merged.getNamespace());
         state.setContainerName(merged.getContainerName());
+        state.setWorkspaceRoot(merged.getWorkspaceRoot());
         state.setImage(merged.getImage());
         state.setPodOwned(true);
         state.setWorkspaceRootReady(false);
@@ -152,6 +153,9 @@ public class KubernetesSandboxClient implements SandboxClient<KubernetesSandboxC
         if (callOptions.getContainerName() != null) {
             o.setContainerName(callOptions.getContainerName());
         }
+        if (callOptions.getWorkspaceRoot() != null) {
+            o.setWorkspaceRoot(callOptions.getWorkspaceRoot());
+        }
         if (callOptions.getServiceAccount() != null) {
             o.setServiceAccount(callOptions.getServiceAccount());
         }
@@ -177,6 +181,7 @@ public class KubernetesSandboxClient implements SandboxClient<KubernetesSandboxC
         o.setNamespace(src.getNamespace());
         o.setImage(src.getImage());
         o.setContainerName(src.getContainerName());
+        o.setWorkspaceRoot(src.getWorkspaceRoot());
         o.setServiceAccount(src.getServiceAccount());
         o.setNodeSelector(src.getNodeSelector());
         o.setPodLabels(src.getPodLabels());

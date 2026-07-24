@@ -30,6 +30,7 @@ public class KubernetesSandboxClientOptions extends SandboxClientOptions {
     private String namespace = "default";
     private String image = "ubuntu:22.04";
     private String containerName = "workspace";
+    private String workspaceRoot = "/workspace";
     private String serviceAccount;
     private Map<String, String> nodeSelector = new HashMap<>();
     private Map<String, String> podLabels = new HashMap<>();
@@ -88,6 +89,14 @@ public class KubernetesSandboxClientOptions extends SandboxClientOptions {
 
     public void setContainerName(String containerName) {
         this.containerName = containerName != null ? containerName : "workspace";
+    }
+
+    public String getWorkspaceRoot() {
+        return workspaceRoot;
+    }
+
+    public void setWorkspaceRoot(String workspaceRoot) {
+        this.workspaceRoot = workspaceRoot != null ? workspaceRoot : "/workspace";
     }
 
     public String getServiceAccount() {
