@@ -419,6 +419,23 @@ class BaseSandboxFilesystemTest {
             assertFalse(result.isSuccess());
             assertTrue(result.error().contains("appears"));
         }
+
+        @Test
+        void ls_nonExistentPath_shouldReturnFail() {
+            LocalShellSandboxFilesystem fs = new LocalShellSandboxFilesystem();
+            LsResult r = fs.ls(RT, "/this/path/does/not/exist/at/all");
+            assertFalse(r.isSuccess(), "ls on non-existent path should fail");
+        }
+
+        @Test
+        void ls_filePath_shouldReturnFail() throws IOException {
+            Path file = tmpDir.resolve("file.txt");
+            Files.writeString(file, "content");
+            LocalShellSandboxFilesystem fs = new LocalShellSandboxFilesystem();
+            LsResult r = fs.ls(RT, file.toAbsolutePath().toString());
+            assertFalse(r.isSuccess(), "ls on a file path should fail");
+        }
+        }
     }
 
     // ================================================================
@@ -479,7 +496,7 @@ class BaseSandboxFilesystemTest {
         public ExecuteResponse execute(
                 RuntimeContext runtimeContext, String command, Integer timeoutSeconds) {
             lastCommand = command;
-            if (command.startsWith("for f in ") && command.contains("stat -c")) {
+            if (command.startsWith("if [ ! -e ") && command.contains("stat -c")) {
                 return new ExecuteResponse(
                         "DIR:/workspace/docs\t1719300000\n"
                                 + "FILE:/workspace/readme.txt\t12\t1719300000\n",
