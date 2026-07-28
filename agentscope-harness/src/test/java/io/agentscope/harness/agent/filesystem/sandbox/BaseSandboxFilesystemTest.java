@@ -435,7 +435,6 @@ class BaseSandboxFilesystemTest {
             LsResult r = fs.ls(RT, file.toAbsolutePath().toString());
             assertFalse(r.isSuccess(), "ls on a file path should fail");
         }
-        }
     }
 
     // ================================================================

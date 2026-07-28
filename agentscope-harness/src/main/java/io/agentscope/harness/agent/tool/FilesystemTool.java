@@ -51,7 +51,31 @@ public class FilesystemTool {
     }
 
     private String norm(String path) {
-        return pathNormalizer != null ? pathNormalizer.normalize(path) : path;
+        if (pathNormalizer == null || path == null) {
+            return path;
+        }
+        // 绝对路径跳过归一化: 归一化会剥离工作区前缀使路径变为相对路径,
+        // 导致 LocalFilesystem.resolvePath() 中的 applyNamespacePrefix
+        // 重新注入命名空间前缀, 使最终路径多出 user/session 这一级而指向错误位置.
+        if (isAbsolutePath(path)) {
+            return path;
+        }
+        return pathNormalizer.normalize(path);
+    }
+
+    private static boolean isAbsolutePath(String path) {
+        if (path.startsWith("/")) {
+            return true;
+        }
+        // Windows absolute paths: "X:\" or "X:/"
+        if (path.length() >= 3
+                && Character.isLetter(path.charAt(0))
+                && path.charAt(1) == ':'
+                && (path.charAt(2) == '\\' || path.charAt(2) == '/')) {
+            return true;
+        }
+        // Windows UNC: "\\server\share"
+        return path.startsWith("\\\\");
     }
 
     @Tool(
