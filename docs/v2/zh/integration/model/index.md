@@ -4,6 +4,8 @@
 
 - [OpenAI](openai.md)
 - [DeepSeek](deepseek.md)
+- [GLM](glm.md)
+- [MiniMax](minimax.md)
 - [DashScope](dashscope.md)
 - [Gemini](gemini.md)
 - [Anthropic](anthropic.md)
