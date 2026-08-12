@@ -76,7 +76,7 @@ class WorkspaceContextMiddlewareSandboxPromptTest {
             String prompt = prompt(wm, true);
 
             assertNotNull(prompt);
-            assertTrue(prompt.contains("use the deliver_artifact tool"), () -> prompt);
+            assertTrue(prompt.contains("call deliver_artifact automatically"), () -> prompt);
             assertFalse(prompt.contains("upload/download tools"), () -> prompt);
         }
     }
