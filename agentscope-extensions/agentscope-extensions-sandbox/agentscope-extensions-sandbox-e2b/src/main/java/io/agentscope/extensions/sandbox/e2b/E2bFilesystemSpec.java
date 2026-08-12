@@ -106,6 +106,11 @@ public class E2bFilesystemSpec extends SandboxFilesystemSpec {
         return this;
     }
 
+    public E2bFilesystemSpec workspaceRoot(String workspaceRoot) {
+        defaultWorkspaceSpec.setRoot(workspaceRoot);
+        return this;
+    }
+
     public E2bFilesystemSpec workspaceSpec(WorkspaceSpec workspaceSpec) {
         this.defaultWorkspaceSpec = workspaceSpec;
         return this;
