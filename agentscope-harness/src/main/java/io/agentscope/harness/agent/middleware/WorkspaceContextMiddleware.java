@@ -168,12 +168,16 @@ public class WorkspaceContextMiddleware implements HarnessRuntimeMiddleware {
         this.additionalContextFiles = files != null ? files : List.of();
     }
 
-    /** Whether memory tools are disabled for this middleware (affects prompt guidance). */
+    /**
+     * Whether memory tools are disabled for this middleware (affects prompt guidance).
+     */
     public boolean isDisableMemoryTools() {
         return disableMemoryTools;
     }
 
-    /** Whether memory hooks are disabled for this middleware (affects prompt guidance). */
+    /**
+     * Whether memory hooks are disabled for this middleware (affects prompt guidance).
+     */
     public boolean isDisableMemoryHooks() {
         return disableMemoryHooks;
     }
@@ -367,9 +371,9 @@ public class WorkspaceContextMiddleware implements HarnessRuntimeMiddleware {
                             + " is not directly accessible");
             if (artifactDeliveryEnabled) {
                 sb.append(
-                        " — use the deliver_artifact tool to deliver files produced in this"
-                                + " workspace to their configured destination outside the"
-                                + " sandbox.\n");
+                        "Files are isolated inside this container. The host filesystem is not"
+                                + " directly accessible — see the File Isolation Notice below for"
+                                + " how to deliver files out of the sandbox.\n");
             } else {
                 sb.append(
                         " and there is no mechanism for moving files across the" + " boundary.\n");
@@ -410,6 +414,26 @@ public class WorkspaceContextMiddleware implements HarnessRuntimeMiddleware {
         sb.append(
                 "AGENTS.md defines persona and local conventions — honor them when consistent"
                         + " with safety and policy.\n");
+        if (artifactDeliveryEnabled
+                && fs instanceof AbstractSandboxFilesystem
+                && !(fs instanceof OverlayFilesystem)) {
+            sb.append(
+                    "**File Isolation Notice**\n"
+                            + "Files inside this container are isolated from the host filesystem"
+                            + " and are not directly accessible from outside. If your work"
+                            + " produces any final deliverables—such as documents, reports,"
+                            + " images, spreadsheets, archives, audio/video files, code"
+                            + " artifacts, or similar—you **must** use the deliver_artifact tool"
+                            + " to export them to their configured external destination.\n"
+                            + "\n"
+                            + "**Important Notes**:\n"
+                            + "- Only deliver the final output of your task. **Do not** deliver"
+                            + " temporary files, working copies, internal intermediate files, or"
+                            + " any sensitive information (e.g., credentials, keys, personal"
+                            + " data).\n"
+                            + "- Do not simply print the file path as a reference; the user"
+                            + " cannot access your container's filesystem directly.\n");
+        }
         return sb.toString();
     }
 
