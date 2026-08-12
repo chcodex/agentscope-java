@@ -131,6 +131,7 @@ public class WorkspaceContextMiddleware implements HarnessRuntimeMiddleware {
     private final boolean disableMemoryTools;
     private final boolean disableMemoryHooks;
     private List<String> additionalContextFiles = List.of();
+    private boolean artifactDeliveryEnabled = false;
 
     public WorkspaceContextMiddleware(WorkspaceManager workspaceManager) {
         this(workspaceManager, "HarnessAgent", null, DEFAULT_MAX_CONTEXT_TOKENS, false, false);
@@ -177,6 +178,16 @@ public class WorkspaceContextMiddleware implements HarnessRuntimeMiddleware {
         return disableMemoryHooks;
     }
 
+    /**
+     * Whether an {@link io.agentscope.harness.agent.artifact.ArtifactDeliveryTarget} is configured
+     * and the {@code deliver_artifact} tool is exposed. When {@code true}, the sandbox branch of the
+     * workspace paragraph tells the model to use that tool; when {@code false}, it states that files
+     * cannot leave the sandbox.
+     */
+    public void setArtifactDeliveryEnabled(boolean artifactDeliveryEnabled) {
+        this.artifactDeliveryEnabled = artifactDeliveryEnabled;
+    }
+
     @Override
     public Mono<String> onSystemPrompt(Agent agent, RuntimeContext ctx, String currentPrompt) {
         RuntimeContext rc = ctx != null ? ctx : RuntimeContext.empty();
@@ -215,7 +226,8 @@ public class WorkspaceContextMiddleware implements HarnessRuntimeMiddleware {
         }
 
         String workspaceParagraph =
-                buildWorkspaceParagraph(workspace, workspaceManager.getFilesystem(), rc);
+                buildWorkspaceParagraph(
+                        workspace, workspaceManager.getFilesystem(), rc, artifactDeliveryEnabled);
         String loadedContext =
                 buildLoadedContextSection(
                         agentsContent, memoryContent, knowledgeBlock, additionalBlock);
@@ -296,7 +308,10 @@ public class WorkspaceContextMiddleware implements HarnessRuntimeMiddleware {
      * </ul>
      */
     private static String buildWorkspaceParagraph(
-            Path workspace, AbstractFilesystem fs, RuntimeContext rc) {
+            Path workspace,
+            AbstractFilesystem fs,
+            RuntimeContext rc,
+            boolean artifactDeliveryEnabled) {
         StringBuilder sb = new StringBuilder("## Workspace\n");
         LocalFilesystemWithShell localUpper = detectLocalUpper(fs);
         Path project = localUpper != null ? localUpper.getShellCwd() : null;
@@ -349,10 +364,16 @@ public class WorkspaceContextMiddleware implements HarnessRuntimeMiddleware {
             sb.append(
                     "The harness-side workspace files (AGENTS.md, skills, knowledge,"
                             + " MEMORY.md) are projected into this sandbox. The host filesystem"
-                            + " is not directly accessible — use the"
-                            + " upload/download tools to move files across the boundary. Anything"
-                            + " you create here is isolated and does not persist on the host unless"
-                            + " explicitly synced.\n");
+                            + " is not directly accessible");
+            if (artifactDeliveryEnabled) {
+                sb.append(
+                        " — use the deliver_artifact tool to deliver files produced in this"
+                                + " workspace to their configured destination outside the"
+                                + " sandbox.\n");
+            } else {
+                sb.append(
+                        " and there is no mechanism for moving files across the" + " boundary.\n");
+            }
             appendHostPlatformInfo(
                     sb,
                     querySandbox(

@@ -63,7 +63,7 @@ class WorkspaceContextMiddlewareSandboxTest {
         assertNotNull(prompt);
         assertTrue(prompt.contains("Sandbox root: /custom/root"));
         assertTrue(prompt.contains("container id: sbox-1"));
-        assertTrue(prompt.contains("upload/download tools"));
+        assertTrue(prompt.contains("projected into this sandbox"));
         assertTrue(prompt.contains("AGENTS.md defines persona"));
     }
 
