@@ -25,6 +25,7 @@ import io.agentscope.harness.agent.coordination.PeriodicGate;
 import io.agentscope.harness.agent.filesystem.AbstractFilesystem;
 import io.agentscope.harness.agent.filesystem.model.FileInfo;
 import io.agentscope.harness.agent.filesystem.model.GlobResult;
+import io.agentscope.harness.agent.memory.MemoryBackgroundTasks;
 import io.agentscope.harness.agent.memory.MemoryConsolidator;
 import io.agentscope.harness.agent.workspace.WorkspaceConstants;
 import io.agentscope.harness.agent.workspace.WorkspaceManager;
@@ -146,7 +147,7 @@ public class MemoryMaintenanceMiddleware implements HarnessRuntimeMiddleware {
         return next.apply(input)
                 .doOnComplete(
                         () ->
-                                Mono.<AgentEvent>fromRunnable(() -> maybeRunMaintenance(rc))
+                                doMaintenance(rc)
                                         .subscribeOn(Schedulers.boundedElastic())
                                         .subscribe(
                                                 null,
@@ -156,15 +157,16 @@ public class MemoryMaintenanceMiddleware implements HarnessRuntimeMiddleware {
                                                                 e.getMessage())));
     }
 
-    private void maybeRunMaintenance(RuntimeContext rc) {
+    private Mono<Void> doMaintenance(RuntimeContext rc) {
         if (!periodicGate.tryClaim(compositeTimerKey(rc), minGap)) {
-            return;
+            return Mono.empty();
         }
-        try {
-            runMaintenance(rc);
-        } catch (Exception e) {
-            log.warn("Memory maintenance failed: {}", e.getMessage());
-        }
+        // Track the in-flight task synchronously, before subscribeOn hands the subscription to a
+        // background thread. This both skips the counter for throttled-out calls and eliminates the
+        // (tiny) race where awaitQuiescence could observe a zero counter before begin() runs.
+        MemoryBackgroundTasks.begin();
+        Mono<Void> maintenanceMono = Mono.fromRunnable(() -> runMaintenance(rc));
+        return maintenanceMono.doFinally(signal -> MemoryBackgroundTasks.end());
     }
 
     /**

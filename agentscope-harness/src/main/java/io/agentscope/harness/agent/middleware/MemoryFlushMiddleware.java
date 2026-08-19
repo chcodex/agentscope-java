@@ -25,6 +25,7 @@ import io.agentscope.core.state.AgentState;
 import io.agentscope.harness.agent.IsolationScope;
 import io.agentscope.harness.agent.coordination.LocalPeriodicGate;
 import io.agentscope.harness.agent.coordination.PeriodicGate;
+import io.agentscope.harness.agent.memory.MemoryBackgroundTasks;
 import io.agentscope.harness.agent.memory.MemoryConfig;
 import io.agentscope.harness.agent.memory.MemoryFlushManager;
 import io.agentscope.harness.agent.workspace.WorkspaceManager;
@@ -176,6 +177,11 @@ public class MemoryFlushMiddleware implements HarnessRuntimeMiddleware {
         boolean shouldFlush = shouldFlushNow(rc);
         Mono<Void> flushMono;
         if (shouldFlush) {
+            // Track the in-flight task synchronously, before subscribeOn hands the subscription to
+            // a
+            // background thread. This both skips the counter for no-op flushes and eliminates the
+            // (tiny) race where awaitQuiescence could observe a zero counter before begin() runs.
+            MemoryBackgroundTasks.begin();
             flushMono =
                     flushManager
                             .flushMemories(rc, messages)
@@ -184,7 +190,8 @@ public class MemoryFlushMiddleware implements HarnessRuntimeMiddleware {
                                     e -> {
                                         log.warn("Memory flush failed: {}", e.getMessage());
                                         return Mono.empty();
-                                    });
+                                    })
+                            .doFinally(signal -> MemoryBackgroundTasks.end());
         } else {
             log.debug("Memory flush skipped (trigger={})", flushTrigger);
             flushMono = Mono.empty();
