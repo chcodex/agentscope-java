@@ -33,6 +33,7 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -132,22 +133,65 @@ class E2bEnvdProcessClientTest {
     }
 
     @Test
-    void jsonCodecReturnsSentinelWhenEndMissing() throws Exception {
+    void jsonCodecRejectsEofBeforeEnd() throws Exception {
         E2bEnvdProcessClient client = new E2bEnvdProcessClient(options(E2bCodec.JSON));
         ByteArrayOutputStream stdout = new ByteArrayOutputStream();
         ByteArrayOutputStream stderr = new ByteArrayOutputStream();
-        int exit =
-                drainStartStream(
-                        client,
-                        connectFrames(
-                                responseJson(base64("hello\n"), null, null),
-                                responseJson(null, base64("warn\n"), null)),
-                        stdout,
-                        stderr);
+        IOException exception =
+                assertThrows(
+                        IOException.class,
+                        () ->
+                                drainStartStream(
+                                        client,
+                                        connectFrames(
+                                                responseJson(base64("hello\n"), null, null),
+                                                responseJson(null, base64("warn\n"), null)),
+                                        stdout,
+                                        stderr));
 
-        assertEquals(Integer.MIN_VALUE, exit);
+        assertTrue(exception.getMessage().contains("before receiving a process exit code"));
         assertEquals("hello\n", stdout.toString(StandardCharsets.UTF_8));
         assertEquals("warn\n", stderr.toString(StandardCharsets.UTF_8));
+    }
+
+    @Test
+    void jsonCodecRejectsTruncatedFrameLengthBeforeEnd() throws Exception {
+        E2bEnvdProcessClient client = new E2bEnvdProcessClient(options(E2bCodec.JSON));
+        byte[] truncatedLength = new byte[] {0x00, 0x00, 0x00};
+
+        IOException exception =
+                assertThrows(
+                        IOException.class,
+                        () ->
+                                drainStartStream(
+                                        client,
+                                        truncatedLength,
+                                        new ByteArrayOutputStream(),
+                                        new ByteArrayOutputStream()));
+
+        assertTrue(exception.getMessage().contains("before receiving a process exit code"));
+    }
+
+    @Test
+    void jsonCodecRejectsTruncatedFramePayloadBeforeEnd() throws Exception {
+        E2bEnvdProcessClient client = new E2bEnvdProcessClient(options(E2bCodec.JSON));
+        ByteBuffer truncatedPayload = ByteBuffer.allocate(7).order(ByteOrder.BIG_ENDIAN);
+        truncatedPayload.put((byte) 0x00);
+        truncatedPayload.putInt(4);
+        truncatedPayload.put((byte) '{');
+        truncatedPayload.put((byte) '}');
+
+        IOException exception =
+                assertThrows(
+                        IOException.class,
+                        () ->
+                                drainStartStream(
+                                        client,
+                                        truncatedPayload.array(),
+                                        new ByteArrayOutputStream(),
+                                        new ByteArrayOutputStream()));
+
+        assertTrue(exception.getMessage().contains("before receiving a process exit code"));
     }
 
     @Test
@@ -161,6 +205,17 @@ class E2bEnvdProcessClientTest {
         assertEquals(5, exit);
         assertEquals("", stdout.toString(StandardCharsets.UTF_8));
         assertEquals("", stderr.toString(StandardCharsets.UTF_8));
+    }
+
+    @Test
+    void jsonCodecPreservesZeroExitCode() throws Exception {
+        E2bEnvdProcessClient client = new E2bEnvdProcessClient(options(E2bCodec.JSON));
+        ByteArrayOutputStream stdout = new ByteArrayOutputStream();
+        ByteArrayOutputStream stderr = new ByteArrayOutputStream();
+        int exit =
+                drainStartStream(client, connectFrame(responseJson(null, null, 0)), stdout, stderr);
+
+        assertEquals(0, exit);
     }
 
     private static DynamicMessage dataResponse(
@@ -617,10 +672,13 @@ class E2bEnvdProcessClientTest {
         try {
             return (int)
                     method.invoke(client, new ByteArrayInputStream(connectFrame), stdout, stderr);
-        } catch (java.lang.reflect.InvocationTargetException e) {
+        } catch (InvocationTargetException e) {
             Throwable cause = e.getCause();
-            if (cause instanceof Exception) {
-                throw (Exception) cause;
+            if (cause instanceof Exception exception) {
+                throw exception;
+            }
+            if (cause instanceof Error error) {
+                throw error;
             }
             throw e;
         }
