@@ -52,9 +52,12 @@ public class WorkspaceContextMiddleware implements HarnessRuntimeMiddleware {
 
     private static final String SESSION_CONTEXT_SECTION_TEMPLATE =
             """
-            ## Session Context
+            ## AgentStateStore Context
             This is the %s. We are setting up the context for our chat.
             Today's date is %s.
+            My operating system is: %s
+            The workspace directory is: %s
+            The project's temporary directory is: %s
             %s
             """;
 
@@ -213,7 +216,7 @@ public class WorkspaceContextMiddleware implements HarnessRuntimeMiddleware {
                 includeMemoryContext ? workspaceManager.readMemoryMd(rc).strip() : "";
         String knowledgeContent = workspaceManager.readKnowledgeMd(rc).strip();
         Path workspace = workspaceManager.getWorkspace();
-        String sessionContext = buildSessionContextSection(rc);
+        String sessionContext = buildSessionContextSection(workspace, rc);
 
         String knowledgeBlock = buildKnowledgeBlock(rc, knowledgeContent, workspace);
         String additionalBlock = buildAdditionalContextBlock(rc);
@@ -502,18 +505,27 @@ public class WorkspaceContextMiddleware implements HarnessRuntimeMiddleware {
         };
     }
 
-    private String buildSessionContextSection(RuntimeContext rc) {
+    private String buildSessionContextSection(Path workspace, RuntimeContext rc) {
         String today = LocalDate.now().format(DateTimeFormatter.ofPattern("EEEE MMM d, yyyy"));
+        String platform = System.getProperty("os.name") + " " + System.getProperty("os.version");
+        String tempDir = System.getProperty("java.io.tmpdir");
         String dynamicPart = buildSessionDynamicPart(rc);
 
-        return String.format(SESSION_CONTEXT_SECTION_TEMPLATE, agentName, today, dynamicPart)
+        return String.format(
+                        SESSION_CONTEXT_SECTION_TEMPLATE,
+                        agentName,
+                        today,
+                        platform,
+                        workspace.toAbsolutePath(),
+                        tempDir,
+                        dynamicPart)
                 .strip();
     }
 
     private String buildSessionDynamicPart(RuntimeContext rc) {
         List<String> parts = new ArrayList<>();
         if (rc != null && rc.getSessionId() != null) {
-            parts.add("Session ID: " + rc.getSessionId());
+            parts.add("AgentStateStore ID: " + rc.getSessionId());
         }
         if (environmentMemory != null && !environmentMemory.isBlank()) {
             parts.add(environmentMemory);

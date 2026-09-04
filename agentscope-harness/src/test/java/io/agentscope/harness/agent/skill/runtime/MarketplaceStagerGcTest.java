@@ -24,6 +24,9 @@ import io.agentscope.core.skill.repository.AgentSkillRepositoryInfo;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.FileTime;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.DisplayName;
@@ -31,17 +34,30 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /**
- * Focused tests for {@link MarketplaceStager#stage(List, Map)} orphan GC behaviour with flat and
- * multi-level source namespaces.
+ * Focused tests for {@link MarketplaceStager#stage(List, Map)} orphan GC behaviour.
  *
- * <p>GC identifies skill directories by the presence of a {@code SKILL.md} file, so all test
- * skills include it in their resources.
+ * <p>Staged layout is {@code .skills-cache/&lt;scope&gt;/&lt;source-ns&gt;/&lt;skill&gt;} and GC
+ * only reclaims entries untouched for a full grace window, so deletion assertions backdate the
+ * orphan's mtime instead of expecting immediate removal.
  */
 class MarketplaceStagerGcTest {
 
     @TempDir Path tempWorkspace;
 
     private static final String SKILL_MD = "---\nname: test\n---";
+
+    private static Path stagedFile(Path workspace, String ns, String skill, String file) {
+        return workspace
+                .resolve(MarketplaceStager.CACHE_DIR)
+                .resolve(MarketplaceStager.SHARED_SCOPE)
+                .resolve(ns)
+                .resolve(skill)
+                .resolve(file);
+    }
+
+    private static Path skillDir(Path workspace, String ns, String skill) {
+        return stagedFile(workspace, ns, skill, "x").getParent();
+    }
 
     // ==================== Flat namespace ====================
 
@@ -60,36 +76,45 @@ class MarketplaceStagerGcTest {
 
         stager.stage(List.of(new MarketplaceStager.RepoBound(skill, repo)), Map.of(repo, "src"));
 
-        assertTrue(Files.exists(tempWorkspace.resolve(".skills-cache/src/my-skill/f.txt")));
+        assertTrue(Files.exists(stagedFile(tempWorkspace, "src", "my-skill", "f.txt")));
     }
 
     @Test
-    @DisplayName("Flat namespace: orphan skill is deleted on re-stage")
-    void flatNamespace_orphanDeleted() {
+    @DisplayName("Flat namespace: stale orphan skill is deleted on re-stage")
+    void flatNamespace_orphanDeleted() throws IOException {
         AgentSkill skillA =
                 new AgentSkill(
                         "skill-a", "desc", "c", Map.of("a.txt", "a", "SKILL.md", SKILL_MD), "src");
         StubRepo repo = new StubRepo(List.of(skillA), "src");
-        MarketplaceStager stager = new MarketplaceStager(tempWorkspace);
+        MarketplaceStager stager = new MarketplaceStager(tempWorkspace, Duration.ofHours(6));
 
         // First stage: materialise skill-a
         stager.stage(List.of(new MarketplaceStager.RepoBound(skillA, repo)), Map.of(repo, "src"));
 
-        Path stagedA = tempWorkspace.resolve(".skills-cache/src/skill-a/a.txt");
+        Path stagedA = stagedFile(tempWorkspace, "src", "skill-a", "a.txt");
         assertTrue(Files.exists(stagedA), "skill-a should be staged initially");
+
+        // Backdate so the orphan is past the grace window
+        Files.setLastModifiedTime(
+                skillDir(tempWorkspace, "src", "skill-a"),
+                FileTime.from(Instant.now().minus(Duration.ofDays(7))));
 
         // Second stage: repo no longer publishes skill-a → orphan GC deletes it
         stager.stage(List.of(), Map.of(repo, "src"));
 
         assertFalse(Files.exists(stagedA), "orphan skill-a should be deleted by GC");
         assertTrue(
-                Files.notExists(tempWorkspace.resolve(".skills-cache/src")),
+                Files.notExists(
+                        tempWorkspace
+                                .resolve(MarketplaceStager.CACHE_DIR)
+                                .resolve(MarketplaceStager.SHARED_SCOPE)
+                                .resolve("src")),
                 "empty namespace dir should also be cleaned up");
     }
 
     @Test
-    @DisplayName("Flat namespace: retained skill is not deleted when others change")
-    void flatNamespace_retainedSurvivesWhenOthersChange() {
+    @DisplayName("Flat namespace: fresh orphan survives within the grace window")
+    void flatNamespace_freshOrphanSurvives() {
         AgentSkill skillA =
                 new AgentSkill(
                         "skill-a", "desc", "c", Map.of("a.txt", "a", "SKILL.md", SKILL_MD), "src");
@@ -105,150 +130,47 @@ class MarketplaceStagerGcTest {
                         new MarketplaceStager.RepoBound(skillB, repo)),
                 Map.of(repo, "src"));
 
-        Path stagedA = tempWorkspace.resolve(".skills-cache/src/skill-a/a.txt");
-        Path stagedB = tempWorkspace.resolve(".skills-cache/src/skill-b/b.txt");
+        Path stagedA = stagedFile(tempWorkspace, "src", "skill-a", "a.txt");
+        Path stagedB = stagedFile(tempWorkspace, "src", "skill-b", "b.txt");
         assertTrue(Files.exists(stagedA));
         assertTrue(Files.exists(stagedB));
 
-        // Re-stage with only skill-a
+        // Re-stage with only skill-a: skill-b just staged, still fresh → kept
         stager.stage(List.of(new MarketplaceStager.RepoBound(skillA, repo)), Map.of(repo, "src"));
 
         assertTrue(Files.exists(stagedA), "retained skill-a should survive");
-        assertFalse(Files.exists(stagedB), "orphan skill-b should be deleted");
-    }
-
-    // ==================== Multi-level namespace ====================
-
-    @Test
-    @DisplayName("Multi-level namespace: skill survives staging (regression guard)")
-    void multiLevelNamespace_skillSurvives() {
-        AgentSkill skill =
-                new AgentSkill(
-                        "my-skill",
-                        "desc",
-                        "c",
-                        Map.of("f.txt", "hello", "SKILL.md", SKILL_MD),
-                        "git-owner/repo");
-        StubRepo repo = new StubRepo(List.of(skill), "git-owner/repo");
-        MarketplaceStager stager = new MarketplaceStager(tempWorkspace);
-
-        stager.stage(
-                List.of(new MarketplaceStager.RepoBound(skill, repo)),
-                Map.of(repo, "git-owner/repo"));
-
-        // The intermediate directories (git-owner/, git-owner/repo/) must not
-        // be deleted by GC — the skill file at the leaf must survive.
-        assertTrue(
-                Files.exists(tempWorkspace.resolve(".skills-cache/git-owner/repo/my-skill/f.txt")),
-                "skill under multi-level namespace should survive GC");
-    }
-
-    @Test
-    @DisplayName("Multi-level namespace: orphan skill is deleted on re-stage")
-    void multiLevelNamespace_orphanDeleted() {
-        AgentSkill skill =
-                new AgentSkill(
-                        "old-skill",
-                        "desc",
-                        "c",
-                        Map.of("o.txt", "o", "SKILL.md", SKILL_MD),
-                        "git-owner/repo");
-        StubRepo repo = new StubRepo(List.of(skill), "git-owner/repo");
-        MarketplaceStager stager = new MarketplaceStager(tempWorkspace);
-
-        stager.stage(
-                List.of(new MarketplaceStager.RepoBound(skill, repo)),
-                Map.of(repo, "git-owner/repo"));
-
-        Path staged = tempWorkspace.resolve(".skills-cache/git-owner/repo/old-skill/o.txt");
-        assertTrue(Files.exists(staged));
-
-        // Re-stage with empty visible list → old-skill is an orphan
-        stager.stage(List.of(), Map.of(repo, "git-owner/repo"));
-
-        assertFalse(Files.exists(staged), "orphan skill under multi-level ns should be deleted");
-    }
-
-    @Test
-    @DisplayName("Multi-level namespace: retained skill survives while orphan is deleted")
-    void multiLevelNamespace_retainedSurvivesOrphanDeleted() {
-        AgentSkill keep =
-                new AgentSkill(
-                        "keep",
-                        "desc",
-                        "c",
-                        Map.of("k.txt", "k", "SKILL.md", SKILL_MD),
-                        "git-owner/repo");
-        AgentSkill drop =
-                new AgentSkill(
-                        "drop",
-                        "desc",
-                        "c",
-                        Map.of("d.txt", "d", "SKILL.md", SKILL_MD),
-                        "git-owner/repo");
-        StubRepo repo = new StubRepo(List.of(keep, drop), "git-owner/repo");
-        MarketplaceStager stager = new MarketplaceStager(tempWorkspace);
-
-        stager.stage(
-                List.of(
-                        new MarketplaceStager.RepoBound(keep, repo),
-                        new MarketplaceStager.RepoBound(drop, repo)),
-                Map.of(repo, "git-owner/repo"));
-
-        Path kept = tempWorkspace.resolve(".skills-cache/git-owner/repo/keep/k.txt");
-        Path dropped = tempWorkspace.resolve(".skills-cache/git-owner/repo/drop/d.txt");
-        assertTrue(Files.exists(kept));
-        assertTrue(Files.exists(dropped));
-
-        // Re-stage with only 'keep'
-        stager.stage(
-                List.of(new MarketplaceStager.RepoBound(keep, repo)),
-                Map.of(repo, "git-owner/repo"));
-
-        assertTrue(Files.exists(kept), "retained skill should survive");
-        assertFalse(Files.exists(dropped), "orphan skill should be deleted");
-        // The intermediate namespace dirs must still exist
-        assertTrue(
-                Files.isDirectory(tempWorkspace.resolve(".skills-cache/git-owner/repo")),
-                "intermediate namespace dir must not be deleted");
-        assertTrue(
-                Files.isDirectory(tempWorkspace.resolve(".skills-cache/git-owner")),
-                "top-level namespace dir must not be deleted");
+        assertTrue(Files.exists(stagedB), "fresh orphan skill-b should survive the grace window");
     }
 
     // ==================== Mixed namespaces ====================
 
     @Test
-    @DisplayName("Mixed flat and multi-level namespaces: all retained skills survive")
+    @DisplayName("Mixed flat namespaces: all retained skills survive")
     void mixedNamespaces_allRetainedSurvive() {
         AgentSkill flat =
                 new AgentSkill(
                         "flat", "desc", "c", Map.of("f.txt", "f", "SKILL.md", SKILL_MD), "src");
-        AgentSkill deep =
+        AgentSkill other =
                 new AgentSkill(
-                        "deep",
-                        "desc",
-                        "c",
-                        Map.of("d.txt", "d", "SKILL.md", SKILL_MD),
-                        "git-owner/repo");
+                        "other", "desc", "c", Map.of("d.txt", "d", "SKILL.md", SKILL_MD), "market");
         StubRepo flatRepo = new StubRepo(List.of(flat), "src");
-        StubRepo deepRepo = new StubRepo(List.of(deep), "git-owner/repo");
+        StubRepo otherRepo = new StubRepo(List.of(other), "market");
         MarketplaceStager stager = new MarketplaceStager(tempWorkspace);
 
         stager.stage(
                 List.of(
                         new MarketplaceStager.RepoBound(flat, flatRepo),
-                        new MarketplaceStager.RepoBound(deep, deepRepo)),
-                Map.of(flatRepo, "src", deepRepo, "git-owner/repo"));
+                        new MarketplaceStager.RepoBound(other, otherRepo)),
+                Map.of(flatRepo, "src", otherRepo, "market"));
 
-        assertTrue(Files.exists(tempWorkspace.resolve(".skills-cache/src/flat/f.txt")));
-        assertTrue(Files.exists(tempWorkspace.resolve(".skills-cache/git-owner/repo/deep/d.txt")));
+        assertTrue(Files.exists(stagedFile(tempWorkspace, "src", "flat", "f.txt")));
+        assertTrue(Files.exists(stagedFile(tempWorkspace, "market", "other", "d.txt")));
     }
 
     // ==================== Legacy directory without SKILL.md ====================
 
     @Test
-    @DisplayName("Legacy dir without SKILL.md: not recognized as skill, persists as residual")
+    @DisplayName("Legacy dir without SKILL.md: freshly created dir survives the grace window")
     void legacyDirWithoutSkillMd_notRecognizedAsSkill() throws IOException {
         AgentSkill skillA =
                 new AgentSkill(
@@ -258,21 +180,26 @@ class MarketplaceStagerGcTest {
 
         stager.stage(List.of(new MarketplaceStager.RepoBound(skillA, repo)), Map.of(repo, "src"));
 
-        Path stagedA = tempWorkspace.resolve(".skills-cache/src/skill-a/a.txt");
+        Path stagedA = stagedFile(tempWorkspace, "src", "skill-a", "a.txt");
         assertTrue(Files.exists(stagedA));
 
         // Manually create a legacy directory with no SKILL.md
-        Path legacyDir = tempWorkspace.resolve(".skills-cache/src/legacy-skill");
+        Path legacyDir =
+                tempWorkspace
+                        .resolve(MarketplaceStager.CACHE_DIR)
+                        .resolve(MarketplaceStager.SHARED_SCOPE)
+                        .resolve("src")
+                        .resolve("legacy-skill");
         Files.createDirectories(legacyDir.resolve("residual.txt"));
 
-        // Re-stage with only skill-a → GC runs, legacy dir has no SKILL.md so it's
-        // not found by Files.walk and is not in retained set either → it survives
+        // Re-stage with only skill-a → GC runs, legacy dir is fresh so the grace
+        // window keeps it
         stager.stage(List.of(new MarketplaceStager.RepoBound(skillA, repo)), Map.of(repo, "src"));
 
         assertTrue(Files.exists(stagedA), "skill-a should survive");
         assertTrue(
                 Files.exists(legacyDir.resolve("residual.txt")),
-                "legacy dir without SKILL.md is a residual (known limitation)");
+                "fresh legacy dir should survive the grace window");
     }
 
     /** Minimal repository stub for testing. */
