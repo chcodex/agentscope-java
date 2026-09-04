@@ -127,14 +127,28 @@ final class E2bEnvdProcessClient {
     private ShellCapture runShellCapture(
             E2bSandboxState state, String cwd, String shellCommand, int timeoutSeconds)
             throws Exception {
+        if (timeoutSeconds <= 0) {
+            throw new IllegalArgumentException(
+                    "timeoutSeconds must be positive: " + timeoutSeconds);
+        }
         OkHttpClient callClient =
-                timeoutSeconds > 0
-                        ? http.newBuilder().callTimeout(timeoutSeconds, TimeUnit.SECONDS).build()
-                        : http;
+                http.newBuilder()
+                        .callTimeout(timeoutSeconds, TimeUnit.SECONDS)
+                        // Disable the idle read timeout: it fires on gaps between bytes and
+                        // would preempt callTimeout (both surface as InterruptedIOException),
+                        // misreporting a short idle stall as a full exec timeout (#2974).
+                        // Total-duration semantics is owned solely by callTimeout.
+                        .readTimeout(0, TimeUnit.SECONDS)
+                        .build();
         String host = envdHost(state);
         String url = host + "/process.Process/Start";
         byte[] envelope = encodeStartRequestEnvelope(shellCommand, cwd);
-        Request req = buildEnvdRequest(url, envelope, connectMediaType(), state).build();
+        Request req =
+                buildEnvdRequest(url, envelope, connectMediaType(), state)
+                        // Ask envd to kill the remote process when this lapses; otherwise a
+                        // client-side timeout only drops our HTTP stream and leaks the process.
+                        .addHeader("Connect-Timeout-Ms", String.valueOf(timeoutSeconds * 1000L))
+                        .build();
 
         ByteArrayOutputStream stdout = new ByteArrayOutputStream();
         ByteArrayOutputStream stderr = new ByteArrayOutputStream();
@@ -150,6 +164,12 @@ final class E2bEnvdProcessClient {
                 exit = drainStartStream(in, stdout, stderr);
             }
         } catch (InterruptedIOException e) {
+            // External cancellation surfaces here too; don't misreport it as a timeout
+            // and don't swallow the interrupt bit.
+            if (Thread.currentThread().isInterrupted()) {
+                Thread.currentThread().interrupt();
+                throw e;
+            }
             throw new SandboxException.ExecTimeoutException(shellCommand, timeoutSeconds);
         }
         return new ShellCapture(exit, stdout, stderr);
@@ -177,7 +197,7 @@ final class E2bEnvdProcessClient {
             // Connect protocol: Message-Length is 4-byte unsigned integer, big-endian
             // https://connectrpc.com/docs/protocol/#streaming-rpcs
             int len = ByteBuffer.wrap(lenB).order(ByteOrder.BIG_ENDIAN).getInt();
-            if (len < 0 || len > 64 * 1024 * 1024) {
+            if (len > 64 * 1024 * 1024) {
                 throw new IOException("Invalid connect frame length: " + len);
             }
             byte[] data = in.readNBytes(len);
@@ -361,7 +381,7 @@ final class E2bEnvdProcessClient {
      */
     public void uploadFile(E2bSandboxState state, String remotePath, byte[] data) throws Exception {
         String host = envdHost(state);
-        String url = host + "/files?path=" + URLEncoder.encode(remotePath, StandardCharsets.UTF_8);
+        String url = host + filesUrl(remotePath);
 
         RequestBody fileBody = RequestBody.create(data, APPLICATION_OCTET_STREAM);
         RequestBody multipart =
@@ -390,7 +410,7 @@ final class E2bEnvdProcessClient {
      */
     public byte[] downloadFile(E2bSandboxState state, String remotePath) throws Exception {
         String host = envdHost(state);
-        String url = host + "/files?path=" + URLEncoder.encode(remotePath, StandardCharsets.UTF_8);
+        String url = host + filesUrl(remotePath);
         Request req = buildFilesystemRequest(url, state).get().build();
         try (Response res = http.newCall(req).execute()) {
             if (!res.isSuccessful()) {
@@ -406,6 +426,13 @@ final class E2bEnvdProcessClient {
     private static String filenameFromPath(String path) {
         int idx = path.lastIndexOf('/');
         return idx >= 0 ? path.substring(idx + 1) : path;
+    }
+
+    private String filesUrl(String remotePath) {
+        return "/files?path="
+                + URLEncoder.encode(remotePath, StandardCharsets.UTF_8)
+                + "&username="
+                + URLEncoder.encode(opt.getRunUser(), StandardCharsets.UTF_8);
     }
 
     private Request.Builder buildEnvdRequest(

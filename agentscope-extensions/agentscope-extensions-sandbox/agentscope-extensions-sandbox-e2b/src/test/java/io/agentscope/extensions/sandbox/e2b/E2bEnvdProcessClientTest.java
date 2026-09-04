@@ -17,6 +17,8 @@ package io.agentscope.extensions.sandbox.e2b;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -35,12 +37,15 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Base64;
+import java.util.concurrent.atomic.AtomicReference;
 import okhttp3.Call;
+import okhttp3.Interceptor;
 import okhttp3.MediaType;
 import okhttp3.OkHttpClient;
 import okhttp3.Protocol;
@@ -293,8 +298,10 @@ class E2bEnvdProcessClientTest {
 
     // Connect protocol: successful EndStreamResponse is "{}" (no error, no metadata).
     // Python SDK: end_stream without "error" → return (stop iteration).
+    // A stream that ends without any process exit code is an incomplete transport
+    // response and must be rejected (#2828), not treated as success.
     @Test
-    void endStreamResponseWithoutErrorBreaksCleanly() throws Exception {
+    void endStreamResponseWithoutExitCodeThrows() throws Exception {
         E2bEnvdProcessClient client = new E2bEnvdProcessClient(options(E2bCodec.JSON));
         byte[] frame =
                 concatFrames(
@@ -302,9 +309,11 @@ class E2bEnvdProcessClientTest {
                         endStreamFrame("{}"));
         ByteArrayOutputStream stdout = new ByteArrayOutputStream();
         ByteArrayOutputStream stderr = new ByteArrayOutputStream();
-        int exit = drainStartStream(client, frame, stdout, stderr);
+        IOException exception =
+                assertThrows(
+                        IOException.class, () -> drainStartStream(client, frame, stdout, stderr));
 
-        assertEquals(Integer.MIN_VALUE, exit);
+        assertTrue(exception.getMessage().contains("before receiving a process exit code"));
         assertEquals("hello", stdout.toString(StandardCharsets.UTF_8));
         assertEquals("", stderr.toString(StandardCharsets.UTF_8));
     }
@@ -397,15 +406,17 @@ class E2bEnvdProcessClientTest {
     // ---- PROTO codec tests ----
 
     @Test
-    void protoCodecDrainStartStream() throws Exception {
+    void protoCodecDrainStartStreamWithoutExitCodeThrows() throws Exception {
         E2bEnvdProcessClient client = new E2bEnvdProcessClient(options(E2bCodec.PROTO));
         DynamicMessage dataResp = dataResponse(client, "hello\n", null);
         byte[] frame = concatFrames(connectFrame(dataResp.toByteArray()), endStreamFrame("{}"));
         ByteArrayOutputStream stdout = new ByteArrayOutputStream();
         ByteArrayOutputStream stderr = new ByteArrayOutputStream();
-        int exit = drainStartStream(client, frame, stdout, stderr);
+        IOException exception =
+                assertThrows(
+                        IOException.class, () -> drainStartStream(client, frame, stdout, stderr));
 
-        assertEquals(Integer.MIN_VALUE, exit);
+        assertTrue(exception.getMessage().contains("before receiving a process exit code"));
         assertEquals("hello\n", stdout.toString(StandardCharsets.UTF_8));
         assertEquals("", stderr.toString(StandardCharsets.UTF_8));
     }
@@ -465,7 +476,7 @@ class E2bEnvdProcessClientTest {
     }
 
     @Test
-    void truncatedFrameDataBreaks() throws Exception {
+    void truncatedFrameDataThrows() throws Exception {
         E2bEnvdProcessClient client = new E2bEnvdProcessClient(options(E2bCodec.JSON));
         byte[] frame = new byte[10];
         frame[0] = 0x00;
@@ -474,9 +485,11 @@ class E2bEnvdProcessClientTest {
 
         ByteArrayOutputStream stdout = new ByteArrayOutputStream();
         ByteArrayOutputStream stderr = new ByteArrayOutputStream();
-        int exit = drainStartStream(client, frame, stdout, stderr);
+        IOException exception =
+                assertThrows(
+                        IOException.class, () -> drainStartStream(client, frame, stdout, stderr));
 
-        assertEquals(Integer.MIN_VALUE, exit);
+        assertTrue(exception.getMessage().contains("before receiving a process exit code"));
     }
 
     @Test
@@ -554,6 +567,7 @@ class E2bEnvdProcessClientTest {
         String url = requestCaptor.getValue().url().toString();
         assertTrue(url.startsWith("https://49983-test-id.e2b.app/files?path="));
         assertTrue(url.contains("path=%2Ftmp%2Ftest.txt"));
+        assertTrue(url.contains("username=user"));
         verify(mockCall).execute();
     }
 
@@ -622,6 +636,7 @@ class E2bEnvdProcessClientTest {
         String url = requestCaptor.getValue().url().toString();
         assertTrue(url.startsWith("https://49983-test-id.e2b.app/files?path="));
         assertTrue(url.contains("path=%2Ftmp%2Ftest.txt"));
+        assertTrue(url.contains("username=user"));
         verify(mockCall).execute();
     }
 
@@ -835,5 +850,75 @@ class E2bEnvdProcessClientTest {
 
         String result = (String) method.invoke(null, "/home/");
         assertEquals("", result);
+    }
+
+    @Test
+    void requestCarriesConnectTimeoutMsHeader() throws Exception {
+        AtomicReference<String> header = new AtomicReference<>();
+        Interceptor capture =
+                chain -> {
+                    header.set(chain.request().header("Connect-Timeout-Ms"));
+                    throw new SocketTimeoutException("timeout");
+                };
+        E2bEnvdProcessClient client = clientWithInterceptor(capture);
+
+        assertThrows(
+                SandboxException.ExecTimeoutException.class,
+                () -> client.runShell(state(), "/workspace", "sleep 1000", 3));
+        assertEquals("3000", header.get());
+    }
+
+    @Test
+    void interruptionIsRethrownNotWrappedAsTimeout() throws Exception {
+        Interceptor interrupting =
+                chain -> {
+                    Thread.currentThread().interrupt();
+                    throw new SocketTimeoutException("read timed out");
+                };
+        E2bEnvdProcessClient client = clientWithInterceptor(interrupting);
+        try {
+            SocketTimeoutException thrown =
+                    assertThrows(
+                            SocketTimeoutException.class,
+                            () -> client.runShell(state(), "/workspace", "sleep 1000", 3));
+            assertEquals("read timed out", thrown.getMessage());
+            assertTrue(Thread.currentThread().isInterrupted(), "interrupt bit must be restored");
+        } finally {
+            // Do not leak the interrupt bit into other tests.
+            Thread.interrupted();
+        }
+        assertFalse(Thread.currentThread().isInterrupted());
+    }
+
+    @Test
+    void nonPositiveTimeoutFailsFastWithoutRequest() throws Exception {
+        AtomicReference<String> header = new AtomicReference<>();
+        Interceptor capture =
+                chain -> {
+                    header.set(chain.request().header("Connect-Timeout-Ms"));
+                    throw new SocketTimeoutException("must not be called");
+                };
+        E2bEnvdProcessClient client = clientWithInterceptor(capture);
+
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> client.runShell(state(), "/workspace", "echo hi", 0));
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> client.runShell(state(), "/workspace", "echo hi", -5));
+        assertNull(header.get(), "no HTTP request must be issued for invalid timeout");
+    }
+
+    private static E2bEnvdProcessClient clientWithInterceptor(Interceptor interceptor)
+            throws Exception {
+        E2bSandboxClientOptions opt = options(E2bCodec.PROTO);
+        opt.setHttpClient(new OkHttpClient.Builder().addInterceptor(interceptor).build());
+        return new E2bEnvdProcessClient(opt);
+    }
+
+    private static E2bSandboxState state() {
+        E2bSandboxState state = new E2bSandboxState();
+        state.setSandboxId("test-sandbox");
+        return state;
     }
 }
