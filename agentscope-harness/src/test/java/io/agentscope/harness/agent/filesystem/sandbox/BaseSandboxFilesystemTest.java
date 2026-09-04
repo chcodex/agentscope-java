@@ -420,6 +420,8 @@ class BaseSandboxFilesystemTest {
             assertTrue(result.error().contains("appears"));
         }
 
+        // ==================== Bug reproduction: ls shell swallows errors ====================
+
         @Test
         void ls_nonExistentPath_shouldReturnFail() {
             LocalShellSandboxFilesystem fs = new LocalShellSandboxFilesystem();

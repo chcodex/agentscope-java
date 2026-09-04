@@ -233,7 +233,7 @@ public class WorkspaceContextMiddleware implements HarnessRuntimeMiddleware {
 
         String workspaceParagraph =
                 buildWorkspaceParagraph(
-                        workspace, workspaceManager.getFilesystem(), rc, artifactDeliveryEnabled);
+                        workspace, workspaceManager.getFilesystem(), artifactDeliveryEnabled);
         String loadedContext =
                 buildLoadedContextSection(
                         agentsContent, memoryContent, knowledgeBlock, additionalBlock);
@@ -314,10 +314,7 @@ public class WorkspaceContextMiddleware implements HarnessRuntimeMiddleware {
      * </ul>
      */
     private static String buildWorkspaceParagraph(
-            Path workspace,
-            AbstractFilesystem fs,
-            RuntimeContext rc,
-            boolean artifactDeliveryEnabled) {
+            Path workspace, AbstractFilesystem fs, boolean artifactDeliveryEnabled) {
         StringBuilder sb = new StringBuilder("## Workspace\n");
         LocalFilesystemWithShell localUpper = detectLocalUpper(fs);
         Path project = localUpper != null ? localUpper.getShellCwd() : null;
@@ -367,10 +364,6 @@ public class WorkspaceContextMiddleware implements HarnessRuntimeMiddleware {
                     .append(" (container id: ")
                     .append(sandbox.id())
                     .append(")\n");
-            sb.append(
-                    "The harness-side workspace files (AGENTS.md, skills, knowledge,"
-                            + " MEMORY.md) are projected into this sandbox. The host filesystem"
-                            + " is not directly accessible");
             if (artifactDeliveryEnabled) {
                 sb.append(
                         "Files are isolated inside this container. The host filesystem is not"
@@ -378,17 +371,10 @@ public class WorkspaceContextMiddleware implements HarnessRuntimeMiddleware {
                                 + " how to deliver files out of the sandbox.\n");
             } else {
                 sb.append(
-                        " and there is no mechanism for moving files across the" + " boundary.\n");
+                        "Files are isolated inside this container. The host filesystem is not"
+                                + " accessible and there is no mechanism for moving files across"
+                                + " the boundary.\n");
             }
-            appendHostPlatformInfo(
-                    sb,
-                    querySandbox(
-                            sandbox,
-                            rc,
-                            "cat /etc/os-release 2>/dev/null | grep ^PRETTY_NAME | cut -d="
-                                    + " -f2 | tr -d '\"'",
-                            querySandbox(sandbox, rc, "uname -srm", "Linux")),
-                    querySandbox(sandbox, rc, "echo \"${TMPDIR:-/tmp}\"", "/tmp"));
         } else if (fs instanceof CompositeFilesystem) {
             sb.append("Distributed workspace template root: ")
                     .append(workspace.toAbsolutePath())
