@@ -142,6 +142,108 @@ class MarketplaceStagerGcTest {
         assertTrue(Files.exists(stagedB), "fresh orphan skill-b should survive the grace window");
     }
 
+    // ==================== Multi-level namespace ====================
+
+    @Test
+    @DisplayName("Multi-level namespace: skill survives staging (regression guard)")
+    void multiLevelNamespace_skillSurvives() {
+        AgentSkill skill =
+                new AgentSkill(
+                        "my-skill",
+                        "desc",
+                        "c",
+                        Map.of("f.txt", "hello", "SKILL.md", SKILL_MD),
+                        "git-owner/repo");
+        StubRepo repo = new StubRepo(List.of(skill), "git-owner/repo");
+        MarketplaceStager stager = new MarketplaceStager(tempWorkspace);
+
+        stager.stage(
+                List.of(new MarketplaceStager.RepoBound(skill, repo)),
+                Map.of(repo, "git-owner/repo"));
+
+        // The intermediate directories (git-owner/, git-owner/repo/) must not
+        // be deleted by GC — the skill file at the leaf must survive.
+        assertTrue(
+                Files.exists(stagedFile(tempWorkspace, "git-owner/repo", "my-skill", "f.txt")),
+                "skill under multi-level namespace should survive GC");
+    }
+
+    @Test
+    @DisplayName("Multi-level namespace: stale orphan skill is deleted on re-stage")
+    void multiLevelNamespace_orphanDeleted() throws IOException {
+        AgentSkill skill =
+                new AgentSkill(
+                        "old-skill",
+                        "desc",
+                        "c",
+                        Map.of("o.txt", "o", "SKILL.md", SKILL_MD),
+                        "git-owner/repo");
+        StubRepo repo = new StubRepo(List.of(skill), "git-owner/repo");
+        MarketplaceStager stager = new MarketplaceStager(tempWorkspace, Duration.ofHours(6));
+
+        stager.stage(
+                List.of(new MarketplaceStager.RepoBound(skill, repo)),
+                Map.of(repo, "git-owner/repo"));
+
+        Path staged = stagedFile(tempWorkspace, "git-owner/repo", "old-skill", "o.txt");
+        assertTrue(Files.exists(staged));
+
+        // Backdate so the orphan is past the grace window
+        Files.setLastModifiedTime(
+                skillDir(tempWorkspace, "git-owner/repo", "old-skill"),
+                FileTime.from(Instant.now().minus(Duration.ofDays(7))));
+
+        // Re-stage with empty visible list → old-skill is a stale orphan
+        stager.stage(List.of(), Map.of(repo, "git-owner/repo"));
+
+        assertFalse(Files.exists(staged), "orphan skill under multi-level ns should be deleted");
+    }
+
+    @Test
+    @DisplayName("Multi-level namespace: retained skill survives while stale orphan is deleted")
+    void multiLevelNamespace_retainedSurvivesOrphanDeleted() throws IOException {
+        AgentSkill keep =
+                new AgentSkill(
+                        "keep",
+                        "desc",
+                        "c",
+                        Map.of("k.txt", "k", "SKILL.md", SKILL_MD),
+                        "git-owner/repo");
+        AgentSkill drop =
+                new AgentSkill(
+                        "drop",
+                        "desc",
+                        "c",
+                        Map.of("d.txt", "d", "SKILL.md", SKILL_MD),
+                        "git-owner/repo");
+        StubRepo repo = new StubRepo(List.of(keep, drop), "git-owner/repo");
+        MarketplaceStager stager = new MarketplaceStager(tempWorkspace, Duration.ofHours(6));
+
+        stager.stage(
+                List.of(
+                        new MarketplaceStager.RepoBound(keep, repo),
+                        new MarketplaceStager.RepoBound(drop, repo)),
+                Map.of(repo, "git-owner/repo"));
+
+        Path kept = stagedFile(tempWorkspace, "git-owner/repo", "keep", "k.txt");
+        Path dropped = stagedFile(tempWorkspace, "git-owner/repo", "drop", "d.txt");
+        assertTrue(Files.exists(kept));
+        assertTrue(Files.exists(dropped));
+
+        // Backdate the dropped skill so only it is past the grace window
+        Files.setLastModifiedTime(
+                skillDir(tempWorkspace, "git-owner/repo", "drop"),
+                FileTime.from(Instant.now().minus(Duration.ofDays(7))));
+
+        // Re-stage with only 'keep'
+        stager.stage(
+                List.of(new MarketplaceStager.RepoBound(keep, repo)),
+                Map.of(repo, "git-owner/repo"));
+
+        assertTrue(Files.exists(kept), "retained skill should survive");
+        assertFalse(Files.exists(dropped), "orphan skill should be deleted");
+    }
+
     // ==================== Mixed namespaces ====================
 
     @Test

@@ -433,6 +433,48 @@ public class WorkspaceContextMiddleware implements HarnessRuntimeMiddleware {
     }
 
     /**
+     * Operating system description for the session template: queried from inside the sandbox
+     * when one backs the workspace, so the prompt reflects the container (not the host).
+     */
+    private String hostPlatformOs(RuntimeContext rc) {
+        AbstractFilesystem fs = workspaceManager.getFilesystem();
+        if (fs instanceof AbstractSandboxFilesystem sandbox) {
+            String pretty =
+                    querySandbox(
+                            sandbox,
+                            rc,
+                            "cat /etc/os-release 2>/dev/null | grep ^PRETTY_NAME | cut -d="
+                                    + " -f2 | tr -d '\"'",
+                            "");
+            if (!pretty.isEmpty()) {
+                return pretty;
+            }
+            return querySandbox(sandbox, rc, "uname -srm", hostOs());
+        }
+        return hostOs();
+    }
+
+    /**
+     * Temporary directory for the session template: queried from inside the sandbox when one
+     * backs the workspace, so the prompt reflects the container (not the host).
+     */
+    private String hostPlatformTmpdir(RuntimeContext rc) {
+        AbstractFilesystem fs = workspaceManager.getFilesystem();
+        if (fs instanceof AbstractSandboxFilesystem sandbox) {
+            return querySandbox(sandbox, rc, "echo \"${TMPDIR:-/tmp}\"", hostTmpdir());
+        }
+        return hostTmpdir();
+    }
+
+    private static String hostOs() {
+        return System.getProperty("os.name") + " " + System.getProperty("os.version");
+    }
+
+    private static String hostTmpdir() {
+        return System.getProperty("java.io.tmpdir");
+    }
+
+    /**
      * Executes a shell command in the sandbox and returns the stripped output, or the given
      * fallback string if execution fails.
      */
@@ -507,8 +549,8 @@ public class WorkspaceContextMiddleware implements HarnessRuntimeMiddleware {
 
     private String buildSessionContextSection(Path workspace, RuntimeContext rc) {
         String today = LocalDate.now().format(DateTimeFormatter.ofPattern("EEEE MMM d, yyyy"));
-        String platform = System.getProperty("os.name") + " " + System.getProperty("os.version");
-        String tempDir = System.getProperty("java.io.tmpdir");
+        String platform = hostPlatformOs(rc);
+        String tempDir = hostPlatformTmpdir(rc);
         String dynamicPart = buildSessionDynamicPart(rc);
 
         return String.format(

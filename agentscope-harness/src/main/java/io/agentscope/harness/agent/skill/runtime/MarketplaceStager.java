@@ -239,7 +239,7 @@ public final class MarketplaceStager {
                 // Mark as live before GC runs: this is what stops a concurrent call — or
                 // another replica sharing the volume — from treating it as an orphan.
                 touch(stagedDir);
-                retained.add(stagedDir);
+                retained.add(stagedDir.normalize());
                 roots.put(
                         name, new StageResult.Cached(scopeRoot.getFileName().toString(), ns, name));
             } catch (Exception e) {
@@ -409,31 +409,50 @@ public final class MarketplaceStager {
         // `retained` reflects ONE call's visible skills; the cache is shared. Only delete
         // entries that no call has staged for a full grace window.
         Instant cutoff = Instant.now().minus(orphanGrace);
-        // Two-level layout: <source-ns>/<skill-name>/
-        try (var nsStream = Files.list(cacheRoot)) {
-            List<Path> nsDirs = new ArrayList<>();
-            nsStream.filter(Files::isDirectory).forEach(nsDirs::add);
-            for (Path nsDir : nsDirs) {
-                try (var skillStream = Files.list(nsDir)) {
-                    List<Path> skillDirs = new ArrayList<>();
-                    skillStream.filter(Files::isDirectory).forEach(skillDirs::add);
-                    for (Path skillDir : skillDirs) {
-                        if (retained.contains(skillDir) || !isStale(skillDir, cutoff)) {
-                            continue;
-                        }
-                        deleteRecursively(skillDir);
-                    }
-                }
-                // Clean up empty namespace dir.
-                try (var probe = Files.list(nsDir)) {
-                    if (probe.findAny().isEmpty()) {
-                        deleteQuietly(nsDir);
-                    }
-                }
-            }
+        // Find skill directories by locating SKILL.md files. Intermediate namespace
+        // directories (which don't contain SKILL.md) are never collected, which naturally
+        // handles multi-level namespaces without ancestor-protection logic.
+        Set<Path> foundSkillDirs = new HashSet<>();
+        try (var stream = Files.walk(cacheRoot)) {
+            stream.filter(p -> p.getFileName().toString().equals("SKILL.md"))
+                    .map(Path::getParent)
+                    .forEach(foundSkillDirs::add);
         } catch (IOException | UncheckedIOException e) {
             log.debug("Orphan GC under {} failed: {}", cacheRoot, e.getMessage());
             return;
+        }
+        // Collect stale orphans (deepest first) and delete them. Fresh entries survive
+        // the grace window even when another call no longer lists them.
+        List<Path> orphans = new ArrayList<>();
+        for (Path skillDir : foundSkillDirs) {
+            if (!retained.contains(skillDir) && isStale(skillDir, cutoff)) {
+                orphans.add(skillDir);
+            }
+        }
+        orphans.sort((a, b) -> b.getNameCount() - a.getNameCount());
+        for (Path orphan : orphans) {
+            try {
+                deleteRecursively(orphan);
+            } catch (IOException e) {
+                log.debug("Failed to delete orphan {}: {}", orphan, e.getMessage());
+            }
+        }
+        // Prune empty ancestor directories left after deletion
+        for (Path orphan : orphans) {
+            for (Path p = orphan.getParent();
+                    p != null && !p.equals(cacheRoot);
+                    p = p.getParent()) {
+                try (var probe = Files.list(p)) {
+                    if (probe.findAny().isEmpty()) {
+                        Files.deleteIfExists(p);
+                    } else {
+                        break;
+                    }
+                } catch (IOException e) {
+                    log.debug("Failed to probe/prune {}: {}", p, e.getMessage());
+                    break;
+                }
+            }
         }
     }
 

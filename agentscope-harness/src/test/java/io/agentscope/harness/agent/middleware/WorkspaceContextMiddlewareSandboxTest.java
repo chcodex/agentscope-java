@@ -78,6 +78,35 @@ class WorkspaceContextMiddlewareSandboxTest {
     }
 
     @Test
+    void sessionContext_queriesOsFromSandbox(@TempDir Path workspace) {
+        FakeSandboxFilesystem fs = new FakeSandboxFilesystem("sbox-8", "/workspace");
+        fs.osReleaseResponse = new ExecuteResponse("Ubuntu 22.04", 0, false);
+        fs.tempdirResponse = new ExecuteResponse("/sandbox-tmp", 0, false);
+        WorkspaceManager wm = track(new WorkspaceManager(workspace, fs));
+        WorkspaceContextMiddleware mw = new WorkspaceContextMiddleware(wm);
+
+        String prompt = mw.onSystemPrompt(null, RC, "BASE\n").block();
+        assertNotNull(prompt);
+        assertTrue(prompt.contains("Ubuntu 22.04"));
+        assertTrue(prompt.contains("/sandbox-tmp"));
+    }
+
+    @Test
+    void sessionContext_fallsBackToHostOnSandboxFailure(@TempDir Path workspace) {
+        FakeSandboxFilesystem fs = new FakeSandboxFilesystem("sbox-9", "/workspace");
+        fs.osReleaseResponse = new ExecuteResponse("", 1, false);
+        fs.unameResponse = new ExecuteResponse("", 1, false);
+        fs.tempdirResponse = new ExecuteResponse("", 1, false);
+        WorkspaceManager wm = track(new WorkspaceManager(workspace, fs));
+        WorkspaceContextMiddleware mw = new WorkspaceContextMiddleware(wm);
+
+        String prompt = mw.onSystemPrompt(null, RC, "BASE\n").block();
+        assertNotNull(prompt);
+        assertTrue(prompt.contains(System.getProperty("os.name")));
+        assertTrue(prompt.contains(System.getProperty("java.io.tmpdir")));
+    }
+
+    @Test
     void sessionContext_includesSessionInfo(@TempDir Path workspace) {
         FakeSandboxFilesystem fs = new FakeSandboxFilesystem("sbox-7", "/workspace");
         WorkspaceManager wm = track(new WorkspaceManager(workspace, fs));
@@ -93,6 +122,10 @@ class WorkspaceContextMiddlewareSandboxTest {
 
         private final String id;
         private final String workspaceRoot;
+
+        ExecuteResponse osReleaseResponse;
+        ExecuteResponse unameResponse;
+        ExecuteResponse tempdirResponse;
 
         FakeSandboxFilesystem(String id, String workspaceRoot) {
             this.id = id;
@@ -112,6 +145,21 @@ class WorkspaceContextMiddlewareSandboxTest {
         @Override
         public ExecuteResponse execute(
                 RuntimeContext runtimeContext, String command, Integer timeoutSeconds) {
+            if (command.contains("/etc/os-release")) {
+                return osReleaseResponse != null
+                        ? osReleaseResponse
+                        : new ExecuteResponse("Linux 6.2", 0, false);
+            }
+            if (command.contains("uname")) {
+                return unameResponse != null
+                        ? unameResponse
+                        : new ExecuteResponse("Linux", 0, false);
+            }
+            if (command.contains("TMPDIR")) {
+                return tempdirResponse != null
+                        ? tempdirResponse
+                        : new ExecuteResponse("/tmp", 0, false);
+            }
             return new ExecuteResponse("", 0, false);
         }
 
