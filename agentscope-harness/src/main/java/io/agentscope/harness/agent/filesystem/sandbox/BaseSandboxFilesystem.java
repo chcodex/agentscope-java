@@ -95,6 +95,9 @@ public abstract class BaseSandboxFilesystem implements AbstractSandboxFilesystem
                         + "done; fi";
 
         ExecuteResponse result = execute(runtimeContext, cmd, null);
+        if (!result.isSuccess()) {
+            return LsResult.fail(executeFailureMessage(result, "listing", path));
+        }
         String output = result.output() != null ? result.output().strip() : "";
 
         if ("__NOT_EXISTS__".equals(output)) {
@@ -136,8 +139,18 @@ public abstract class BaseSandboxFilesystem implements AbstractSandboxFilesystem
         if (!"text".equals(fileType)) {
             String cmd = "base64 " + escapedPath + " 2>/dev/null";
             ExecuteResponse result = execute(runtimeContext, cmd, null);
-            if (result.exitCode() != null && result.exitCode() != 0) {
-                return ReadResult.fail("File '" + filePath + "': file_not_found");
+            if (!result.isSuccess()) {
+                // Positive exit codes other than 124 (the timeout(1) convention — the command
+                // did not complete) mean the command ran and base64 could not read the file;
+                // stderr is discarded, so report the designed file_not_found signal instead of
+                // an empty error.
+                boolean commandRanAndFailedToRead =
+                        result.exitCode() != null
+                                && result.exitCode() > 0
+                                && result.exitCode() != 124;
+                return commandRanAndFailedToRead
+                        ? ReadResult.fail("File '" + filePath + "': file_not_found")
+                        : ReadResult.fail(executeFailureMessage(result, "reading", filePath));
             }
             String encoded = result.output() != null ? result.output().strip() : "";
             return ReadResult.success(new FileData(encoded, "base64"));
@@ -161,6 +174,9 @@ public abstract class BaseSandboxFilesystem implements AbstractSandboxFilesystem
                         + "; fi";
 
         ExecuteResponse result = execute(runtimeContext, cmd, null);
+        if (!result.isSuccess()) {
+            return ReadResult.fail(executeFailureMessage(result, "reading", filePath));
+        }
         String output = result.output() != null ? result.output() : "";
 
         if (output.strip().equals("__NOT_FOUND__")) {
@@ -276,6 +292,10 @@ public abstract class BaseSandboxFilesystem implements AbstractSandboxFilesystem
                         + " 2>/dev/null || true";
 
         ExecuteResponse result = execute(runtimeContext, cmd, null);
+        if (!result.isSuccess()) {
+            return GrepResult.fail(
+                    executeFailureMessage(result, "searching", path != null ? path : "."));
+        }
         String output = result.output() != null ? result.output().strip() : "";
 
         if (output.isEmpty()) {
@@ -314,6 +334,10 @@ public abstract class BaseSandboxFilesystem implements AbstractSandboxFilesystem
                         + "done";
 
         ExecuteResponse result = execute(runtimeContext, cmd, null);
+        if (!result.isSuccess()) {
+            return GlobResult.fail(
+                    executeFailureMessage(result, "globbing", path != null ? path : "/"));
+        }
         String output = result.output() != null ? result.output().strip() : "";
 
         if (output.isEmpty()) {
@@ -375,6 +399,20 @@ public abstract class BaseSandboxFilesystem implements AbstractSandboxFilesystem
         ExecuteResponse result =
                 execute(runtimeContext, "test -e " + escapedPath + " && echo yes || echo no", null);
         return result.output() != null && result.output().strip().startsWith("yes");
+    }
+
+    /**
+     * Builds the failure message for a non-successful {@link #execute} response, prefixing the
+     * operation context and falling back to the exit code when the response carries no
+     * diagnostic output.
+     */
+    private static String executeFailureMessage(
+            ExecuteResponse result, String operation, String target) {
+        String detail =
+                result.output() != null && !result.output().isBlank()
+                        ? result.output()
+                        : "exit code " + result.exitCode();
+        return "Error " + operation + " '" + target + "': " + detail;
     }
 
     /**
