@@ -103,7 +103,7 @@ public class FilesystemTool {
                 + "]";
     }
 
-    private String norm(String path) {
+    private String norm(String path, RuntimeContext runtimeContext) {
         if (pathNormalizer == null || path == null) {
             return path;
         }
@@ -113,7 +113,7 @@ public class FilesystemTool {
         if (isAbsolutePath(path)) {
             return path;
         }
-        return pathNormalizer.normalize(path);
+        return pathNormalizer.normalize(path, runtimeContext);
     }
 
     private static boolean isAbsolutePath(String path) {
@@ -152,7 +152,8 @@ public class FilesystemTool {
                     Integer limit) {
         int off = offset != null ? offset : 0;
         int lim = limit != null ? limit : 0;
-        ReadResult r = abstractFilesystem.read(runtimeContext, norm(path), off, lim);
+        ReadResult r =
+                abstractFilesystem.read(runtimeContext, norm(path, runtimeContext), off, lim);
         if (!r.isSuccess()) {
             return "Error: " + r.error();
         }
@@ -166,7 +167,8 @@ public class FilesystemTool {
             RuntimeContext runtimeContext,
             @ToolParam(name = "path", description = "Target file path") String path,
             @ToolParam(name = "content", description = "File content to write") String content) {
-        WriteResult r = abstractFilesystem.write(runtimeContext, norm(path), content);
+        WriteResult r =
+                abstractFilesystem.write(runtimeContext, norm(path, runtimeContext), content);
         return r.isSuccess() ? "Written to " + r.path() : "Error: " + r.error();
     }
 
@@ -188,7 +190,11 @@ public class FilesystemTool {
         boolean shouldReplaceAll = Boolean.TRUE.equals(replaceAll);
         EditResult r =
                 abstractFilesystem.edit(
-                        runtimeContext, norm(path), oldString, newString, shouldReplaceAll);
+                        runtimeContext,
+                        norm(path, runtimeContext),
+                        oldString,
+                        newString,
+                        shouldReplaceAll);
         return r.isSuccess()
                 ? "Edited " + r.path() + " (" + r.occurrences() + " replacement(s))"
                 : "Error: " + r.error();
@@ -222,7 +228,8 @@ public class FilesystemTool {
         if (effectiveLimit < 1) {
             return "Error: limit must be greater than 0";
         }
-        GrepResult r = abstractFilesystem.grep(runtimeContext, pattern, norm(path), glob);
+        GrepResult r =
+                abstractFilesystem.grep(runtimeContext, pattern, norm(path, runtimeContext), glob);
         if (!r.isSuccess()) {
             return "Error: " + r.error();
         }
@@ -269,7 +276,7 @@ public class FilesystemTool {
         if (effectiveLimit < 1) {
             return "Error: limit must be greater than 0";
         }
-        GlobResult r = abstractFilesystem.glob(runtimeContext, pattern, norm(path));
+        GlobResult r = abstractFilesystem.glob(runtimeContext, pattern, norm(path, runtimeContext));
         if (!r.isSuccess()) {
             return "Error: " + r.error();
         }
@@ -304,7 +311,7 @@ public class FilesystemTool {
     public String listFiles(
             RuntimeContext runtimeContext,
             @ToolParam(name = "path", description = "Directory path to list") String path) {
-        LsResult r = abstractFilesystem.ls(runtimeContext, norm(path));
+        LsResult r = abstractFilesystem.ls(runtimeContext, norm(path, runtimeContext));
         if (!r.isSuccess()) {
             return "Error: " + r.error();
         }

@@ -27,6 +27,7 @@ import static org.mockito.Mockito.when;
 import io.agentscope.core.agent.RuntimeContext;
 import io.agentscope.core.tool.AgentTool;
 import io.agentscope.core.tool.Toolkit;
+import io.agentscope.harness.agent.IsolationScope;
 import io.agentscope.harness.agent.filesystem.AbstractFilesystem;
 import io.agentscope.harness.agent.filesystem.local.LocalFilesystem;
 import io.agentscope.harness.agent.filesystem.model.EditResult;
@@ -37,6 +38,8 @@ import io.agentscope.harness.agent.filesystem.model.GrepMatch;
 import io.agentscope.harness.agent.filesystem.model.GrepResult;
 import io.agentscope.harness.agent.filesystem.model.LsResult;
 import io.agentscope.harness.agent.filesystem.model.ReadResult;
+import io.agentscope.harness.agent.filesystem.remote.store.NamespaceFactory;
+import io.agentscope.harness.agent.filesystem.spec.LocalFilesystemSpec;
 import io.agentscope.harness.agent.workspace.WorkspacePathNormalizer;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -250,6 +253,31 @@ class FilesystemToolTest {
         assertTrue(result.contains("[DIR]"));
         // 绝对路径不再被 normalizer 剥离, 直接透传至 filesystem
         verify(filesystem).ls(RT, agentPath);
+    }
+
+    @Test
+    void sessionIsolation_absoluteAndRelativeWorkspacePathsResolveToSameFile(
+            @TempDir Path workspace) {
+        NamespaceFactory namespaceFactory = IsolationScope.SESSION.toNamespaceFactory();
+        AbstractFilesystem filesystem =
+                new LocalFilesystemSpec()
+                        .isolationScope(IsolationScope.SESSION)
+                        .toFilesystem(workspace, namespaceFactory);
+        WorkspacePathNormalizer normalizer =
+                WorkspacePathNormalizer.of(
+                        workspace.toAbsolutePath().normalize().toString(), namespaceFactory);
+        tool = new FilesystemTool(filesystem, normalizer);
+        RuntimeContext runtimeContext = RuntimeContext.builder().sessionId("session-1").build();
+        Path absolutePath = workspace.resolve("session-1/artifact.txt").toAbsolutePath();
+
+        assertTrue(
+                tool.writeFile(runtimeContext, absolutePath.toString(), "artifact")
+                        .startsWith("Written to "));
+        assertTrue(Files.exists(absolutePath));
+        assertFalse(Files.exists(workspace.resolve("session-1/session-1/artifact.txt")));
+        assertEquals("artifact", tool.readFile(runtimeContext, "artifact.txt", null, null));
+        assertEquals(
+                "artifact", tool.readFile(runtimeContext, absolutePath.toString(), null, null));
     }
 
     // ==================== Bug reproduction: listFiles ambiguous error message ====================
