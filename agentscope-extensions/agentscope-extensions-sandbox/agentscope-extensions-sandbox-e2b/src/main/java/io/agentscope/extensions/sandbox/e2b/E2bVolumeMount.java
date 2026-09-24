@@ -15,74 +15,105 @@
  */
 package io.agentscope.extensions.sandbox.e2b;
 
-import com.fasterxml.jackson.annotation.JsonCreator;
-import com.fasterxml.jackson.annotation.JsonProperty;
 import io.agentscope.harness.agent.sandbox.SandboxException;
-import java.io.Serializable;
 import java.util.Objects;
 
 /**
- * A pre-existing E2B volume attached at sandbox creation time.
+ * Mount of a pre-existing E2B volume into a sandbox.
  *
- * <p>{@code name} is the existing volume name and {@code path} is the absolute in-sandbox mount
- * path. The mounts are sent as {@code volumeMounts: [{name, path}]} on {@code POST /sandboxes} and
- * re-attached automatically whenever the sandbox is recreated.
+ * <p>Volumes live independently of sandbox lifecycles and are attached at sandbox creation time
+ * via {@code volumeMounts: [{name, path}]} on {@code POST /sandboxes}. Volume lifecycle
+ * operations (create/delete/list, content read/write) stay in the E2B dashboard/SDK; this class
+ * only describes attach-at-create.
+ *
+ * <p>Both fields map 1:1 to E2B's {@code SandboxVolumeMount}: {@code name} is the existing
+ * volume name, {@code path} is the absolute in-sandbox mount path. E2B volumes are read-write
+ * and the platform defines no mount-path prefix whitelist, so validation only enforces
+ * non-blank {@code name} and an absolute {@code path}.
  */
-public final class E2bVolumeMount implements Serializable {
+public class E2bVolumeMount {
 
-    private static final long serialVersionUID = 1L;
+    private String name;
+    private String path;
 
-    private final String name;
-    private final String path;
+    /** Default constructor. */
+    public E2bVolumeMount() {}
 
     /**
      * Creates a volume mount.
      *
-     * @param name existing volume name (blank rejected)
-     * @param path absolute in-sandbox mount path (blank or relative rejected)
+     * @param name existing E2B volume name
+     * @param path absolute in-sandbox mount path
      */
-    @JsonCreator
-    public E2bVolumeMount(@JsonProperty("name") String name, @JsonProperty("path") String path) {
-        if (name == null || name.isBlank()) {
-            throw new SandboxException.SandboxConfigurationException(
-                    "E2B volume mount name is required");
-        }
-        if (path == null || path.isBlank()) {
-            throw new SandboxException.SandboxConfigurationException(
-                    "E2B volume mount path is required");
-        }
-        if (!path.startsWith("/")) {
-            throw new SandboxException.SandboxConfigurationException(
-                    "E2B volume mount path must be absolute: " + path);
-        }
-        this.name = name;
-        this.path = path;
+    public E2bVolumeMount(String name, String path) {
+        setName(name);
+        setPath(path);
     }
 
     /**
-     * Returns the existing volume name.
+     * Returns the existing E2B volume name.
      *
-     * @return volume name (never blank)
+     * @return volume name
      */
     public String getName() {
         return name;
     }
 
+    public E2bVolumeMount setName(String name) {
+        if (name == null || name.isBlank()) {
+            throw new SandboxException.SandboxConfigurationException(
+                    "E2B volume mount name must be set (name of an existing volume)");
+        }
+        this.name = name.strip();
+        return this;
+    }
+
     /**
-     * Returns the absolute in-sandbox mount path.
+     * Returns the normalized absolute in-sandbox mount path.
      *
-     * @return mount path (never blank, always absolute)
+     * @return absolute mount path (duplicate slashes collapsed, no trailing slash except root)
      */
     public String getPath() {
         return path;
     }
 
+    public E2bVolumeMount setPath(String path) {
+        this.path = normalizeMountPath(path);
+        return this;
+    }
+
     /**
-     * Returns whether a mount covers the workspace root, i.e. the workspace lives on the volume.
+     * Normalizes an in-sandbox mount path: trims whitespace, collapses duplicate slashes and
+     * strips a trailing slash (except for the root {@code /} itself).
      *
-     * @param workspaceRoot workspace root path (null/blank never covered)
-     * @param mountPath volume mount path (null/blank never covers)
-     * @return true when {@code mountPath} equals {@code workspaceRoot} or is one of its ancestors
+     * @param path raw mount path
+     * @return normalized absolute path
+     * @throws SandboxException.SandboxConfigurationException when the path is not absolute
+     */
+    public static String normalizeMountPath(String path) {
+        if (path == null || path.isBlank()) {
+            throw new SandboxException.SandboxConfigurationException(
+                    "E2B volume mount path must be set (absolute in-sandbox path, e.g. /mnt/data)");
+        }
+        String normalized = path.strip().replace('\\', '/').replaceAll("/+", "/");
+        if (!normalized.startsWith("/")) {
+            throw new SandboxException.SandboxConfigurationException(
+                    "E2B volume mount path must be absolute but was: " + path);
+        }
+        if (normalized.length() > 1 && normalized.endsWith("/")) {
+            normalized = normalized.substring(0, normalized.length() - 1);
+        }
+        return normalized;
+    }
+
+    /**
+     * Returns whether {@code workspaceRoot} lives on the given mount, i.e. it equals the mount
+     * path or sits strictly beneath it. The trailing-slash guard keeps {@code /mnt/data-x} from
+     * matching a {@code /mnt/data} mount.
+     *
+     * @param workspaceRoot workspace root to test (may be blank)
+     * @param mountPath normalized mount path (may be blank)
+     * @return true when the workspace root is hosted on the mount
      */
     public static boolean coversWorkspaceRoot(String workspaceRoot, String mountPath) {
         if (workspaceRoot == null
@@ -91,9 +122,12 @@ public final class E2bVolumeMount implements Serializable {
                 || mountPath.isBlank()) {
             return false;
         }
-        String root = stripTrailingSlash(workspaceRoot.replace('\\', '/'));
-        String mount = stripTrailingSlash(mountPath.replace('\\', '/'));
-        return mount.equals(root) || root.startsWith(mount + "/");
+        String root = normalizeMountPath(workspaceRoot);
+        String mount = normalizeMountPath(mountPath);
+        if (mount.equals("/")) {
+            return true;
+        }
+        return root.equals(mount) || root.startsWith(mount + "/");
     }
 
     @Override
@@ -104,7 +138,7 @@ public final class E2bVolumeMount implements Serializable {
         if (!(o instanceof E2bVolumeMount other)) {
             return false;
         }
-        return name.equals(other.name) && path.equals(other.path);
+        return Objects.equals(name, other.name) && Objects.equals(path, other.path);
     }
 
     @Override
@@ -115,12 +149,5 @@ public final class E2bVolumeMount implements Serializable {
     @Override
     public String toString() {
         return "E2bVolumeMount{name='" + name + "', path='" + path + "'}";
-    }
-
-    private static String stripTrailingSlash(String s) {
-        if (s.length() > 1 && s.endsWith("/")) {
-            return s.substring(0, s.length() - 1);
-        }
-        return s;
     }
 }
