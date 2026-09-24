@@ -21,6 +21,7 @@ import io.agentscope.harness.agent.sandbox.SandboxClientOptions;
 import io.agentscope.harness.agent.sandbox.WorkspaceSpec;
 import io.agentscope.harness.agent.sandbox.snapshot.NoopSnapshotSpec;
 import io.agentscope.harness.agent.sandbox.snapshot.SandboxSnapshotSpec;
+import java.util.List;
 
 /** {@link SandboxFilesystemSpec} for E2B cloud sandboxes. */
 public class E2bFilesystemSpec extends SandboxFilesystemSpec {
@@ -72,6 +73,26 @@ public class E2bFilesystemSpec extends SandboxFilesystemSpec {
 
     public E2bFilesystemSpec codec(E2bCodec codec) {
         options.setCodec(codec);
+        return this;
+    }
+
+    public E2bFilesystemSpec volumeMount(String name, String path) {
+        options.addVolumeMount(name, path);
+        return this;
+    }
+
+    public E2bFilesystemSpec volumeMount(E2bVolumeMount mount) {
+        options.addVolumeMount(mount);
+        return this;
+    }
+
+    /**
+     * Replaces all configured volume mounts.
+     *
+     * @param mounts replacement mounts (null or empty clears previously added ones)
+     */
+    public E2bFilesystemSpec volumeMounts(List<E2bVolumeMount> mounts) {
+        options.setVolumeMounts(mounts);
         return this;
     }
 

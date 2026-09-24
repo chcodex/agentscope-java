@@ -24,6 +24,7 @@ import io.agentscope.harness.agent.sandbox.SandboxException;
 import io.agentscope.harness.agent.sandbox.WorkspaceMountSupport;
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 import org.slf4j.Logger;
@@ -87,8 +88,23 @@ public class E2bSandbox extends AbstractBaseSandbox {
     }
 
     @Override
+    protected boolean probeWorkspaceRootForPreservedResume() {
+        if (e2bState.isWorkspaceOnVolume()) {
+            // Files live on a persistent volume — the directory is durable across sandbox
+            // recreations, so treat it as preserved without probing.
+            return true;
+        }
+        return super.probeWorkspaceRootForPreservedResume();
+    }
+
+    @Override
     protected InputStream doPersistWorkspace() throws Exception {
         if (e2bState.getPersistenceMode() == E2bPersistenceMode.NATIVE_SNAPSHOT) {
+            // Native snapshots preserve the software environment (installed deps, system state);
+            // volume bytes stay durable via the volume itself and mounts are re-attached on
+            // restore.
+            // TODO(volume-snapshot): verify whether native snapshots capture mounted volume
+            // content (needed only for mounts nested under a non-volume workspace root).
             JsonNode snap = platform.createSandboxSnapshot(e2bState.getSandboxId(), snapshotName());
             String id = snap.path("snapshotID").asText("");
             if (id.isBlank()) {
@@ -99,11 +115,18 @@ public class E2bSandbox extends AbstractBaseSandbox {
             e2bState.getSnapshotIds().add(id);
             return new ByteArrayInputStream(E2bSnapshotRefs.encodeSnapshotId(id));
         }
+        if (e2bState.isWorkspaceOnVolume()) {
+            // Workspace bytes are durable via the volume — nothing to archive.
+            return InputStream.nullInputStream();
+        }
         String root = e2bState.getWorkspaceSpec().getRoot();
         String tarPath = "/tmp/agentscope-ws-" + UUID.randomUUID() + ".tar";
         StringBuilder script = new StringBuilder("tar ");
         for (String ex :
                 WorkspaceMountSupport.tarExcludeArgsForBindMounts(e2bState.getWorkspaceSpec())) {
+            script.append(ex).append(' ');
+        }
+        for (String ex : volumeTarExcludeArgs()) {
             script.append(ex).append(' ');
         }
         script.append("-cf ")
@@ -139,6 +162,11 @@ public class E2bSandbox extends AbstractBaseSandbox {
     @Override
     protected void doHydrateWorkspace(InputStream archive) throws Exception {
         byte[] all = archive.readAllBytes();
+        if (all.length == 0) {
+            // Volume-backed workspaces persist nothing to hydrate; an empty archive is the
+            // expected no-op marker, not an error.
+            return;
+        }
         String nativeId = E2bSnapshotRefs.decodeSnapshotIdIfPresent(all);
         if (nativeId != null && !nativeId.isBlank()) {
             restoreSandboxFromSnapshotTemplate(nativeId);
@@ -167,6 +195,10 @@ public class E2bSandbox extends AbstractBaseSandbox {
 
     @Override
     protected void doDestroyWorkspace() throws Exception {
+        if (e2bState.isWorkspaceOnVolume()) {
+            // Do not destroy volume-backed workspaces; the mount is shared/persistent.
+            return;
+        }
         try {
             envd().runShell(
                             e2bState,
@@ -187,7 +219,9 @@ public class E2bSandbox extends AbstractBaseSandbox {
         if (e2bState.getSandboxId() == null || e2bState.getSandboxId().isBlank()) {
             JsonNode n =
                     platform.createSandbox(
-                            e2bState.getTemplateId(), opt.getSandboxTimeoutSeconds());
+                            e2bState.getTemplateId(),
+                            opt.getSandboxTimeoutSeconds(),
+                            e2bState.getVolumeMounts());
             platform.applySandboxFields(e2bState, n);
             applyDefaultDomain();
             envd = null;
@@ -204,7 +238,9 @@ public class E2bSandbox extends AbstractBaseSandbox {
             e2bState.setWorkspaceProjectionHash(null);
             JsonNode n =
                     platform.createSandbox(
-                            e2bState.getTemplateId(), opt.getSandboxTimeoutSeconds());
+                            e2bState.getTemplateId(),
+                            opt.getSandboxTimeoutSeconds(),
+                            e2bState.getVolumeMounts());
             platform.applySandboxFields(e2bState, n);
         }
         applyDefaultDomain();
@@ -220,7 +256,10 @@ public class E2bSandbox extends AbstractBaseSandbox {
     private void restoreSandboxFromSnapshotTemplate(String snapshotTemplateId) throws Exception {
         String oldId = e2bState.getSandboxId();
         JsonNode created =
-                platform.createSandbox(snapshotTemplateId, opt.getSandboxTimeoutSeconds());
+                platform.createSandbox(
+                        snapshotTemplateId,
+                        opt.getSandboxTimeoutSeconds(),
+                        e2bState.getVolumeMounts());
         platform.applySandboxFields(e2bState, created);
         applyDefaultDomain();
         if (e2bState.isSandboxOwned()
@@ -262,6 +301,23 @@ public class E2bSandbox extends AbstractBaseSandbox {
     private static String snapshotName() {
         String shortId = UUID.randomUUID().toString().replace("-", "").substring(0, 8);
         return "agentscope-" + shortId + "-" + System.currentTimeMillis();
+    }
+
+    /**
+     * {@code tar --exclude} args for volume mounts nested strictly beneath the workspace root.
+     * A mount covering the root needs no exclusion (persistence is a no-op in that case).
+     */
+    private List<String> volumeTarExcludeArgs() {
+        List<E2bVolumeMount> mounts = e2bState.getVolumeMounts();
+        if (mounts.isEmpty()) {
+            return List.of();
+        }
+        List<String> paths = new ArrayList<>(mounts.size());
+        for (E2bVolumeMount m : mounts) {
+            paths.add(m.getPath());
+        }
+        return WorkspaceMountSupport.tarExcludeArgsForAbsolutePaths(
+                e2bState.getWorkspaceSpec().getRoot(), paths);
     }
 
     private E2bEnvdProcessClient envd() throws Exception {
