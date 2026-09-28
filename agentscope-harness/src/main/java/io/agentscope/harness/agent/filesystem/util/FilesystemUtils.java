@@ -15,6 +15,7 @@
  */
 package io.agentscope.harness.agent.filesystem.util;
 
+import io.agentscope.harness.agent.filesystem.model.EditResult;
 import java.util.Set;
 
 /**
@@ -64,12 +65,56 @@ public final class FilesystemUtils {
     }
 
     /**
+     * Validates {@code edit()} arguments shared by every filesystem implementation.
+     *
+     * <p>Both are rejected uniformly so all implementations behave identically: a {@code null}
+     * {@code newString} is not a deletion (pass {@code ""} for that, which keeps the normal
+     * replacement semantics and occurrence count), and an empty {@code oldString} would make
+     * {@link #countOccurrences} loop forever.
+     *
+     * @return an {@link EditResult#fail} result when the arguments are invalid, otherwise
+     *         {@code null} to signal that the edit may proceed
+     */
+    public static EditResult validateEditArguments(String filePath, String oldStr, String newStr) {
+        if (oldStr == null || oldStr.isEmpty()) {
+            return EditResult.fail("Error: oldString must not be null or empty");
+        }
+        if (newStr == null) {
+            return EditResult.fail(
+                    "Error: newString must not be null; pass an empty string to delete the"
+                            + " matched text");
+        }
+        return null;
+    }
+
+    /**
+     * Perform string replacement with occurrence validation.
+     *
+     * @return {@code Object[]} of {@code [newContent, occurrenceCount]} on success, or a
+     *         single-element array {@code [errorMessage]} on failure
+     * @deprecated superseded by {@link #stringReplacement(String, String, String, boolean)},
+     *     which returns the same result as a typed value. {@code agentscope-harness} is
+     *     published to Maven Central and this method shipped with the {@code Object[]}
+     *     signature in v2.0.1-v2.0.3, so the old signature is retained as a source/binary
+     *     compatibility bridge for downstream callers.
+     */
+    @Deprecated
+    public static Object[] performStringReplacement(
+            String content, String oldString, String newString, boolean replaceAll) {
+        ReplacementResult result = stringReplacement(content, oldString, newString, replaceAll);
+        if (!result.isSuccess()) {
+            return new Object[] {result.error()};
+        }
+        return new Object[] {result.content(), result.occurrences()};
+    }
+
+    /**
      * Perform string replacement with occurrence validation.
      *
      * @return {@link ReplacementResult#success(String, int)} on success, or
      *         {@link ReplacementResult#error(String)} on failure
      */
-    public static ReplacementResult performStringReplacement(
+    public static ReplacementResult stringReplacement(
             String content, String oldString, String newString, boolean replaceAll) {
         int occurrences = countOccurrences(content, oldString);
 

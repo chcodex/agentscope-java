@@ -351,6 +351,11 @@ public class LocalFilesystem implements AbstractFilesystem {
             String oldString,
             String newString,
             boolean replaceAll) {
+        EditResult invalid = FilesystemUtils.validateEditArguments(filePath, oldString, newString);
+        if (invalid != null) {
+            return invalid;
+        }
+
         Path resolved = resolvePath(runtimeContext, filePath);
 
         if (!Files.exists(resolved) || !Files.isRegularFile(resolved)) {
@@ -370,7 +375,7 @@ public class LocalFilesystem implements AbstractFilesystem {
             String normalizedNew = newString.replace("\r\n", "\n").replace("\r", "\n");
 
             FilesystemUtils.ReplacementResult result =
-                    FilesystemUtils.performStringReplacement(
+                    FilesystemUtils.stringReplacement(
                             content, normalizedOld, normalizedNew, replaceAll);
 
             if (!result.isSuccess()) {
