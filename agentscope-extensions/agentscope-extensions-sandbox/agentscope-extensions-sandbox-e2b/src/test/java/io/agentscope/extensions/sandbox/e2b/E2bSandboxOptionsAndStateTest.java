@@ -16,12 +16,24 @@
 package io.agentscope.extensions.sandbox.e2b;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 
+import io.agentscope.core.agent.RuntimeContext;
+import io.agentscope.harness.agent.sandbox.SandboxAcquireResult;
+import io.agentscope.harness.agent.sandbox.SandboxManager;
+import io.agentscope.harness.agent.sandbox.SessionSandboxStateStore;
 import io.agentscope.harness.agent.sandbox.WorkspaceSpec;
+import io.agentscope.harness.agent.sandbox.snapshot.SandboxSnapshot;
+import java.io.IOException;
+import java.io.InputStream;
 import java.util.List;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 
 class E2bSandboxOptionsAndStateTest {
 
@@ -229,6 +241,30 @@ class E2bSandboxOptionsAndStateTest {
         sandbox.shutdown();
     }
 
+    @Test
+    void clientMergeRetentionCallUnsetKeepsDefault() throws Exception {
+        E2bSandboxClientOptions defaults = new E2bSandboxClientOptions();
+        defaults.setSnapshotRetention(2);
+        E2bSandboxClient client = new E2bSandboxClient(defaults, null);
+
+        io.agentscope.harness.agent.sandbox.Sandbox unset =
+                client.create(new WorkspaceSpec(), null, new E2bSandboxClientOptions());
+        assertEquals(2, mergedRetention(unset));
+
+        E2bSandboxClientOptions call = new E2bSandboxClientOptions();
+        call.setSnapshotRetention(5);
+        io.agentscope.harness.agent.sandbox.Sandbox over =
+                client.create(new WorkspaceSpec(), null, call);
+        assertEquals(5, mergedRetention(over));
+    }
+
+    private static int mergedRetention(io.agentscope.harness.agent.sandbox.Sandbox sandbox)
+            throws Exception {
+        java.lang.reflect.Field f = E2bSandbox.class.getDeclaredField("opt");
+        f.setAccessible(true);
+        return ((E2bSandboxClientOptions) f.get(sandbox)).getSnapshotRetention();
+    }
+
     private static E2bSandboxState getE2bState(io.agentscope.harness.agent.sandbox.Sandbox sandbox)
             throws Exception {
         java.lang.reflect.Field f = E2bSandbox.class.getDeclaredField("e2bState");
@@ -357,6 +393,252 @@ class E2bSandboxOptionsAndStateTest {
             }
         } finally {
             server.shutdown();
+        }
+    }
+
+    @Test
+    void stopFailureRollsBackRecordAndKeepsReferencedSnapshot() throws Exception {
+        okhttp3.mockwebserver.MockWebServer server = new okhttp3.mockwebserver.MockWebServer();
+        server.start();
+        try {
+            server.enqueue(
+                    new okhttp3.mockwebserver.MockResponse()
+                            .setBody("{\"snapshotID\":\"team/new-snap:tag\"}"));
+            server.enqueue(new okhttp3.mockwebserver.MockResponse().setResponseCode(200));
+
+            E2bSandboxState state = new E2bSandboxState();
+            state.setWorkspaceSpec(new WorkspaceSpec());
+            state.setSandboxOwned(true);
+            state.setSandboxId("sbx-1");
+            state.setPersistenceMode(E2bPersistenceMode.NATIVE_SNAPSHOT);
+            state.setSnapshotIds(new java.util.ArrayList<>(List.of("team/old-snap:tag")));
+            state.setSnapshot(new FailingSnapshot());
+
+            E2bSandboxClientOptions opt = new E2bSandboxClientOptions();
+            opt.setApiKey("k");
+            opt.setApiBaseUrl(server.url("/").toString());
+            opt.setMaxRetries(1);
+            opt.setSnapshotRetention(1);
+            E2bSandbox sandbox = new E2bSandbox(state, opt);
+
+            try {
+                sandbox.stop();
+                assertTrue(false, "stop should propagate the archive persist failure");
+            } catch (IOException expected) {
+            }
+            sandbox.shutdown();
+
+            // snapshot create + kill only: the failed stop rolls its record back, so the list
+            // never exceeds retention and no template is deleted; the still-referenced old
+            // snapshot is kept.
+            assertEquals(2, server.getRequestCount());
+            assertEquals("/sandboxes/sbx-1/snapshots", server.takeRequest().getPath());
+            assertEquals("/sandboxes/sbx-1", server.takeRequest().getPath());
+            assertEquals(List.of("team/old-snap:tag"), state.getSnapshotIds());
+        } finally {
+            server.shutdown();
+        }
+    }
+
+    @Test
+    void stopThenShutdownCleansUpToRetention() throws Exception {
+        okhttp3.mockwebserver.MockWebServer server = new okhttp3.mockwebserver.MockWebServer();
+        server.start();
+        try {
+            server.enqueue(
+                    new okhttp3.mockwebserver.MockResponse()
+                            .setBody("{\"snapshotID\":\"team/new-snap:tag\"}"));
+            server.enqueue(new okhttp3.mockwebserver.MockResponse().setResponseCode(200));
+            server.enqueue(new okhttp3.mockwebserver.MockResponse().setResponseCode(200));
+
+            E2bSandboxState state = new E2bSandboxState();
+            state.setWorkspaceSpec(new WorkspaceSpec());
+            state.setSandboxOwned(true);
+            state.setSandboxId("sbx-1");
+            state.setPersistenceMode(E2bPersistenceMode.NATIVE_SNAPSHOT);
+            state.setSnapshotIds(new java.util.ArrayList<>(List.of("team/old-snap:tag")));
+            state.setSnapshot(new CapturingSnapshot());
+
+            E2bSandboxClientOptions opt = new E2bSandboxClientOptions();
+            opt.setApiKey("k");
+            opt.setApiBaseUrl(server.url("/").toString());
+            opt.setMaxRetries(1);
+            opt.setSnapshotRetention(1);
+            E2bSandbox sandbox = new E2bSandbox(state, opt);
+
+            sandbox.stop();
+            sandbox.shutdown();
+
+            // snapshot create + kill + one template delete; only the newest id is kept.
+            assertEquals(3, server.getRequestCount());
+            assertEquals("/sandboxes/sbx-1/snapshots", server.takeRequest().getPath());
+            assertEquals("/sandboxes/sbx-1", server.takeRequest().getPath());
+            assertEquals("/templates/team%2Fold-snap:tag", server.takeRequest().getPath());
+            assertEquals(List.of("team/new-snap:tag"), state.getSnapshotIds());
+        } finally {
+            server.shutdown();
+        }
+    }
+
+    @Test
+    void stopFailureDropsOnlyTheIdItsOwnPersistRecorded() throws Exception {
+        okhttp3.mockwebserver.MockWebServer server = new okhttp3.mockwebserver.MockWebServer();
+        server.start();
+        try {
+            server.enqueue(
+                    new okhttp3.mockwebserver.MockResponse()
+                            .setBody("{\"snapshotID\":\"team/new-snap:tag\"}"));
+
+            E2bSandboxState state = new E2bSandboxState();
+            state.setWorkspaceSpec(new WorkspaceSpec());
+            state.setSandboxId("sbx-1");
+            state.setPersistenceMode(E2bPersistenceMode.NATIVE_SNAPSHOT);
+            state.setSnapshotIds(new java.util.ArrayList<>(List.of("team/old-snap:tag")));
+            // Another session over the same state object records its snapshot while this
+            // instance's archive persist is in flight.
+            state.setSnapshot(new FailingSnapshot("team/other-snap:tag", state));
+
+            E2bSandboxClientOptions opt = new E2bSandboxClientOptions();
+            opt.setApiKey("k");
+            opt.setApiBaseUrl(server.url("/").toString());
+            opt.setMaxRetries(1);
+            E2bSandbox sandbox = new E2bSandbox(state, opt);
+
+            try {
+                sandbox.stop();
+                assertTrue(false, "stop should propagate the archive persist failure");
+            } catch (IOException expected) {
+            }
+
+            assertEquals(
+                    List.of("team/old-snap:tag", "team/other-snap:tag"),
+                    state.getSnapshotIds(),
+                    "the failed persist drops its own id only, not the one another writer"
+                            + " appended");
+        } finally {
+            server.shutdown();
+        }
+    }
+
+    @Test
+    void failedStopPersistsRolledBackRecordThroughSandboxManager() throws Exception {
+        okhttp3.mockwebserver.MockWebServer server = new okhttp3.mockwebserver.MockWebServer();
+        server.start();
+        try {
+            server.enqueue(
+                    new okhttp3.mockwebserver.MockResponse()
+                            .setBody("{\"snapshotID\":\"team/new-snap:tag\"}"));
+            server.enqueue(new okhttp3.mockwebserver.MockResponse().setResponseCode(200));
+
+            E2bSandboxClientOptions opt = new E2bSandboxClientOptions();
+            opt.setApiKey("k");
+            opt.setApiBaseUrl(server.url("/").toString());
+            opt.setMaxRetries(1);
+            E2bSandboxClient client = new E2bSandboxClient(opt, null);
+
+            E2bSandboxState state = new E2bSandboxState();
+            state.setWorkspaceSpec(new WorkspaceSpec());
+            state.setSandboxOwned(true);
+            state.setSandboxId("sbx-1");
+            state.setPersistenceMode(E2bPersistenceMode.NATIVE_SNAPSHOT);
+            state.setSnapshotIds(new java.util.ArrayList<>(List.of("team/old-snap:tag")));
+            state.setSnapshot(new FailingSnapshot());
+            E2bSandbox sandbox = new E2bSandbox(state, opt);
+
+            SessionSandboxStateStore store = mock(SessionSandboxStateStore.class);
+            SandboxManager manager = new SandboxManager(client, store, "e2b-agent");
+            SandboxAcquireResult acquired = SandboxAcquireResult.selfManaged(sandbox);
+
+            // release swallows the stop failure (logging it) and still shuts down; the middleware
+            // persists the state after release, so the rollback must be visible to the store.
+            manager.release(acquired);
+            manager.persistState(acquired, null, RuntimeContext.builder().sessionId("s1").build());
+
+            ArgumentCaptor<String> persisted = ArgumentCaptor.forClass(String.class);
+            verify(store).save(any(), persisted.capture());
+            assertTrue(persisted.getValue().contains("team/old-snap:tag"), persisted.getValue());
+            assertFalse(
+                    persisted.getValue().contains("team/new-snap:tag"),
+                    "the persisted record must not reference the never-persisted snapshot: "
+                            + persisted.getValue());
+        } finally {
+            server.shutdown();
+        }
+    }
+
+    /**
+     * {@link SandboxSnapshot} whose archive persist always fails; optionally emulating a second
+     * writer recording its own snapshot id in the shared state while the persist is in flight.
+     */
+    private static final class FailingSnapshot implements SandboxSnapshot {
+
+        private final String concurrentlyRecordedId;
+        private final E2bSandboxState sharedState;
+
+        FailingSnapshot() {
+            this(null, null);
+        }
+
+        FailingSnapshot(String concurrentlyRecordedId, E2bSandboxState sharedState) {
+            this.concurrentlyRecordedId = concurrentlyRecordedId;
+            this.sharedState = sharedState;
+        }
+
+        @Override
+        public void persist(InputStream workspaceArchive) throws Exception {
+            if (concurrentlyRecordedId != null) {
+                sharedState.getSnapshotIds().add(concurrentlyRecordedId);
+            }
+            throw new IOException("disk full");
+        }
+
+        @Override
+        public InputStream restore() {
+            return InputStream.nullInputStream();
+        }
+
+        @Override
+        public boolean isRestorable() {
+            return false;
+        }
+
+        @Override
+        public String getId() {
+            return "failing";
+        }
+
+        @Override
+        public String getType() {
+            return "failing";
+        }
+    }
+
+    /** {@link SandboxSnapshot} that accepts the archive. */
+    private static final class CapturingSnapshot implements SandboxSnapshot {
+
+        @Override
+        public void persist(InputStream workspaceArchive) throws Exception {
+            workspaceArchive.readAllBytes();
+        }
+
+        @Override
+        public InputStream restore() {
+            return InputStream.nullInputStream();
+        }
+
+        @Override
+        public boolean isRestorable() {
+            return true;
+        }
+
+        @Override
+        public String getId() {
+            return "capturing";
+        }
+
+        @Override
+        public String getType() {
+            return "capturing";
         }
     }
 }

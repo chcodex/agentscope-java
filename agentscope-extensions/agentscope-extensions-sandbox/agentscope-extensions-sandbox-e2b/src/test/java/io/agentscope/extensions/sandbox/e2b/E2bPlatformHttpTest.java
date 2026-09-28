@@ -109,16 +109,28 @@ class E2bPlatformHttpTest {
     }
 
     @Test
-    void pruneSnapshotsRetentionOneDeletesAllButNewest() throws Exception {
+    void cleanupSnapshotsRetainsLastNByInsertionOrder() throws Exception {
         server.enqueue(new MockResponse().setResponseCode(200));
         server.enqueue(new MockResponse().setResponseCode(200));
 
         List<String> kept =
-                platform.pruneSnapshots(
-                        "agentscope-a1b2c3d4-1701000000000",
+                platform.cleanupSnapshots(List.of("snap-1", "snap-2", "snap-3", "snap-4"), 2);
+
+        assertEquals(2, server.getRequestCount());
+        assertEquals(List.of("snap-3", "snap-4"), kept);
+    }
+
+    @Test
+    void cleanupSnapshotsRetentionOneDeletesAllButNewest() throws Exception {
+        server.enqueue(new MockResponse().setResponseCode(200));
+        server.enqueue(new MockResponse().setResponseCode(200));
+
+        List<String> kept =
+                platform.cleanupSnapshots(
                         List.of(
                                 "team/agentscope-a1b2c3d4-1699999999999:latest",
-                                "team/agentscope-a1b2c3d4-1700000000000:latest"),
+                                "team/agentscope-a1b2c3d4-1700000000000:latest",
+                                "agentscope-a1b2c3d4-1701000000000"),
                         1);
 
         assertEquals("DELETE", server.takeRequest(5, TimeUnit.SECONDS).getMethod());
@@ -127,16 +139,16 @@ class E2bPlatformHttpTest {
     }
 
     @Test
-    void pruneSnapshotsRetentionKeepsConfiguredCount() throws Exception {
+    void cleanupSnapshotsRetentionKeepsConfiguredCount() throws Exception {
         server.enqueue(new MockResponse().setResponseCode(200));
 
         List<String> kept =
-                platform.pruneSnapshots(
-                        "agentscope-a1b2c3d4-1703000000000",
+                platform.cleanupSnapshots(
                         List.of(
                                 "team/agentscope-a1b2c3d4-1699999999999:latest",
                                 "team/agentscope-a1b2c3d4-1700000000000:latest",
-                                "team/agentscope-a1b2c3d4-1702000000000:latest"),
+                                "team/agentscope-a1b2c3d4-1702000000000:latest",
+                                "agentscope-a1b2c3d4-1703000000000"),
                         3);
 
         assertEquals(
@@ -152,114 +164,17 @@ class E2bPlatformHttpTest {
     }
 
     @Test
-    void pruneSnapshotsKeepsLastNByInsertionOrder() throws Exception {
-        server.enqueue(new MockResponse().setResponseCode(200));
-        server.enqueue(new MockResponse().setResponseCode(200));
-
-        List<String> kept =
-                platform.pruneSnapshots("snap-4", List.of("snap-1", "snap-2", "snap-3"), 2);
-
-        assertEquals("/templates/snap-1", server.takeRequest(5, TimeUnit.SECONDS).getPath());
-        assertEquals("/templates/snap-2", server.takeRequest(5, TimeUnit.SECONDS).getPath());
-        assertEquals(2, server.getRequestCount());
-        assertEquals(List.of("snap-3", "snap-4"), kept);
-    }
-
-    @Test
-    void pruneSnapshotsSkipsKeepIdInOlder() throws Exception {
+    void cleanupSnapshotsSkipsNullAndBlank() throws Exception {
         server.enqueue(new MockResponse().setResponseCode(200));
 
-        List<String> kept =
-                platform.pruneSnapshots(
-                        "agentscope-a1b2c3d4-1703000000000",
-                        List.of(
-                                "agentscope-a1b2c3d4-1699999999999",
-                                "agentscope-a1b2c3d4-1700000000000",
-                                "agentscope-a1b2c3d4-1703000000000"),
-                        2);
+        java.util.List<String> ids = new java.util.ArrayList<>();
+        ids.add(null);
+        ids.add("   ");
+        ids.add("snap-1");
+        ids.add("snap-2");
+        ids.add("snap-3");
 
-        assertEquals(
-                "/templates/agentscope-a1b2c3d4-1699999999999",
-                server.takeRequest(5, TimeUnit.SECONDS).getPath());
-        assertEquals(1, server.getRequestCount());
-        assertEquals(
-                List.of("agentscope-a1b2c3d4-1700000000000", "agentscope-a1b2c3d4-1703000000000"),
-                kept);
-    }
-
-    @Test
-    void pruneSnapshotsFifoRetainsLastN() throws Exception {
-        server.enqueue(new MockResponse().setResponseCode(200));
-        server.enqueue(new MockResponse().setResponseCode(200));
-        server.enqueue(new MockResponse().setResponseCode(200));
-
-        List<String> kept =
-                platform.pruneSnapshots(
-                        "snap-5", List.of("snap-1", "snap-2", "snap-3", "snap-4"), 2);
-
-        assertEquals(3, server.getRequestCount());
-        assertEquals(List.of("snap-4", "snap-5"), kept);
-    }
-
-    @Test
-    void cleanupSnapshotsRetainsLastNByInsertionOrder() throws Exception {
-        server.enqueue(new MockResponse().setResponseCode(200));
-        server.enqueue(new MockResponse().setResponseCode(200));
-
-        List<String> kept =
-                platform.cleanupSnapshots(List.of("snap-1", "snap-2", "snap-3", "snap-4"), 2);
-
-        assertEquals(2, server.getRequestCount());
-        assertEquals(List.of("snap-3", "snap-4"), kept);
-    }
-
-    @Test
-    void pruneSnapshotsNonPositiveRetentionKeepsAll() {
-        List<String> older = List.of("team/agentscope-a1b2c3d4-1699999999999:latest");
-
-        assertEquals(
-                List.of("team/agentscope-a1b2c3d4-1699999999999:latest", "keep"),
-                platform.pruneSnapshots("keep", older, 0));
-        assertEquals(
-                List.of("team/agentscope-a1b2c3d4-1699999999999:latest", "keep"),
-                platform.pruneSnapshots("keep", older, -1));
-        assertEquals(0, server.getRequestCount());
-    }
-
-    @Test
-    void pruneSnapshotsContinuesAfterSingleDeleteFailure() throws Exception {
-        server.enqueue(new MockResponse().setResponseCode(500).setBody("boom"));
-        server.enqueue(new MockResponse().setResponseCode(200));
-
-        List<String> kept =
-                platform.pruneSnapshots(
-                        "agentscope-a1b2c3d4-1701000000000",
-                        List.of(
-                                "team/agentscope-a1b2c3d4-1699999999999:latest",
-                                "team/agentscope-a1b2c3d4-1700000000000:latest"),
-                        1);
-
-        server.takeRequest(5, TimeUnit.SECONDS);
-        assertEquals("DELETE", server.takeRequest(5, TimeUnit.SECONDS).getMethod());
-        // failed delete is kept so the record stays accurate and is retried next persist
-        assertEquals(
-                List.of(
-                        "team/agentscope-a1b2c3d4-1699999999999:latest",
-                        "agentscope-a1b2c3d4-1701000000000"),
-                kept);
-    }
-
-    @Test
-    void pruneSnapshotsSkipsNullAndBlankOlder() throws Exception {
-        server.enqueue(new MockResponse().setResponseCode(200));
-
-        java.util.List<String> older = new java.util.ArrayList<>();
-        older.add(null);
-        older.add("   ");
-        older.add("snap-1");
-        older.add("snap-2");
-
-        List<String> kept = platform.pruneSnapshots("snap-3", older, 2);
+        List<String> kept = platform.cleanupSnapshots(ids, 2);
 
         assertEquals(1, server.getRequestCount());
         assertEquals("/templates/snap-1", server.takeRequest(5, TimeUnit.SECONDS).getPath());
@@ -267,17 +182,26 @@ class E2bPlatformHttpTest {
     }
 
     @Test
-    void pruneSnapshotsNoDeleteWhenSizeLteRetention() {
-        List<String> kept = platform.pruneSnapshots("snap-3", List.of("snap-1", "snap-2"), 5);
-        assertEquals(0, server.getRequestCount());
-        assertEquals(List.of("snap-1", "snap-2", "snap-3"), kept);
+    void cleanupSnapshotsDeduplicatesIds() throws Exception {
+        server.enqueue(new MockResponse().setResponseCode(200));
+
+        // snap-1 appears twice; it counts once so only snap-1 is deleted
+        List<String> kept =
+                platform.cleanupSnapshots(List.of("snap-1", "snap-2", "snap-1", "snap-3"), 2);
+
+        assertEquals(1, server.getRequestCount());
+        assertEquals("/templates/snap-1", server.takeRequest(5, TimeUnit.SECONDS).getPath());
+        assertEquals(List.of("snap-2", "snap-3"), kept);
     }
 
     @Test
-    void pruneSnapshotsExactlyRetentionKeepsAll() {
-        List<String> kept = platform.pruneSnapshots("snap-3", List.of("snap-1", "snap-2"), 3);
+    void cleanupSnapshotsDuplicatesWithinRetentionNeedNoDelete() {
+        // 4 entries but only 2 distinct ids; retention 2 keeps all distinct ids without deleting
+        List<String> kept =
+                platform.cleanupSnapshots(List.of("snap-1", "snap-2", "snap-1", "snap-2"), 2);
+
         assertEquals(0, server.getRequestCount());
-        assertEquals(List.of("snap-1", "snap-2", "snap-3"), kept);
+        assertEquals(List.of("snap-1", "snap-2"), kept);
     }
 
     @Test
@@ -366,6 +290,16 @@ class E2bPlatformHttpTest {
     }
 
     @Test
+    void trimSlashResolvesBaseUrl() {
+        // A blank base URL falls back to the E2B cloud default; the trailing slash is trimmed so
+        // request paths are joined without a double slash.
+        assertEquals("https://api.e2b.app", E2bPlatformHttp.trimSlash(null));
+        assertEquals("https://api.e2b.app", E2bPlatformHttp.trimSlash("   "));
+        assertEquals("https://api.e2b.app", E2bPlatformHttp.trimSlash("https://api.e2b.app/"));
+        assertEquals("http://localhost:8080", E2bPlatformHttp.trimSlash("http://localhost:8080"));
+    }
+
+    @Test
     void applySandboxFieldsHandlesNullAndPartial() throws Exception {
         E2bSandboxState state = new E2bSandboxState();
         com.fasterxml.jackson.databind.ObjectMapper om =
@@ -387,22 +321,5 @@ class E2bPlatformHttpTest {
         assertEquals("d.e2b.app", state.getSandboxDomain());
         assertEquals("tok", state.getEnvdAccessToken());
         assertEquals("0.2.0", state.getEnvdVersion());
-    }
-
-    @Test
-    void createSandboxWithDefaultBaseUrlWhenBlank() throws Exception {
-        E2bSandboxClientOptions opt = new E2bSandboxClientOptions();
-        opt.setApiKey("test-key");
-        opt.setApiBaseUrl("   ");
-        E2bPlatformHttp p = new E2bPlatformHttp(opt);
-        // trimSlash returns default https://api.e2b.app, createSandbox will try to POST there and
-        // fail fast
-        // We only verify it doesn't throw on construction and trimSlash path; actual HTTP not
-        // exercised.
-        // Instead verify requireApiKey still works
-        assertEquals("test-key", opt.getApiKey());
-        // killSandbox with blank base url uses default host - should not throw configuration error
-        // Just verify p is constructed
-        assertTrue(p != null);
     }
 }

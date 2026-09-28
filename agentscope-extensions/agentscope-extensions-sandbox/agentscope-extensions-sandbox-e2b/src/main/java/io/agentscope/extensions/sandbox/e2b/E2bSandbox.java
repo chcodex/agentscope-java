@@ -49,6 +49,14 @@ public class E2bSandbox extends AbstractBaseSandbox {
     private final E2bPlatformHttp platform;
     private E2bEnvdProcessClient envd;
 
+    /**
+     * Snapshot id created by the workspace persist in flight on this instance, or {@code null} when
+     * none is running. {@link #doPersistWorkspace()} sets it right before the id enters {@link
+     * E2bSandboxState#getSnapshotIds()}, so {@link #stop()} can drop exactly the id this call
+     * created when the archive fails to persist.
+     */
+    private String lastCreatedSnapshotId;
+
     public E2bSandbox(E2bSandboxState state, E2bSandboxClientOptions opt) {
         super(state);
         this.e2bState = state;
@@ -65,6 +73,37 @@ public class E2bSandbox extends AbstractBaseSandbox {
         }
         ensureSandbox();
         super.start();
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p>A failed workspace persist must not leave its snapshot id in {@link
+     * E2bSandboxState#getSnapshotIds()}: the persisted archive still references the previous
+     * snapshot, and a record holding the newer id as well would make {@link #cleanupSnapshots()}
+     * delete the snapshot that archive restores from. The id is therefore removed by identity, not
+     * by position — the record is shared state, and ids another session appended meanwhile are not
+     * this call's to drop. The exception is re-thrown unchanged: {@code SandboxManager.release}
+     * swallows it and the caller persists the state afterwards, so the corrected record still
+     * reaches the store.
+     */
+    @Override
+    public void stop() throws Exception {
+        // Only the persist in flight may be rolled back: an id recorded by an earlier persist
+        // (e.g. a direct persistWorkspace() call) must not be dropped by a later failure here.
+        lastCreatedSnapshotId = null;
+        try {
+            super.stop();
+        } catch (Exception e) {
+            String created = lastCreatedSnapshotId;
+            if (created != null) {
+                e2bState.getSnapshotIds().remove(created);
+                log.debug(
+                        "[sandbox-e2b] rolled back snapshot id {} after failed workspace persist",
+                        created);
+            }
+            throw e;
+        }
     }
 
     @Override
@@ -112,6 +151,7 @@ public class E2bSandbox extends AbstractBaseSandbox {
                         SandboxErrorCode.WORKSPACE_ARCHIVE_WRITE_ERROR,
                         "E2B snapshot response missing snapshotID: " + snap);
             }
+            lastCreatedSnapshotId = id;
             e2bState.getSnapshotIds().add(id);
             return new ByteArrayInputStream(E2bSnapshotRefs.encodeSnapshotId(id));
         }
@@ -281,9 +321,9 @@ public class E2bSandbox extends AbstractBaseSandbox {
         if (retention <= 0) {
             return;
         }
-        // One-shot correction regardless of any earlier residue: keep the newest retention by
-        // embedded timestamp and delete the rest. E2B only unlocks the templates after
-        // killSandbox, so this runs on shutdown.
+        // One-shot correction regardless of any earlier residue: keep the last retention ids by
+        // insertion order (most recent last) and delete the rest. E2B only unlocks the
+        // templates after killSandbox, so this runs on shutdown.
         try {
             List<String> kept = platform.cleanupSnapshots(e2bState.getSnapshotIds(), retention);
             e2bState.setSnapshotIds(kept);
@@ -294,9 +334,11 @@ public class E2bSandbox extends AbstractBaseSandbox {
 
     /**
      * AgentScope-native snapshot alias: {@code agentscope-<shortId>-<epochMillis>}, where the
-     * middle segment is an 8-hex-char short UUID generated locally. The trailing 13-digit epoch
-     * millis timestamp makes ordering deterministic; anything not matching this format is treated as
-     * a legacy/foreign snapshot and never pruned.
+     * middle segment is an 8-hex-char short UUID generated locally and the trailing segment is the
+     * creation epoch millis (kept human-readable; retention does not parse it). Retention keeps the
+     * last {@code snapshotRetention} ids in {@link E2bSandboxState#getSnapshotIds()} by insertion
+     * order (most recent last) and deletes the rest via {@link E2bPlatformHttp#cleanupSnapshots},
+     * regardless of id format.
      */
     private static String snapshotName() {
         String shortId = UUID.randomUUID().toString().replace("-", "").substring(0, 8);
