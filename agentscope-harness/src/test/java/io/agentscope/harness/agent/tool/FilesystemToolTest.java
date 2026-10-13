@@ -15,6 +15,7 @@
  */
 package io.agentscope.harness.agent.tool;
 
+import static io.agentscope.harness.agent.tool.ToolResultAssertions.assertText;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -25,6 +26,9 @@ import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 import io.agentscope.core.agent.RuntimeContext;
+import io.agentscope.core.message.TextBlock;
+import io.agentscope.core.message.ToolResultBlock;
+import io.agentscope.core.message.ToolResultState;
 import io.agentscope.core.tool.AgentTool;
 import io.agentscope.core.tool.Toolkit;
 import io.agentscope.harness.agent.IsolationScope;
@@ -45,6 +49,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -64,165 +69,23 @@ class FilesystemToolTest {
         tool = new FilesystemTool(filesystem);
     }
 
-    // ---------------------------------------------------------------
-    // listFiles — 底层 ls() 已修复: 区分"不存在"/"不是目录"/"空目录"
-    // ---------------------------------------------------------------
-
-    @Test
-    void listFiles_pathDoesNotExist_returnsErrorMessage() {
-        when(filesystem.ls(RT, "/nonexistent"))
-                .thenReturn(LsResult.fail("Path does not exist: /nonexistent"));
-
-        String result = tool.listFiles(RT, "/nonexistent");
-
-        assertEquals("Error: Path does not exist: /nonexistent", result);
+    /** Extracts the concatenated text output of a tool result. */
+    private static String textOf(ToolResultBlock result) {
+        return result.getOutput().stream()
+                .filter(b -> b instanceof TextBlock)
+                .map(b -> ((TextBlock) b).getText())
+                .collect(Collectors.joining());
     }
-
-    @Test
-    void listFiles_pathIsFileNotDirectory_returnsErrorMessage() {
-        when(filesystem.ls(RT, "/some-file.txt"))
-                .thenReturn(LsResult.fail("Not a directory: /some-file.txt"));
-
-        String result = tool.listFiles(RT, "/some-file.txt");
-
-        assertEquals("Error: Not a directory: /some-file.txt", result);
-    }
-
-    @Test
-    void listFiles_emptyDirectory_returnsEmptyDirectoryMessage() {
-        when(filesystem.ls(RT, "/empty-dir")).thenReturn(LsResult.success(List.of()));
-
-        String result = tool.listFiles(RT, "/empty-dir");
-
-        assertEquals("Empty directory: /empty-dir", result);
-    }
-
-    @Test
-    void listFiles_nonEmptyDirectory_returnsFormattedEntries() {
-        when(filesystem.ls(RT, "/dir"))
-                .thenReturn(
-                        LsResult.success(
-                                List.of(
-                                        FileInfo.ofDir("subdir", "2025-01-01"),
-                                        FileInfo.ofFile("readme.md", 123L, "2025-01-01"),
-                                        FileInfo.ofFile("data.csv", 456L, "2025-01-01"))));
-
-        String result = tool.listFiles(RT, "/dir");
-
-        String[] lines = result.split("\n");
-        assertEquals(3, lines.length);
-        assertTrue(lines[0].startsWith("[DIR]  subdir"), "目录项应有 [DIR] 前缀");
-        assertTrue(lines[1].startsWith("[FILE] readme.md (123 bytes)"));
-        assertTrue(lines[2].startsWith("[FILE] data.csv (456 bytes)"));
-    }
-
-    @Test
-    void listFiles_includesDotDirectoriesAndFiles() {
-        when(filesystem.ls(RT, "/project"))
-                .thenReturn(
-                        LsResult.success(
-                                List.of(
-                                        FileInfo.ofDir(".config", "2025-01-01"),
-                                        FileInfo.ofDir(".git", "2025-01-01"),
-                                        FileInfo.ofDir("src", "2025-01-01"),
-                                        FileInfo.ofFile(".gitignore", 42L, "2025-01-01"),
-                                        FileInfo.ofFile("pom.xml", 2048L, "2025-01-01"))));
-
-        String result = tool.listFiles(RT, "/project");
-
-        String[] lines = result.split("\n");
-        assertEquals(5, lines.length);
-        assertTrue(lines[0].startsWith("[DIR]  .config"));
-        assertTrue(lines[1].startsWith("[DIR]  .git"));
-        assertTrue(lines[2].startsWith("[DIR]  src"));
-        assertTrue(lines[3].startsWith("[FILE] .gitignore (42 bytes)"));
-        assertTrue(lines[4].startsWith("[FILE] pom.xml (2048 bytes)"));
-    }
-
-    @Test
-    void listFiles_lsReturnsFailure_returnsErrorMessage() {
-        when(filesystem.ls(RT, "/forbidden")).thenReturn(LsResult.fail("Permission denied"));
-
-        String result = tool.listFiles(RT, "/forbidden");
-
-        assertEquals("Error: Permission denied", result);
-    }
-
-    @Test
-    void listFiles_lsReturnsNullEntries_returnsEmptyDirectory() {
-        when(filesystem.ls(RT, "/weird")).thenReturn(new LsResult(null, null));
-
-        String result = tool.listFiles(RT, "/weird");
-
-        assertEquals("Empty directory: /weird", result);
-    }
-
-    @Test
-    void listFiles_directoryWithOnlySubdirs_stillReturnsEntries() {
-        when(filesystem.ls(RT, "/only-dirs"))
-                .thenReturn(
-                        LsResult.success(
-                                List.of(
-                                        FileInfo.ofDir("references", "2025-01-01"),
-                                        FileInfo.ofDir("scripts", "2025-01-01"),
-                                        FileInfo.ofDir("tests", "2025-01-01"))));
-
-        String result = tool.listFiles(RT, "/only-dirs");
-
-        String[] lines = result.split("\n");
-        assertEquals(3, lines.length);
-        assertTrue(lines[0].startsWith("[DIR]  references"));
-        assertTrue(lines[1].startsWith("[DIR]  scripts"));
-        assertTrue(lines[2].startsWith("[DIR]  tests"));
-    }
-
-    @Test
-    void listFiles_relativePath_stillNormalized() {
-        WorkspacePathNormalizer normalizer = WorkspacePathNormalizer.of("/workspace");
-        tool = new FilesystemTool(filesystem, normalizer);
-
-        when(filesystem.ls(RT, "subdir")).thenReturn(LsResult.success(List.of()));
-
-        tool.listFiles(RT, "subdir");
-
-        // 相对路径跳过 isAbsolutePath 检查, 仍被 normalizer 归一化
-        verify(filesystem).ls(RT, "subdir");
-    }
-
-    @Test
-    void listFiles_normalizerPrefixMismatch_pathUnchanged() {
-        WorkspacePathNormalizer normalizer = WorkspacePathNormalizer.of("/workspace");
-        tool = new FilesystemTool(filesystem, normalizer);
-
-        when(filesystem.ls(RT, "/other/path")).thenReturn(LsResult.success(List.of()));
-
-        tool.listFiles(RT, "/other/path");
-
-        // 绝对路径但前缀不匹配: isAbsolutePath 为 true → 跳过 normalizer → 原样传递
-        verify(filesystem).ls(RT, "/other/path");
-    }
-
-    @Test
-    void listFiles_passesNormalizedPathToFilesystem() {
-        tool = new FilesystemTool(filesystem);
-
-        when(filesystem.ls(RT, "/some/path")).thenReturn(LsResult.success(List.of()));
-
-        tool.listFiles(RT, "/some/path");
-
-        verify(filesystem).ls(RT, "/some/path");
-    }
-
-    // 原有测试 ———————————————————————————————————————————————————————
 
     @Test
     void editFile_omittedReplaceAll_defaultsToFalse() {
         when(filesystem.edit(eq(RT), eq("f.txt"), eq("old"), eq("new"), eq(false)))
                 .thenReturn(EditResult.ok("f.txt", 1));
 
-        String result = tool.editFile(RT, "f.txt", "old", "new", null);
+        ToolResultBlock result = tool.editFile(RT, "f.txt", "old", "new", null);
+        assertEquals(ToolResultState.SUCCESS, result.getState());
 
-        assertTrue(result.startsWith("Edited "));
+        assertTrue(textOf(result).startsWith("Edited "));
         verify(filesystem).edit(RT, "f.txt", "old", "new", false);
     }
 
@@ -231,28 +94,31 @@ class FilesystemToolTest {
         when(filesystem.edit(eq(RT), eq("f.txt"), eq("old"), eq("new"), eq(true)))
                 .thenReturn(EditResult.ok("f.txt", 2));
 
-        String result = tool.editFile(RT, "f.txt", "old", "new", true);
+        ToolResultBlock result = tool.editFile(RT, "f.txt", "old", "new", true);
+        assertEquals(ToolResultState.SUCCESS, result.getState());
 
-        assertTrue(result.contains("2 replacement"));
+        assertTrue(textOf(result).contains("2 replacement"));
         verify(filesystem).edit(RT, "f.txt", "old", "new", true);
     }
 
     @Test
-    void listFiles_absolutePath_skipsNormalizer() {
+    void listFiles_normalizesWindowsAbsoluteWorkspacePath() {
         WorkspacePathNormalizer normalizer =
                 WorkspacePathNormalizer.of(
                         "D:\\workspace\\my-learn\\agentscope-v2\\.agentscope\\workspace");
         tool = new FilesystemTool(filesystem, normalizer);
-        String agentPath = "D:\\workspace\\my-learn\\agentscope-v2\\.agentscope\\workspace\\memory";
 
-        when(filesystem.ls(RT, agentPath))
+        when(filesystem.ls(RT, "memory"))
                 .thenReturn(LsResult.success(List.of(FileInfo.ofDir("memory", ""))));
 
-        String result = tool.listFiles(RT, agentPath);
+        ToolResultBlock result =
+                tool.listFiles(
+                        RT,
+                        "D:\\workspace\\my-learn\\agentscope-v2\\.agentscope\\workspace\\memory");
+        assertEquals(ToolResultState.SUCCESS, result.getState());
 
-        assertTrue(result.contains("[DIR]"));
-        // 绝对路径不再被 normalizer 剥离, 直接透传至 filesystem
-        verify(filesystem).ls(RT, agentPath);
+        assertTrue(textOf(result).contains("[DIR]"));
+        verify(filesystem).ls(RT, "memory");
     }
 
     @Test
@@ -271,13 +137,22 @@ class FilesystemToolTest {
         Path absolutePath = workspace.resolve("session-1/artifact.txt").toAbsolutePath();
 
         assertTrue(
-                tool.writeFile(runtimeContext, absolutePath.toString(), "artifact")
+                assertText(
+                                tool.writeFile(runtimeContext, absolutePath.toString(), "artifact"),
+                                ToolResultState.SUCCESS)
                         .startsWith("Written to "));
         assertTrue(Files.exists(absolutePath));
         assertFalse(Files.exists(workspace.resolve("session-1/session-1/artifact.txt")));
-        assertEquals("artifact", tool.readFile(runtimeContext, "artifact.txt", null, null));
         assertEquals(
-                "artifact", tool.readFile(runtimeContext, absolutePath.toString(), null, null));
+                "artifact",
+                assertText(
+                        tool.readFile(runtimeContext, "artifact.txt", null, null),
+                        ToolResultState.SUCCESS));
+        assertEquals(
+                "artifact",
+                assertText(
+                        tool.readFile(runtimeContext, absolutePath.toString(), null, null),
+                        ToolResultState.SUCCESS));
     }
 
     // ==================== Bug reproduction: listFiles ambiguous error message ====================
@@ -287,10 +162,13 @@ class FilesystemToolTest {
         when(filesystem.ls(RT, "/nonexistent"))
                 .thenReturn(LsResult.fail("Path does not exist: /nonexistent"));
 
-        String result = tool.listFiles(RT, "/nonexistent");
+        ToolResultBlock result = tool.listFiles(RT, "/nonexistent");
+        assertEquals(ToolResultState.ERROR, result.getState());
 
-        assertTrue(result.startsWith("Error:"), "should report error for non-existent path");
-        assertTrue(result.contains("does not exist"), "error should mention 'does not exist'");
+        assertTrue(
+                textOf(result).startsWith("Error:"), "should report error for non-existent path");
+        assertTrue(
+                textOf(result).contains("does not exist"), "error should mention 'does not exist'");
     }
 
     @Test
@@ -298,19 +176,23 @@ class FilesystemToolTest {
         when(filesystem.ls(RT, "/path/to/file.txt"))
                 .thenReturn(LsResult.fail("Not a directory: /path/to/file.txt"));
 
-        String result = tool.listFiles(RT, "/path/to/file.txt");
+        ToolResultBlock result = tool.listFiles(RT, "/path/to/file.txt");
+        assertEquals(ToolResultState.ERROR, result.getState());
 
-        assertTrue(result.startsWith("Error:"), "should report error for file path");
-        assertTrue(result.contains("Not a directory"), "error should mention 'Not a directory'");
+        assertTrue(textOf(result).startsWith("Error:"), "should report error for file path");
+        assertTrue(
+                textOf(result).contains("Not a directory"),
+                "error should mention 'Not a directory'");
     }
 
     @Test
     void listFiles_emptyDirectory_returnsEmptyDirMessage() {
         when(filesystem.ls(RT, "/empty/dir")).thenReturn(LsResult.success(List.of()));
 
-        String result = tool.listFiles(RT, "/empty/dir");
+        ToolResultBlock result = tool.listFiles(RT, "/empty/dir");
+        assertEquals(ToolResultState.SUCCESS, result.getState());
 
-        assertEquals("Empty directory: /empty/dir", result);
+        assertEquals("Empty directory: /empty/dir", textOf(result));
     }
 
     // ==================== Bug reproduction: listFiles ambiguous error message ====================
@@ -320,9 +202,10 @@ class FilesystemToolTest {
         when(filesystem.read(eq(RT), eq("f.txt"), eq(0), eq(0)))
                 .thenReturn(ReadResult.success(new FileData("hello", "utf-8")));
 
-        String result = tool.readFile(RT, "f.txt", null, null);
+        ToolResultBlock result = tool.readFile(RT, "f.txt", null, null);
+        assertEquals(ToolResultState.SUCCESS, result.getState());
 
-        assertEquals("hello", result);
+        assertEquals("hello", textOf(result));
         verify(filesystem).read(RT, "f.txt", 0, 0);
     }
 
@@ -331,9 +214,10 @@ class FilesystemToolTest {
         when(filesystem.read(eq(RT), eq("f.txt"), eq(2), eq(5)))
                 .thenReturn(ReadResult.success(new FileData("world", "utf-8")));
 
-        String result = tool.readFile(RT, "f.txt", 2, 5);
+        ToolResultBlock result = tool.readFile(RT, "f.txt", 2, 5);
+        assertEquals(ToolResultState.SUCCESS, result.getState());
 
-        assertEquals("world", result);
+        assertEquals("world", textOf(result));
         verify(filesystem).read(RT, "f.txt", 2, 5);
     }
 
@@ -355,12 +239,16 @@ class FilesystemToolTest {
         FilesystemTool tool = new FilesystemTool(fs);
 
         // 测试: 外层 office-tools-ppt 下只有 office-tools-ppt/ 一个子目录（无文件）
-        String outerResult = tool.listFiles(RT, "office-tools-ppt");
+        ToolResultBlock outerResultBlock = tool.listFiles(RT, "office-tools-ppt");
+        assertEquals(ToolResultState.SUCCESS, outerResultBlock.getState());
+        String outerResult = textOf(outerResultBlock);
         // 先直接断言完整输出，方便看清实际返回
         assertTrue(outerResult.contains("[DIR]"), "外层仅有子目录时应正常列出，但实际返回: [" + outerResult + "]");
 
         // 测试: 内层 office-tools-ppt/office-tools-ppt 下仅有 references, scripts, tests（无文件）
-        String innerResult = tool.listFiles(RT, "office-tools-ppt/office-tools-ppt");
+        ToolResultBlock innerResultBlock = tool.listFiles(RT, "office-tools-ppt/office-tools-ppt");
+        assertEquals(ToolResultState.SUCCESS, innerResultBlock.getState());
+        String innerResult = textOf(innerResultBlock);
         assertTrue(innerResult.contains("[DIR]"), "内层仅有子目录时应正常列出，但实际返回: [" + innerResult + "]");
     }
 
@@ -384,10 +272,12 @@ class FilesystemToolTest {
         LocalFilesystem fs = new LocalFilesystem(tempDir);
         FilesystemTool tool = new FilesystemTool(fs);
 
-        String result =
+        ToolResultBlock resultBlock =
                 tool.listFiles(
                         RT,
                         ".agentscope/workspace/TEST-ID/.skills-cache/git-copilot-plugins/skills/default/office-tools-ppt/office-tools-ppt");
+        assertEquals(ToolResultState.SUCCESS, resultBlock.getState());
+        String result = textOf(resultBlock);
 
         assertTrue(result.contains("[DIR]"), "隐藏路径 + 仅有目录时应正常列出，但实际返回: [" + result + "]");
     }
@@ -419,9 +309,35 @@ class FilesystemToolTest {
                                 ".skills-cache/git-copilot-plugins/skills/default/office-tools-ppt/office-tools-ppt")
                         .toString();
 
-        String result = tool.listFiles(RT, agentPath);
+        ToolResultBlock resultBlock = tool.listFiles(RT, agentPath);
+        assertEquals(ToolResultState.SUCCESS, resultBlock.getState());
+        String result = textOf(resultBlock);
 
         assertTrue(result.contains("[DIR]"), "normalizer 剥离前缀后应正常列出，但实际返回: [" + result + "]");
+    }
+
+    @Test
+    void readFile_contentLookingLikeAnError_isStillSuccess() {
+        // Regression for the textual-prefix heuristic: successfully reading a log file whose
+        // content begins with "Error: " must not be reported as a failed tool call.
+        when(filesystem.read(eq(RT), eq("app.log"), eq(0), eq(0)))
+                .thenReturn(ReadResult.success(new FileData("Error: connection refused", "utf-8")));
+
+        ToolResultBlock result = tool.readFile(RT, "app.log", null, null);
+        assertEquals(ToolResultState.SUCCESS, result.getState());
+
+        assertEquals("Error: connection refused", textOf(result));
+    }
+
+    @Test
+    void readFile_failure_reportsErrorState() {
+        when(filesystem.read(eq(RT), eq("missing.txt"), eq(0), eq(0)))
+                .thenReturn(ReadResult.fail("no such file"));
+
+        ToolResultBlock result = tool.readFile(RT, "missing.txt", null, null);
+        assertEquals(ToolResultState.ERROR, result.getState());
+
+        assertTrue(textOf(result).contains("no such file"));
     }
 
     @Test
@@ -434,10 +350,11 @@ class FilesystemToolTest {
                 .thenReturn(
                         io.agentscope.harness.agent.filesystem.model.GlobResult.success(entries));
         when(filesystem.ls(RT, ".")).thenReturn(LsResult.success(entries));
-        for (String result : List.of(tool.globFiles(RT, "**/*", "."), tool.listFiles(RT, "."))) {
-            assertTrue(result.contains("truncated"));
-            assertTrue(result.length() < 17000);
-            assertTrue(result.lines().count() <= 202);
+        for (ToolResultBlock result :
+                List.of(tool.globFiles(RT, "**/*", "."), tool.listFiles(RT, "."))) {
+            assertTrue(textOf(result).contains("truncated"));
+            assertTrue(textOf(result).length() < 17000);
+            assertTrue(textOf(result).lines().count() <= 202);
         }
     }
 
@@ -449,9 +366,10 @@ class FilesystemToolTest {
                                 List.of(
                                         new io.agentscope.harness.agent.filesystem.model.GrepMatch(
                                                 "file", 1, "x".repeat(300000)))));
-        String result = tool.grepFiles(RT, "pattern", ".", null);
-        assertTrue(result.contains("truncated"));
-        assertTrue(result.length() < 17000);
+        ToolResultBlock result = tool.grepFiles(RT, "pattern", ".", null);
+        assertEquals(ToolResultState.SUCCESS, result.getState());
+        assertTrue(textOf(result).contains("truncated"));
+        assertTrue(textOf(result).length() < 17000);
     }
 
     @Test
@@ -459,11 +377,12 @@ class FilesystemToolTest {
         when(filesystem.grep(RT, "needle", ".", null))
                 .thenReturn(GrepResult.success(grepMatches(FilesystemTool.DEFAULT_GREP_LIMIT + 1)));
 
-        String result = tool.grepFiles(RT, "needle", ".", null, null);
+        ToolResultBlock result = tool.grepFiles(RT, "needle", ".", null, null);
+        assertEquals(ToolResultState.SUCCESS, result.getState());
 
-        assertTrue(result.contains("file-99.txt:100:match-99"));
-        assertFalse(result.contains("file-100.txt:101:match-100"));
-        assertTrue(result.contains("showing 100 of 101 matches"));
+        assertTrue(textOf(result).contains("file-99.txt:100:match-99"));
+        assertFalse(textOf(result).contains("file-100.txt:101:match-100"));
+        assertTrue(textOf(result).contains("showing 100 of 101 matches"));
     }
 
     @Test
@@ -471,11 +390,12 @@ class FilesystemToolTest {
         when(filesystem.grep(RT, "needle", ".", null))
                 .thenReturn(GrepResult.success(grepMatches(3)));
 
-        String result = tool.grepFiles(RT, "needle", ".", null, 2);
+        ToolResultBlock result = tool.grepFiles(RT, "needle", ".", null, 2);
+        assertEquals(ToolResultState.SUCCESS, result.getState());
 
-        assertTrue(result.contains("file-1.txt:2:match-1"));
-        assertFalse(result.contains("file-2.txt:3:match-2"));
-        assertTrue(result.contains("showing 2 of 3 matches"));
+        assertTrue(textOf(result).contains("file-1.txt:2:match-1"));
+        assertFalse(textOf(result).contains("file-2.txt:3:match-2"));
+        assertTrue(textOf(result).contains("showing 2 of 3 matches"));
     }
 
     @Test
@@ -487,19 +407,21 @@ class FilesystemToolTest {
                                         .mapToObj(i -> new GrepMatch("f", i, "x"))
                                         .toList()));
 
-        String result = tool.grepFiles(RT, "needle", ".", null, Integer.MAX_VALUE);
+        ToolResultBlock result = tool.grepFiles(RT, "needle", ".", null, Integer.MAX_VALUE);
+        assertEquals(ToolResultState.SUCCESS, result.getState());
 
-        assertFalse(result.contains("f:1000:x"));
-        assertTrue(result.contains("showing 1000 of 1001 matches"));
-        assertTrue(result.contains("Hard maximum of 1000 reached"));
-        assertFalse(result.contains("increase limit"));
+        assertFalse(textOf(result).contains("f:1000:x"));
+        assertTrue(textOf(result).contains("showing 1000 of 1001 matches"));
+        assertTrue(textOf(result).contains("Hard maximum of 1000 reached"));
+        assertFalse(textOf(result).contains("increase limit"));
     }
 
     @Test
     void grepFiles_nonPositiveLimit_isRejectedBeforeSearch() {
-        String result = tool.grepFiles(RT, "needle", ".", null, 0);
+        ToolResultBlock result = tool.grepFiles(RT, "needle", ".", null, 0);
+        assertEquals(ToolResultState.ERROR, result.getState());
 
-        assertEquals("Error: limit must be greater than 0", result);
+        assertEquals("Error: limit must be greater than 0", textOf(result));
         verifyNoInteractions(filesystem);
     }
 
@@ -508,21 +430,22 @@ class FilesystemToolTest {
         when(filesystem.glob(RT, "**/*.txt", "."))
                 .thenReturn(GlobResult.success(files(FilesystemTool.DEFAULT_GLOB_LIMIT + 1)));
 
-        String result = tool.globFiles(RT, "**/*.txt", ".", null);
+        ToolResultBlock result = tool.globFiles(RT, "**/*.txt", ".", null);
+        assertEquals(ToolResultState.SUCCESS, result.getState());
 
-        assertTrue(result.contains("file-199.txt (199 bytes)"));
-        assertFalse(result.contains("file-200.txt (200 bytes)"));
-        assertTrue(result.contains("showing 200 of 201 files"));
+        assertTrue(textOf(result).contains("file-199.txt (199 bytes)"));
+        assertFalse(textOf(result).contains("file-200.txt (200 bytes)"));
+        assertTrue(textOf(result).contains("showing 200 of 201 files"));
     }
 
     @Test
-    void searchOverloads_remainBackwardCompatibleForDirectCallers() {
+    void searchOverloads_useDefaultLimitsForDirectCallers() {
         when(filesystem.grep(RT, "needle", ".", null))
                 .thenReturn(GrepResult.success(grepMatches(1)));
         when(filesystem.glob(RT, "*.txt", ".")).thenReturn(GlobResult.success(files(1)));
 
-        assertEquals("file-0.txt:1:match-0", tool.grepFiles(RT, "needle", ".", null));
-        assertEquals("file-0.txt (0 bytes)", tool.globFiles(RT, "*.txt", "."));
+        assertEquals("file-0.txt:1:match-0", textOf(tool.grepFiles(RT, "needle", ".", null)));
+        assertEquals("file-0.txt (0 bytes)", textOf(tool.globFiles(RT, "*.txt", ".")));
     }
 
     @Test
@@ -546,12 +469,13 @@ class FilesystemToolTest {
     void explicitGlobLimitAboveDefault_stillRespectsCharacterBudget() {
         when(filesystem.glob(RT, "**/*.txt", ".")).thenReturn(GlobResult.success(files(351)));
 
-        String result = tool.globFiles(RT, "**/*.txt", ".", 350);
+        ToolResultBlock result = tool.globFiles(RT, "**/*.txt", ".", 350);
+        assertEquals(ToolResultState.SUCCESS, result.getState());
 
-        assertTrue(result.contains("file-349.txt (349 bytes)"));
-        assertFalse(result.contains("file-350.txt (350 bytes)"));
-        assertTrue(result.contains("showing 350 of 351 files"));
-        assertTrue(result.length() < 17000);
+        assertTrue(textOf(result).contains("file-349.txt (349 bytes)"));
+        assertFalse(textOf(result).contains("file-350.txt (350 bytes)"));
+        assertTrue(textOf(result).contains("showing 350 of 351 files"));
+        assertTrue(textOf(result).length() < 17000);
     }
 
     @Test
@@ -564,13 +488,14 @@ class FilesystemToolTest {
                                         new GrepMatch("large", 2, "x".repeat(300000)),
                                         new GrepMatch("last", 3, "match"))));
 
-        String result = tool.grepFiles(RT, "needle", ".", null, 1000);
+        ToolResultBlock result = tool.grepFiles(RT, "needle", ".", null, 1000);
+        assertEquals(ToolResultState.SUCCESS, result.getState());
 
-        assertTrue(result.contains("small:1:match"));
-        assertTrue(result.contains("showing 1 of 3 matches"));
-        assertTrue(result.contains("character limit"));
-        assertFalse(result.contains("increase limit"));
-        assertTrue(result.length() < 17000);
+        assertTrue(textOf(result).contains("small:1:match"));
+        assertTrue(textOf(result).contains("showing 1 of 3 matches"));
+        assertTrue(textOf(result).contains("character limit"));
+        assertFalse(textOf(result).contains("increase limit"));
+        assertTrue(textOf(result).length() < 17000);
     }
 
     private static List<GrepMatch> grepMatches(int count) {

@@ -19,6 +19,8 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.agentscope.core.agent.RuntimeContext;
+import io.agentscope.harness.agent.context.ContextItem;
+import io.agentscope.harness.agent.context.WorkspaceContextMaterials;
 import io.agentscope.harness.agent.filesystem.model.ExecuteResponse;
 import io.agentscope.harness.agent.filesystem.model.FileDownloadResponse;
 import io.agentscope.harness.agent.filesystem.model.FileUploadResponse;
@@ -28,14 +30,12 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 class WorkspaceContextMiddlewareSandboxTest {
-
-    private static final RuntimeContext RC =
-            RuntimeContext.builder().sessionId("test-session").build();
 
     private final List<WorkspaceManager> openManagers = new ArrayList<>();
 
@@ -52,13 +52,28 @@ class WorkspaceContextMiddlewareSandboxTest {
         return wm;
     }
 
+    /**
+     * Runs the middleware and returns the collected workspace materials as text. Since the
+     * JEV redesign, {@code onSystemPrompt} returns the base prompt unchanged and publishes
+     * materials to the {@link WorkspaceContextMaterials} registry instead.
+     */
+    private static String collectMaterials(WorkspaceContextMiddleware mw) {
+        RuntimeContext rc = RuntimeContext.builder().sessionId("test-session").build();
+        mw.onSystemPrompt(null, rc, "BASE\n").block();
+        WorkspaceContextMaterials materials = rc.get(WorkspaceContextMaterials.class);
+        assertNotNull(materials);
+        return materials.items().stream()
+                .map(ContextItem::content)
+                .collect(Collectors.joining("\n"));
+    }
+
     @Test
     void sandboxBranch_includesSandboxRootAndId(@TempDir Path workspace) {
         FakeSandboxFilesystem fs = new FakeSandboxFilesystem("sbox-1", "/custom/root");
         WorkspaceManager wm = track(new WorkspaceManager(workspace, fs));
         WorkspaceContextMiddleware mw = new WorkspaceContextMiddleware(wm);
 
-        String prompt = mw.onSystemPrompt(null, RC, "BASE\n").block();
+        String prompt = collectMaterials(mw);
         assertNotNull(prompt);
         assertTrue(prompt.contains("Sandbox root: /custom/root"));
         assertTrue(prompt.contains("container id: sbox-1"));
@@ -72,7 +87,7 @@ class WorkspaceContextMiddlewareSandboxTest {
         WorkspaceManager wm = track(new WorkspaceManager(workspace, fs));
         WorkspaceContextMiddleware mw = new WorkspaceContextMiddleware(wm);
 
-        String prompt = mw.onSystemPrompt(null, RC, "BASE\n").block();
+        String prompt = collectMaterials(mw);
         assertNotNull(prompt);
         assertTrue(prompt.contains("Sandbox root: /workspace"));
     }
@@ -85,7 +100,7 @@ class WorkspaceContextMiddlewareSandboxTest {
         WorkspaceManager wm = track(new WorkspaceManager(workspace, fs));
         WorkspaceContextMiddleware mw = new WorkspaceContextMiddleware(wm);
 
-        String prompt = mw.onSystemPrompt(null, RC, "BASE\n").block();
+        String prompt = collectMaterials(mw);
         assertNotNull(prompt);
         assertTrue(prompt.contains("Ubuntu 22.04"));
         assertTrue(prompt.contains("/sandbox-tmp"));
@@ -100,7 +115,7 @@ class WorkspaceContextMiddlewareSandboxTest {
         WorkspaceManager wm = track(new WorkspaceManager(workspace, fs));
         WorkspaceContextMiddleware mw = new WorkspaceContextMiddleware(wm);
 
-        String prompt = mw.onSystemPrompt(null, RC, "BASE\n").block();
+        String prompt = collectMaterials(mw);
         assertNotNull(prompt);
         assertTrue(prompt.contains(System.getProperty("os.name")));
         assertTrue(prompt.contains(System.getProperty("java.io.tmpdir")));
@@ -112,9 +127,9 @@ class WorkspaceContextMiddlewareSandboxTest {
         WorkspaceManager wm = track(new WorkspaceManager(workspace, fs));
         WorkspaceContextMiddleware mw = new WorkspaceContextMiddleware(wm);
 
-        String prompt = mw.onSystemPrompt(null, RC, "BASE\n").block();
+        String prompt = collectMaterials(mw);
         assertNotNull(prompt);
-        assertTrue(prompt.contains("AgentStateStore Context"));
+        assertTrue(prompt.contains("## Runtime Environment"));
         assertTrue(prompt.contains("AgentStateStore ID: test-session"));
     }
 

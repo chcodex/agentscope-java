@@ -18,6 +18,9 @@ package io.agentscope.harness.agent.middleware;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.agentscope.core.agent.RuntimeContext;
+import io.agentscope.harness.agent.context.ContextItem;
+import io.agentscope.harness.agent.context.WorkspaceContextMaterials;
 import io.agentscope.harness.agent.filesystem.AbstractFilesystem;
 import io.agentscope.harness.agent.filesystem.CompositeFilesystem;
 import io.agentscope.harness.agent.filesystem.local.LocalFilesystem;
@@ -26,6 +29,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -52,6 +56,21 @@ class WorkspaceContextMiddlewareBranchTest {
         return wm;
     }
 
+    /**
+     * Runs the middleware and returns the collected workspace materials as text. Since the
+     * JEV redesign, {@code onSystemPrompt} returns the base prompt unchanged and publishes
+     * materials to the {@link WorkspaceContextMaterials} registry instead.
+     */
+    private static String collectMaterials(WorkspaceContextMiddleware mw) {
+        RuntimeContext rc = RuntimeContext.builder().build();
+        mw.onSystemPrompt(null, rc, "BASE\n").block();
+        WorkspaceContextMaterials materials = rc.get(WorkspaceContextMaterials.class);
+        assertNotNull(materials);
+        return materials.items().stream()
+                .map(ContextItem::content)
+                .collect(Collectors.joining("\n"));
+    }
+
     @Test
     void compositeBranch_includesDistributedDescription(@TempDir Path workspace) {
         AbstractFilesystem local = new LocalFilesystem(workspace, true, 10);
@@ -59,7 +78,7 @@ class WorkspaceContextMiddlewareBranchTest {
         WorkspaceManager wm = track(new WorkspaceManager(workspace, composite));
         WorkspaceContextMiddleware mw = new WorkspaceContextMiddleware(wm);
 
-        String prompt = mw.onSystemPrompt(null, null, "BASE\n").block();
+        String prompt = collectMaterials(mw);
         assertNotNull(prompt);
         assertTrue(prompt.contains("Distributed workspace template root"));
         assertTrue(prompt.contains(workspace.toAbsolutePath().toString()));
@@ -74,7 +93,7 @@ class WorkspaceContextMiddlewareBranchTest {
         WorkspaceManager wm = track(new WorkspaceManager(workspace, fs));
         WorkspaceContextMiddleware mw = new WorkspaceContextMiddleware(wm);
 
-        String prompt = mw.onSystemPrompt(null, null, "BASE\n").block();
+        String prompt = collectMaterials(mw);
         assertNotNull(prompt);
         assertTrue(prompt.contains("Your working directory is:"));
         assertTrue(prompt.contains(workspace.toAbsolutePath().toString()));

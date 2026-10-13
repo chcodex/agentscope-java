@@ -47,6 +47,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import okhttp3.Call;
 import okhttp3.Interceptor;
 import okhttp3.MediaType;
+import okhttp3.MultipartBody;
 import okhttp3.OkHttpClient;
 import okhttp3.Protocol;
 import okhttp3.Request;
@@ -223,55 +224,6 @@ class E2bEnvdProcessClientTest {
         assertEquals(0, exit);
     }
 
-    private static DynamicMessage dataResponse(
-            E2bEnvdProcessClient client, String stdout, String stderr) {
-        Descriptors.FileDescriptor fd = client.fileDescriptor();
-        Descriptors.Descriptor processEventDesc = fd.findMessageTypeByName("ProcessEvent");
-        Descriptors.Descriptor dataDesc = processEventDesc.findNestedTypeByName("DataEvent");
-
-        DynamicMessage data =
-                DynamicMessage.newBuilder(dataDesc)
-                        .setField(
-                                stdout != null
-                                        ? dataDesc.findFieldByName("stdout")
-                                        : dataDesc.findFieldByName("stderr"),
-                                ByteString.copyFromUtf8(stdout != null ? stdout : stderr))
-                        .build();
-        DynamicMessage event =
-                DynamicMessage.newBuilder(processEventDesc)
-                        .setField(processEventDesc.findFieldByName("data"), data)
-                        .build();
-        Descriptors.Descriptor startResponseDesc = fd.findMessageTypeByName("StartResponse");
-        return DynamicMessage.newBuilder(startResponseDesc)
-                .setField(startResponseDesc.findFieldByName("event"), event)
-                .build();
-    }
-
-    private static DynamicMessage endEventResponse(
-            E2bEnvdProcessClient client, Integer exitCode, String error) {
-        Descriptors.FileDescriptor fd = client.fileDescriptor();
-        Descriptors.Descriptor processEventDesc = fd.findMessageTypeByName("ProcessEvent");
-        Descriptors.Descriptor endDesc = processEventDesc.findNestedTypeByName("EndEvent");
-
-        DynamicMessage.Builder endBuilder = DynamicMessage.newBuilder(endDesc);
-        if (exitCode != null) {
-            endBuilder.setField(endDesc.findFieldByName("exit_code"), exitCode);
-        }
-        if (error != null) {
-            endBuilder.setField(endDesc.findFieldByName("error"), error);
-        }
-        DynamicMessage end = endBuilder.build();
-
-        DynamicMessage event =
-                DynamicMessage.newBuilder(processEventDesc)
-                        .setField(processEventDesc.findFieldByName("end"), end)
-                        .build();
-        Descriptors.Descriptor startResponseDesc = fd.findMessageTypeByName("StartResponse");
-        return DynamicMessage.newBuilder(startResponseDesc)
-                .setField(startResponseDesc.findFieldByName("event"), event)
-                .build();
-    }
-
     // Connect protocol: final envelope (flags bit 1) is EndStreamMessage JSON.
     // Python SDK ServerStreamParser: if "error" in data → raise make_error(data["error"])
     // https://connectrpc.com/docs/protocol/#error-end-stream
@@ -296,36 +248,157 @@ class E2bEnvdProcessClientTest {
         assertTrue(ex.getMessage().contains("process crash"));
     }
 
+    // Mirror official connectrpc ConnectEnvelopeReader.handle_end_message:
+    //   error = end_stream_message.get("error")
+    //   if error: raise
+    // An empty error object is falsy in Python, i.e. treated as success (clean break,
+    // no SandboxRuntimeException). With no EndEvent received, draining then fails with
+    // IOException — same as a "{}\" trailer without preceding events.
+    @Test
+    void endStreamResponseWithEmptyErrorObjectBreaksCleanly() throws Exception {
+        E2bEnvdProcessClient client = new E2bEnvdProcessClient(options(E2bCodec.JSON));
+        byte[] frame = endStreamFrame("{\"error\":{}}");
+
+        IOException ex =
+                assertThrows(
+                        IOException.class,
+                        () ->
+                                drainStartStream(
+                                        client,
+                                        frame,
+                                        new ByteArrayOutputStream(),
+                                        new ByteArrayOutputStream()));
+        assertTrue(ex.getMessage().contains("before receiving a process exit code"));
+    }
+
+    // Non-empty error without code is still truthy in Python (if error: raise).
+    @Test
+    void endStreamResponseWithMessageOnlyErrorThrows() throws Exception {
+        E2bEnvdProcessClient client = new E2bEnvdProcessClient(options(E2bCodec.JSON));
+        byte[] frame = endStreamFrame("{\"error\":{\"message\":\"boom\"}}");
+
+        SandboxException.SandboxRuntimeException ex =
+                assertThrows(
+                        SandboxException.SandboxRuntimeException.class,
+                        () ->
+                                drainStartStream(
+                                        client,
+                                        frame,
+                                        new ByteArrayOutputStream(),
+                                        new ByteArrayOutputStream()));
+        assertEquals(SandboxErrorCode.WORKSPACE_START_ERROR, ex.getErrorCode());
+        assertTrue(ex.getMessage().contains("boom"));
+    }
+
+    // Non-object error payloads are truthy as well when non-empty.
+    @Test
+    void endStreamResponseWithStringErrorThrows() throws Exception {
+        E2bEnvdProcessClient client = new E2bEnvdProcessClient(options(E2bCodec.JSON));
+        byte[] frame = endStreamFrame("{\"error\":\"boom\"}");
+
+        SandboxException.SandboxRuntimeException ex =
+                assertThrows(
+                        SandboxException.SandboxRuntimeException.class,
+                        () ->
+                                drainStartStream(
+                                        client,
+                                        frame,
+                                        new ByteArrayOutputStream(),
+                                        new ByteArrayOutputStream()));
+        assertEquals(SandboxErrorCode.WORKSPACE_START_ERROR, ex.getErrorCode());
+        assertTrue(ex.getMessage().contains("boom"));
+    }
+
+    // A corrupt end-stream trailer is untrustworthy: unlike corrupt data frames (skipped),
+    // it propagates as IOException instead of being silently swallowed.
+    @Test
+    void corruptEndStreamPayloadThrowsIOException() throws Exception {
+        E2bEnvdProcessClient client = new E2bEnvdProcessClient(options(E2bCodec.JSON));
+        byte[] frame = endStreamFrame("not-json{{{");
+
+        assertThrows(
+                IOException.class,
+                () ->
+                        drainStartStream(
+                                client,
+                                frame,
+                                new ByteArrayOutputStream(),
+                                new ByteArrayOutputStream()));
+    }
+
+    // Falsy error payloads (Python: 0, false, "" are all falsy) end the stream
+    // cleanly without raising — mirroring connectrpc's `if error: raise`.
+    @Test
+    void endStreamResponseWithFalsyErrorBreaksCleanly() throws Exception {
+        for (String payload :
+                new String[] {"{\"error\":0}", "{\"error\":false}", "{\"error\":\"\"}"}) {
+            E2bEnvdProcessClient client = new E2bEnvdProcessClient(options(E2bCodec.JSON));
+            byte[] frame = endStreamFrame(payload);
+
+            IOException ex =
+                    assertThrows(
+                            IOException.class,
+                            () ->
+                                    drainStartStream(
+                                            client,
+                                            frame,
+                                            new ByteArrayOutputStream(),
+                                            new ByteArrayOutputStream()),
+                            "payload: " + payload);
+            // Clean end-stream break, then missing-exit error — never a
+            // SandboxRuntimeException and never a NumberFormatException.
+            assertTrue(ex.getMessage().contains("before receiving a process exit code"));
+        }
+    }
+
     // Connect protocol: successful EndStreamResponse is "{}" (no error, no metadata).
     // Python SDK: end_stream without "error" → return (stop iteration).
-    // A stream that ends without any process exit code is an incomplete transport
-    // response and must be rejected (#2828), not treated as success.
     @Test
-    void endStreamResponseWithoutExitCodeThrows() throws Exception {
+    void endStreamResponseWithoutErrorBreaksCleanly() throws Exception {
         E2bEnvdProcessClient client = new E2bEnvdProcessClient(options(E2bCodec.JSON));
         byte[] frame =
                 concatFrames(
                         connectFrame(responseJson(base64("hello"), null, null)),
+                        connectFrame(endEventJson(0, null)),
                         endStreamFrame("{}"));
         ByteArrayOutputStream stdout = new ByteArrayOutputStream();
         ByteArrayOutputStream stderr = new ByteArrayOutputStream();
-        IOException exception =
-                assertThrows(
-                        IOException.class, () -> drainStartStream(client, frame, stdout, stderr));
+        int exit = drainStartStream(client, frame, stdout, stderr);
 
-        assertTrue(exception.getMessage().contains("before receiving a process exit code"));
+        assertEquals(0, exit);
         assertEquals("hello", stdout.toString(StandardCharsets.UTF_8));
         assertEquals("", stderr.toString(StandardCharsets.UTF_8));
     }
 
-    // Proto3: sint32 exit_code defaults to 0, omitted from JSON when 0.
-    // getField() returns proto3 default (0) when absent — hasField() returns false.
-    // Python SDK reads event.event.end.exit_code directly (always returns 0 by default).
-    // https://protobuf.dev/programming-guides/proto3/#default
+    // An end event carrying neither exit code nor error must not fabricate exit 0:
+    // without it the stream fails with "before receiving a process exit code".
+    // (Proto3 note: a present-but-empty EndEvent on the wire behaves the same —
+    // see emptyEndEventThrowsProto. Real envd always populates exit_code.)
     @Test
-    void exitCodeZeroDefaultWhenOmitted() throws Exception {
+    void emptyEndEventThrows() throws Exception {
         E2bEnvdProcessClient client = new E2bEnvdProcessClient(options(E2bCodec.JSON));
         byte[] frame = concatFrames(connectFrame(endEventJson(null, null)), endStreamFrame("{}"));
+
+        IOException ex =
+                assertThrows(
+                        IOException.class,
+                        () ->
+                                drainStartStream(
+                                        client,
+                                        frame,
+                                        new ByteArrayOutputStream(),
+                                        new ByteArrayOutputStream()));
+        assertTrue(ex.getMessage().contains("before receiving a process exit code"));
+    }
+
+    // Proto-wire counterpart: exit_code=0 is bit-identical to a field-less EndEvent
+    // (proto3 omits default scalars), so they cannot be distinguished — the official
+    // Python SDK reads end.exit_code directly and reports 0 for the same reason.
+    @Test
+    void emptyEndEventReadsZeroProto() throws Exception {
+        E2bEnvdProcessClient client = new E2bEnvdProcessClient(options(E2bCodec.PROTO));
+        DynamicMessage endResp = endEventResponse(client, null, null);
+        byte[] frame = concatFrames(connectFrame(endResp.toByteArray()), endStreamFrame("{}"));
         ByteArrayOutputStream stdout = new ByteArrayOutputStream();
         ByteArrayOutputStream stderr = new ByteArrayOutputStream();
         int exit = drainStartStream(client, frame, stdout, stderr);
@@ -353,18 +426,55 @@ class E2bEnvdProcessClientTest {
     // https://github.com/e2b-dev/infra/blob/main/packages/envd/internal/services/process/handler/handler.go
     // Python SDK: CommandResult(error=event.event.end.error)
     // https://github.com/e2b-dev/e2b/blob/main/packages/python-sdk/e2b/sandbox_sync/commands/command_handle.py#L115
+    // Mirrors the real signal-kill shape observed against live envd:
+    // exit_code=-1 with EndEvent.error="signal: killed".
     @Test
     void endEventErrorWrittenToStderr() throws Exception {
         E2bEnvdProcessClient client = new E2bEnvdProcessClient(options(E2bCodec.JSON));
         byte[] frame =
-                concatFrames(connectFrame(endEventJson(null, "signal: 9")), endStreamFrame("{}"));
+                concatFrames(
+                        connectFrame(endEventJson(-1, "signal: killed")), endStreamFrame("{}"));
         ByteArrayOutputStream stdout = new ByteArrayOutputStream();
         ByteArrayOutputStream stderr = new ByteArrayOutputStream();
         int exit = drainStartStream(client, frame, stdout, stderr);
 
-        assertEquals(0, exit);
+        assertEquals(-1, exit);
         assertEquals("", stdout.toString(StandardCharsets.UTF_8));
-        assertTrue(stderr.toString(StandardCharsets.UTF_8).contains("signal: 9"));
+        assertTrue(stderr.toString(StandardCharsets.UTF_8).contains("signal: killed"));
+    }
+
+    // EndEvent.error is separated from preceding stderr output lacking a trailing
+    // newline, so the two never glue together ("partial" + "exit status 1").
+    @Test
+    void endEventErrorSeparatedFromStderr() throws Exception {
+        E2bEnvdProcessClient client = new E2bEnvdProcessClient(options(E2bCodec.JSON));
+        byte[] frame =
+                concatFrames(
+                        connectFrame(responseJson(null, base64("partial"), null)),
+                        connectFrame(endEventJson(1, "exit status 1")),
+                        endStreamFrame("{}"));
+        ByteArrayOutputStream stdout = new ByteArrayOutputStream();
+        ByteArrayOutputStream stderr = new ByteArrayOutputStream();
+        int exit = drainStartStream(client, frame, stdout, stderr);
+
+        assertEquals(1, exit);
+        assertEquals("partial\nexit status 1", stderr.toString(StandardCharsets.UTF_8));
+    }
+
+    // protojson accepts the original proto field name on the wire as well:
+    // {"end":{"exit_code":42}} decodes like {"end":{"exitCode":42}}.
+    @Test
+    void exitCodeSnakeCaseFieldName() throws Exception {
+        E2bEnvdProcessClient client = new E2bEnvdProcessClient(options(E2bCodec.JSON));
+        byte[] frame =
+                concatFrames(
+                        connectFrame("{\"event\":{\"end\":{\"exit_code\":42}}}"),
+                        endStreamFrame("{}"));
+        ByteArrayOutputStream stdout = new ByteArrayOutputStream();
+        ByteArrayOutputStream stderr = new ByteArrayOutputStream();
+        int exit = drainStartStream(client, frame, stdout, stderr);
+
+        assertEquals(42, exit);
     }
 
     // Connect protocol: flags bit 0 = compressed (not supported by this client).
@@ -405,18 +515,20 @@ class E2bEnvdProcessClientTest {
 
     // ---- PROTO codec tests ----
 
+    // Data frames alone carry no exit code: the stream is rejected, mirroring
+    // jsonCodecRejectsEofBeforeEnd for the proto codec.
     @Test
-    void protoCodecDrainStartStreamWithoutExitCodeThrows() throws Exception {
+    void protoCodecDrainStartStreamRejectsMissingEnd() throws Exception {
         E2bEnvdProcessClient client = new E2bEnvdProcessClient(options(E2bCodec.PROTO));
         DynamicMessage dataResp = dataResponse(client, "hello\n", null);
         byte[] frame = concatFrames(connectFrame(dataResp.toByteArray()), endStreamFrame("{}"));
         ByteArrayOutputStream stdout = new ByteArrayOutputStream();
         ByteArrayOutputStream stderr = new ByteArrayOutputStream();
-        IOException exception =
+
+        IOException ex =
                 assertThrows(
                         IOException.class, () -> drainStartStream(client, frame, stdout, stderr));
-
-        assertTrue(exception.getMessage().contains("before receiving a process exit code"));
+        assertTrue(ex.getMessage().contains("before receiving a process exit code"));
         assertEquals("hello\n", stdout.toString(StandardCharsets.UTF_8));
         assertEquals("", stderr.toString(StandardCharsets.UTF_8));
     }
@@ -475,21 +587,25 @@ class E2bEnvdProcessClientTest {
         assertTrue(ex.getMessage().contains("Invalid connect frame length"));
     }
 
+    // Connect Message-Length is unsigned: 0x80000005 must decode negative and be
+    // rejected. The old `& 0x7FFFFFFF` mask turned it into 5, misaligning the stream.
     @Test
-    void truncatedFrameDataThrows() throws Exception {
+    void highBitFrameLengthThrowsIOException() throws Exception {
         E2bEnvdProcessClient client = new E2bEnvdProcessClient(options(E2bCodec.JSON));
-        byte[] frame = new byte[10];
+        byte[] frame = new byte[5];
         frame[0] = 0x00;
-        ByteBuffer.wrap(frame, 1, 4).order(ByteOrder.BIG_ENDIAN).putInt(100);
-        System.arraycopy("hello".getBytes(StandardCharsets.UTF_8), 0, frame, 5, 5);
+        ByteBuffer.wrap(frame, 1, 4).order(ByteOrder.BIG_ENDIAN).putInt(0x80000005);
 
-        ByteArrayOutputStream stdout = new ByteArrayOutputStream();
-        ByteArrayOutputStream stderr = new ByteArrayOutputStream();
-        IOException exception =
+        IOException ex =
                 assertThrows(
-                        IOException.class, () -> drainStartStream(client, frame, stdout, stderr));
-
-        assertTrue(exception.getMessage().contains("before receiving a process exit code"));
+                        IOException.class,
+                        () ->
+                                drainStartStream(
+                                        client,
+                                        frame,
+                                        new ByteArrayOutputStream(),
+                                        new ByteArrayOutputStream()));
+        assertTrue(ex.getMessage().contains("Invalid connect frame length"));
     }
 
     @Test
@@ -514,12 +630,18 @@ class E2bEnvdProcessClientTest {
         E2bEnvdProcessClient client = new E2bEnvdProcessClient(options(E2bCodec.JSON));
         String json = "{\"event\":{\"end\":{\"exitCode\":\"abc\"}}}";
         byte[] frame = concatFrames(connectFrame(json), endStreamFrame("{}"));
-        ByteArrayOutputStream stdout = new ByteArrayOutputStream();
-        ByteArrayOutputStream stderr = new ByteArrayOutputStream();
-        // exitCode defaults to 0 (proto3 default) when not convertible to int
-        int exit = drainStartStream(client, frame, stdout, stderr);
-
-        assertEquals(0, exit);
+        // A non-convertible exitCode is ignored, leaving an empty end event —
+        // which must not fabricate exit 0 (see emptyEndEventThrows).
+        IOException ex =
+                assertThrows(
+                        IOException.class,
+                        () ->
+                                drainStartStream(
+                                        client,
+                                        frame,
+                                        new ByteArrayOutputStream(),
+                                        new ByteArrayOutputStream()));
+        assertTrue(ex.getMessage().contains("before receiving a process exit code"));
     }
 
     @Test
@@ -533,6 +655,55 @@ class E2bEnvdProcessClientTest {
 
         assertEquals(1, exit);
         assertEquals("", stderr.toString(StandardCharsets.UTF_8));
+    }
+
+    private static DynamicMessage dataResponse(
+            E2bEnvdProcessClient client, String stdout, String stderr) {
+        Descriptors.FileDescriptor fd = client.fileDescriptor();
+        Descriptors.Descriptor processEventDesc = fd.findMessageTypeByName("ProcessEvent");
+        Descriptors.Descriptor dataDesc = processEventDesc.findNestedTypeByName("DataEvent");
+
+        DynamicMessage data =
+                DynamicMessage.newBuilder(dataDesc)
+                        .setField(
+                                stdout != null
+                                        ? dataDesc.findFieldByName("stdout")
+                                        : dataDesc.findFieldByName("stderr"),
+                                ByteString.copyFromUtf8(stdout != null ? stdout : stderr))
+                        .build();
+        DynamicMessage event =
+                DynamicMessage.newBuilder(processEventDesc)
+                        .setField(processEventDesc.findFieldByName("data"), data)
+                        .build();
+        Descriptors.Descriptor startResponseDesc = fd.findMessageTypeByName("StartResponse");
+        return DynamicMessage.newBuilder(startResponseDesc)
+                .setField(startResponseDesc.findFieldByName("event"), event)
+                .build();
+    }
+
+    private static DynamicMessage endEventResponse(
+            E2bEnvdProcessClient client, Integer exitCode, String error) {
+        Descriptors.FileDescriptor fd = client.fileDescriptor();
+        Descriptors.Descriptor processEventDesc = fd.findMessageTypeByName("ProcessEvent");
+        Descriptors.Descriptor endDesc = processEventDesc.findNestedTypeByName("EndEvent");
+
+        DynamicMessage.Builder endBuilder = DynamicMessage.newBuilder(endDesc);
+        if (exitCode != null) {
+            endBuilder.setField(endDesc.findFieldByName("exit_code"), exitCode);
+        }
+        if (error != null) {
+            endBuilder.setField(endDesc.findFieldByName("error"), error);
+        }
+        DynamicMessage end = endBuilder.build();
+
+        DynamicMessage event =
+                DynamicMessage.newBuilder(processEventDesc)
+                        .setField(processEventDesc.findFieldByName("end"), end)
+                        .build();
+        Descriptors.Descriptor startResponseDesc = fd.findMessageTypeByName("StartResponse");
+        return DynamicMessage.newBuilder(startResponseDesc)
+                .setField(startResponseDesc.findFieldByName("event"), event)
+                .build();
     }
 
     // ---- filesystem REST API tests ----
@@ -553,6 +724,7 @@ class E2bEnvdProcessClientTest {
         when(mockCall.execute()).thenReturn(okResponse);
 
         E2bSandboxClientOptions opt = options(E2bCodec.JSON);
+        opt.setRunUser(null);
         opt.setHttpClient(mockHttp);
         E2bEnvdProcessClient client = new E2bEnvdProcessClient(opt);
 
@@ -564,7 +736,11 @@ class E2bEnvdProcessClientTest {
 
         ArgumentCaptor<Request> requestCaptor = ArgumentCaptor.forClass(Request.class);
         verify(mockHttp).newCall(requestCaptor.capture());
-        String url = requestCaptor.getValue().url().toString();
+        Request sent = requestCaptor.getValue();
+        assertEquals("POST", sent.method());
+        assertTrue(sent.body() instanceof MultipartBody);
+        assertEquals(1, ((MultipartBody) sent.body()).size());
+        String url = sent.url().toString();
         assertTrue(url.startsWith("https://49983-test-id.e2b.app/files?path="));
         assertTrue(url.contains("path=%2Ftmp%2Ftest.txt"));
         assertTrue(url.contains("username=user"));
@@ -600,6 +776,16 @@ class E2bEnvdProcessClientTest {
                         () -> client.uploadFile(state, "/tmp/test.txt", "data".getBytes()));
         assertEquals(SandboxErrorCode.WORKSPACE_ARCHIVE_WRITE_ERROR, ex.getErrorCode());
         assertTrue(ex.getMessage().contains("500"));
+    }
+
+    @Test
+    void uploadFileWithDirectoryPathThrowsIllegalArgument() throws Exception {
+        E2bEnvdProcessClient client = new E2bEnvdProcessClient(options(E2bCodec.JSON));
+        E2bSandboxState state = mock(E2bSandboxState.class);
+
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> client.uploadFile(state, "/home/", "data".getBytes()));
     }
 
     @Test
@@ -776,10 +962,20 @@ class E2bEnvdProcessClientTest {
             if (needComma) {
                 json.append(',');
             }
-            json.append("\"error\":\"").append(error).append("\"");
+            json.append("\"error\":").append(jsonString(error));
         }
         json.append("}}}");
         return json.toString();
+    }
+
+    private static String jsonString(String value) {
+        return "\""
+                + value.replace("\\", "\\\\")
+                        .replace("\"", "\\\"")
+                        .replace("\n", "\\n")
+                        .replace("\r", "\\r")
+                        .replace("\t", "\\t")
+                + "\"";
     }
 
     private static String base64(String value) {
@@ -891,7 +1087,7 @@ class E2bEnvdProcessClientTest {
     }
 
     @Test
-    void nonPositiveTimeoutFailsFastWithoutRequest() throws Exception {
+    void zeroTimeoutSkipsClientTimeoutAndServerKill() throws Exception {
         AtomicReference<String> header = new AtomicReference<>();
         Interceptor capture =
                 chain -> {
@@ -900,13 +1096,13 @@ class E2bEnvdProcessClientTest {
                 };
         E2bEnvdProcessClient client = clientWithInterceptor(capture);
 
+        // timeout <= 0 keeps the historical "no client timeout" path (see the opt-in
+        // live-sandbox test): the request is issued without a Connect-Timeout-Ms header
+        // so the server does not kill the remote process.
         assertThrows(
-                IllegalArgumentException.class,
+                SandboxException.ExecTimeoutException.class,
                 () -> client.runShell(state(), "/workspace", "echo hi", 0));
-        assertThrows(
-                IllegalArgumentException.class,
-                () -> client.runShell(state(), "/workspace", "echo hi", -5));
-        assertNull(header.get(), "no HTTP request must be issued for invalid timeout");
+        assertNull(header.get(), "no Connect-Timeout-Ms header for non-positive timeout");
     }
 
     private static E2bEnvdProcessClient clientWithInterceptor(Interceptor interceptor)
