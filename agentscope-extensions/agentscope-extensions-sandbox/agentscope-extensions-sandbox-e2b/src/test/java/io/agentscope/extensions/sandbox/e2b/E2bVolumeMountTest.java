@@ -102,7 +102,8 @@ class E2bVolumeMountTest {
                         .setBody("{\"sandboxID\":\"sbx-1\"}"));
 
         new E2bPlatformHttp(options())
-                .createSandbox("base", 300, List.of(new E2bVolumeMount("vol-a", "/mnt/data")));
+                .createSandbox(
+                        "base", 300, List.of(new E2bVolumeMount("vol-a", "/mnt/data")), null);
 
         RecordedRequest req = server.takeRequest();
         assertEquals("/sandboxes", req.getPath());
@@ -123,7 +124,7 @@ class E2bVolumeMountTest {
                         .setHeader("Content-Type", "application/json")
                         .setBody("{\"sandboxID\":\"sbx-1\"}"));
 
-        new E2bPlatformHttp(options()).createSandbox("base", 300, List.of());
+        new E2bPlatformHttp(options()).createSandbox("base", 300, List.of(), null);
 
         JsonNode body = json.readTree(server.takeRequest().getBody().readUtf8());
         assertFalse(body.has("volumeMounts"), "volumeMounts must be omitted when empty: " + body);
@@ -137,7 +138,8 @@ class E2bVolumeMountTest {
                         .setHeader("Content-Type", "application/json")
                         .setBody("{\"sandboxID\":\"sbx-1\"}"));
 
-        new E2bPlatformHttp(options()).createSandbox("base", 300, Collections.singletonList(null));
+        new E2bPlatformHttp(options())
+                .createSandbox("base", 300, Collections.singletonList(null), null);
 
         JsonNode body = json.readTree(server.takeRequest().getBody().readUtf8());
         assertFalse(
@@ -156,7 +158,8 @@ class E2bVolumeMountTest {
                                         .createSandbox(
                                                 "base",
                                                 300,
-                                                List.of(new E2bVolumeMount("vol-x", "/mnt/data"))));
+                                                List.of(new E2bVolumeMount("vol-x", "/mnt/data")),
+                                                null));
         assertTrue(e.getMessage().contains("400"), e.getMessage());
         assertTrue(e.getMessage().contains("volume not found: vol-x"), e.getMessage());
     }
@@ -166,17 +169,18 @@ class E2bVolumeMountTest {
         E2bSandboxClient client = new E2bSandboxClient();
 
         E2bSandboxClientOptions onVolume = new E2bSandboxClientOptions();
+        onVolume.setWorkspaceRoot("/mnt/data/ws");
         onVolume.addVolumeMount("vol-a", "/mnt/data");
-        Sandbox s = client.create(workspaceSpec("/mnt/data/ws"), null, onVolume);
+        Sandbox s = client.create(workspaceSpec(), null, onVolume);
         E2bSandboxState st = (E2bSandboxState) s.getState();
         assertTrue(st.isWorkspaceOnVolume());
         assertEquals(List.of(new E2bVolumeMount("vol-a", "/mnt/data")), st.getVolumeMounts());
 
         E2bSandboxClientOptions offVolume = new E2bSandboxClientOptions();
+        offVolume.setWorkspaceRoot("/home/user");
         offVolume.addVolumeMount("vol-a", "/mnt/data");
         E2bSandboxState st2 =
-                (E2bSandboxState)
-                        client.create(workspaceSpec("/home/user"), null, offVolume).getState();
+                (E2bSandboxState) client.create(workspaceSpec(), null, offVolume).getState();
         assertFalse(st2.isWorkspaceOnVolume());
     }
 
@@ -258,6 +262,49 @@ class E2bVolumeMountTest {
         assertEquals("/mnt/data", createBody.get("volumeMounts").get(0).get("path").asText());
     }
 
+    @Test
+    void addVolumeMountIsFluent() {
+        E2bSandboxClientOptions opt = new E2bSandboxClientOptions();
+        assertTrue(opt.addVolumeMount("vol-a", "/mnt/data") == opt);
+        assertTrue(opt.addVolumeMount(new E2bVolumeMount("vol-b", "/mnt/other")) == opt);
+        assertTrue(opt.addVolumeMount(null) == opt);
+        assertEquals(
+                List.of(
+                        new E2bVolumeMount("vol-a", "/mnt/data"),
+                        new E2bVolumeMount("vol-b", "/mnt/other")),
+                opt.getVolumeMounts());
+    }
+
+    @Test
+    void createRejectsRelativeWorkspaceRoot() {
+        E2bSandboxClient client = new E2bSandboxClient();
+        E2bSandboxClientOptions relative = new E2bSandboxClientOptions();
+        relative.setWorkspaceRoot("relative/ws");
+        SandboxException.SandboxConfigurationException e =
+                assertThrows(
+                        SandboxException.SandboxConfigurationException.class,
+                        () -> client.create(workspaceSpec(), null, relative));
+        assertTrue(e.getMessage().contains("workspaceRoot"), e.getMessage());
+    }
+
+    @Test
+    void tarCommandQuotesExcludeArgs() throws Exception {
+        E2bSandboxState state = new E2bSandboxState();
+        state.setWorkspaceSpec(workspaceSpec());
+        state.setWorkspaceRoot("/home/user");
+        state.setVolumeMounts(List.of(new E2bVolumeMount("vol-a", "/home/user/my data")));
+        E2bSandbox sandbox = new E2bSandbox(state, options());
+
+        java.lang.reflect.Method m =
+                E2bSandbox.class.getDeclaredMethod(
+                        "buildTarCommand", boolean.class, String.class, String.class);
+        m.setAccessible(true);
+        String script = (String) m.invoke(sandbox, true, "/tmp/ws.tar", "/home/user");
+        assertTrue(
+                script.contains("'--exclude=./my data'"),
+                "exclude with spaces must be shell-quoted, got: " + script);
+    }
+
     private E2bSandboxClientOptions options() {
         E2bSandboxClientOptions opt = new E2bSandboxClientOptions();
         opt.setApiBaseUrl(server.url("/").toString());
@@ -267,12 +314,8 @@ class E2bVolumeMountTest {
     }
 
     private static WorkspaceSpec workspaceSpec() {
-        return workspaceSpec("/tmp/agentscope-test-workspace");
-    }
-
-    private static WorkspaceSpec workspaceSpec(String root) {
         WorkspaceSpec ws = new WorkspaceSpec();
-        ws.setRoot(root);
+        ws.setRoot("/tmp/agentscope-test-workspace");
         return ws;
     }
 }

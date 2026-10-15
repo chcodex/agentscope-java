@@ -58,18 +58,21 @@ public class E2bSandboxClient implements SandboxClient<E2bSandboxClientOptions> 
             E2bSandboxClientOptions options) {
         String sessionId = UUID.randomUUID().toString();
         E2bSandboxClientOptions merged = merge(options);
+        requireAbsoluteWorkspaceRoot(merged.getWorkspaceRoot());
 
         E2bSandboxState state = new E2bSandboxState();
         state.setSessionId(sessionId);
         state.setWorkspaceSpec(workspaceSpec);
         state.setTemplateId(merged.getTemplateId());
+        state.setWorkspaceRoot(merged.getWorkspaceRoot());
         state.setSandboxOwned(true);
         state.setWorkspaceRootReady(false);
         state.setPersistenceMode(merged.getPersistenceMode());
         state.setCodec(merged.getCodec());
         state.setSandboxDomain(merged.getDomain());
+        state.setEnvdSandboxUrl(merged.getEnvdSandboxUrl());
         state.setVolumeMounts(merged.getVolumeMounts());
-        state.setWorkspaceOnVolume(isWorkspaceOnVolume(workspaceSpec, merged));
+        state.setWorkspaceOnVolume(isWorkspaceOnVolume(merged));
 
         if (snapshotSpec != null) {
             state.setSnapshot(snapshotSpec.build(sessionId));
@@ -87,6 +90,7 @@ public class E2bSandboxClient implements SandboxClient<E2bSandboxClientOptions> 
         }
         E2bSandboxClientOptions resumed = copy(defaultOptions);
         resumed.setCodec(e2b.getCodec());
+        resumed.setEnvdSandboxUrl(e2b.getEnvdSandboxUrl());
         return new E2bSandbox(e2b, resumed);
     }
 
@@ -127,6 +131,9 @@ public class E2bSandboxClient implements SandboxClient<E2bSandboxClientOptions> 
         if (call.getDomain() != null) {
             o.setDomain(call.getDomain());
         }
+        if (call.getEnvdSandboxUrl() != null) {
+            o.setEnvdSandboxUrl(call.getEnvdSandboxUrl());
+        }
         if (call.getSandboxTimeoutSeconds() > 0) {
             o.setSandboxTimeoutSeconds(call.getSandboxTimeoutSeconds());
         }
@@ -141,6 +148,9 @@ public class E2bSandboxClient implements SandboxClient<E2bSandboxClientOptions> 
         }
         if (call.getTemplateId() != null) {
             o.setTemplateId(call.getTemplateId());
+        }
+        if (call.getWorkspaceRoot() != null) {
+            o.setWorkspaceRoot(call.getWorkspaceRoot());
         }
         if (call.getHttpClient() != null) {
             o.setHttpClient(call.getHttpClient());
@@ -167,13 +177,21 @@ public class E2bSandboxClient implements SandboxClient<E2bSandboxClientOptions> 
     /**
      * Returns whether the workspace root lives on one of the configured volume mounts.
      *
-     * @param workspaceSpec workspace spec carrying the root path
      * @param opt merged client options
      * @return true when a mount covers the workspace root
      */
-    private static boolean isWorkspaceOnVolume(
-            WorkspaceSpec workspaceSpec, E2bSandboxClientOptions opt) {
-        String root = workspaceSpec != null ? workspaceSpec.getRoot() : null;
+    private static void requireAbsoluteWorkspaceRoot(String workspaceRoot) {
+        if (workspaceRoot == null
+                || workspaceRoot.isBlank()
+                || !workspaceRoot.strip().startsWith("/")) {
+            throw new SandboxException.SandboxConfigurationException(
+                    "E2B workspaceRoot must be an absolute in-sandbox path but was: "
+                            + workspaceRoot);
+        }
+    }
+
+    private static boolean isWorkspaceOnVolume(E2bSandboxClientOptions opt) {
+        String root = opt.getWorkspaceRoot();
         if (root == null || root.isBlank() || opt.getVolumeMounts() == null) {
             return false;
         }
@@ -190,7 +208,9 @@ public class E2bSandboxClient implements SandboxClient<E2bSandboxClientOptions> 
         o.setApiKey(src.getApiKey());
         o.setApiBaseUrl(src.getApiBaseUrl());
         o.setDomain(src.getDomain());
+        o.setEnvdSandboxUrl(src.getEnvdSandboxUrl());
         o.setTemplateId(src.getTemplateId());
+        o.setWorkspaceRoot(src.getWorkspaceRoot());
         o.setSandboxTimeoutSeconds(src.getSandboxTimeoutSeconds());
         o.setRunUser(src.getRunUser());
         o.setPersistenceMode(src.getPersistenceMode());

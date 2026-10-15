@@ -158,9 +158,11 @@ public class E2bSandbox extends AbstractBaseSandbox implements SandboxFileTransf
         if (e2bState.getPersistenceMode() == E2bPersistenceMode.NATIVE_SNAPSHOT) {
             // Native snapshots preserve the software environment (installed deps, system state);
             // volume bytes stay durable via the volume itself and mounts are re-attached on
-            // restore.
-            // TODO(volume-snapshot): verify whether native snapshots capture mounted volume
-            // content (needed only for mounts nested under a non-volume workspace root).
+            // restore. Keep the snapshot call even when the workspace sits on a volume.
+            // Verified live
+            // (E2bVolumeMountLiveTest#nestedMountContentSurvivesNativeSnapshotRestoreUnchanged):
+            // platform snapshots do not capture mounted volume bytes, so a nested mount under a
+            // non-volume workspace root is unaffected by snapshot restore.
             JsonNode snap = platform.createSandboxSnapshot(e2bState.getSandboxId(), snapshotName());
             String id = snap.path("snapshotID").asText("");
             if (id.isBlank()) {
@@ -176,7 +178,7 @@ public class E2bSandbox extends AbstractBaseSandbox implements SandboxFileTransf
             // Workspace bytes are durable via the volume — nothing to archive.
             return InputStream.nullInputStream();
         }
-        String root = e2bState.getWorkspaceSpec().getRoot();
+        String root = e2bState.getWorkspaceRoot();
         String tarPath = newTempTarPath();
         String script = buildTarCommand(true, tarPath, root);
         try {
@@ -214,7 +216,7 @@ public class E2bSandbox extends AbstractBaseSandbox implements SandboxFileTransf
             return;
         }
         String tarPath = newTempTarPath();
-        String root = e2bState.getWorkspaceSpec().getRoot();
+        String root = e2bState.getWorkspaceRoot();
         String script = buildTarCommand(false, tarPath, root);
         try {
             envd().uploadFile(e2bState, tarPath, all);
@@ -226,10 +228,13 @@ public class E2bSandbox extends AbstractBaseSandbox implements SandboxFileTransf
 
     @Override
     protected void doSetupWorkspace() throws Exception {
+        // mkdir's own cwd must already exist: a workspace root on a freshly mounted volume
+        // (e.g. /mnt/data/ws) typically does not exist yet, so run from / instead. The
+        // mkdir target is absolute and unaffected by the cwd.
         envd().runShell(
                         e2bState,
                         "/",
-                        "mkdir -p " + shellSingleQuote(e2bState.getWorkspaceSpec().getRoot()),
+                        "mkdir -p " + shellSingleQuote(e2bState.getWorkspaceRoot()),
                         30);
     }
 
@@ -243,7 +248,7 @@ public class E2bSandbox extends AbstractBaseSandbox implements SandboxFileTransf
             envd().runShell(
                             e2bState,
                             getWorkspaceRoot(),
-                            "rm -rf " + shellSingleQuote(e2bState.getWorkspaceSpec().getRoot()),
+                            "rm -rf " + shellSingleQuote(e2bState.getWorkspaceRoot()),
                             30);
         } catch (Exception e) {
             log.debug("[sandbox-e2b] destroy workspace best-effort: {}", e.getMessage());
@@ -251,8 +256,8 @@ public class E2bSandbox extends AbstractBaseSandbox implements SandboxFileTransf
     }
 
     @Override
-    public String getWorkspaceRoot() {
-        return e2bState.getWorkspaceSpec().getRoot();
+    protected String getWorkspaceRoot() {
+        return e2bState.getWorkspaceRoot();
     }
 
     @Override
@@ -544,7 +549,7 @@ public class E2bSandbox extends AbstractBaseSandbox implements SandboxFileTransf
             paths.add(m.getPath());
         }
         return WorkspaceMountSupport.tarExcludeArgsForAbsolutePaths(
-                e2bState.getWorkspaceSpec().getRoot(), paths);
+                e2bState.getWorkspaceRoot(), paths);
     }
 
     private E2bEnvdProcessClient envd() throws Exception {
@@ -562,11 +567,7 @@ public class E2bSandbox extends AbstractBaseSandbox implements SandboxFileTransf
 
     private void removeTempFileBestEffort(String tarPath) {
         try {
-            envd().runShell(
-                            e2bState,
-                            e2bState.getWorkspaceSpec().getRoot(),
-                            "rm -f " + tarPath,
-                            30);
+            envd().runShell(e2bState, e2bState.getWorkspaceRoot(), "rm -f " + tarPath, 30);
         } catch (Exception e) {
             log.debug("[sandbox-e2b] remove temp tar best-effort: {}", e.getMessage());
         }
@@ -580,7 +581,13 @@ public class E2bSandbox extends AbstractBaseSandbox implements SandboxFileTransf
         StringBuilder script = new StringBuilder("tar ");
         for (String ex :
                 WorkspaceMountSupport.tarExcludeArgsForBindMounts(e2bState.getWorkspaceSpec())) {
-            script.append(ex).append(' ');
+            // Quote: exclude args derive from user-configured paths and may contain spaces.
+            script.append(shellSingleQuote(ex)).append(' ');
+        }
+        if (create) {
+            for (String ex : volumeTarExcludeArgs()) {
+                script.append(shellSingleQuote(ex)).append(' ');
+            }
         }
         script.append(create ? "-cf " : "-xf ")
                 .append(tarPath)
@@ -605,7 +612,7 @@ public class E2bSandbox extends AbstractBaseSandbox implements SandboxFileTransf
         if (path == null || path.isBlank() || !path.startsWith("/")) {
             return null;
         }
-        String root = e2bState.getWorkspaceSpec().getRoot();
+        String root = e2bState.getWorkspaceRoot();
         if (root == null || root.isBlank() || !root.startsWith("/")) {
             return null;
         }

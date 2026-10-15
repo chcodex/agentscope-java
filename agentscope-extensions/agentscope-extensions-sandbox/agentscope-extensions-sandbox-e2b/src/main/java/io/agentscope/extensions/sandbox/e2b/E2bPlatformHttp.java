@@ -61,7 +61,12 @@ final class E2bPlatformHttp {
     }
 
     JsonNode createSandbox(String templateId, int timeoutSeconds) throws IOException {
-        return createSandbox(templateId, timeoutSeconds, null, Map.of());
+        return createSandbox(templateId, timeoutSeconds, null, null);
+    }
+
+    JsonNode createSandbox(String templateId, int timeoutSeconds, Map<String, String> envVars)
+            throws IOException {
+        return createSandbox(templateId, timeoutSeconds, null, envVars);
     }
 
     /**
@@ -71,17 +76,6 @@ final class E2bPlatformHttp {
      * The field is omitted when empty. Platform 400s (no volume beta access, unknown volume name)
      * propagate with the response body via {@link #postJson}.
      */
-    JsonNode createSandbox(String templateId, int timeoutSeconds, List<E2bVolumeMount> mounts)
-            throws IOException {
-        return createSandbox(templateId, timeoutSeconds, mounts, Map.of());
-    }
-
-    JsonNode createSandbox(String templateId, int timeoutSeconds, Map<String, String> envVars)
-            throws IOException {
-        return createSandbox(templateId, timeoutSeconds, null, envVars);
-    }
-
-    /** Creates a sandbox with both pre-existing volume mounts and environment variables. */
     JsonNode createSandbox(
             String templateId,
             int timeoutSeconds,
@@ -91,6 +85,10 @@ final class E2bPlatformHttp {
         ObjectNode body = json.createObjectNode();
         body.put("templateID", templateId);
         body.put("timeout", timeoutSeconds);
+        if (envVars != null && !envVars.isEmpty()) {
+            ObjectNode envs = body.putObject("envVars");
+            envVars.forEach(envs::put);
+        }
         if (mounts != null && !mounts.isEmpty()) {
             var arr = body.putArray("volumeMounts");
             int count = 0;
@@ -106,10 +104,6 @@ final class E2bPlatformHttp {
             if (count == 0) {
                 body.remove("volumeMounts");
             }
-        }
-        if (envVars != null && !envVars.isEmpty()) {
-            ObjectNode envs = body.putObject("envVars");
-            envVars.forEach(envs::put);
         }
         String url = trimSlash(opt.getApiBaseUrl()) + "/sandboxes";
         return E2bRetry.withRetries(

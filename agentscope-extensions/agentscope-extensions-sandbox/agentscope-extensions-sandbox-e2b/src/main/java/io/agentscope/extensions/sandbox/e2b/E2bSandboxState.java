@@ -25,8 +25,10 @@ public class E2bSandboxState extends SandboxState {
     private String sandboxId;
     private String templateId = "base";
     private String sandboxDomain;
+    private String envdSandboxUrl;
     private String envdAccessToken;
     private String envdVersion = "0.1.5";
+    private String workspaceRoot = "/home/user";
     private boolean sandboxOwned = true;
     private E2bPersistenceMode persistenceMode = E2bPersistenceMode.TAR;
     private E2bCodec codec = E2bCodec.PROTO;
@@ -41,9 +43,9 @@ public class E2bSandboxState extends SandboxState {
     private List<E2bVolumeMount> volumeMounts = new ArrayList<>();
 
     /**
-     * Whether the workspace root lives on a volume mount. When true, workspace bytes are durable
-     * via the volume: TAR persistence is a no-op (native snapshots still run to preserve the
-     * software environment) and destroy skips {@code rm -rf}.
+     * Whether {@link #workspaceRoot} lives on a volume mount. When true, workspace bytes are
+     * durable via the volume: TAR persistence is a no-op (native snapshots still run to preserve
+     * the software environment) and destroy skips {@code rm -rf}.
      */
     private boolean workspaceOnVolume = false;
 
@@ -71,6 +73,14 @@ public class E2bSandboxState extends SandboxState {
         this.sandboxDomain = sandboxDomain;
     }
 
+    public String getEnvdSandboxUrl() {
+        return envdSandboxUrl;
+    }
+
+    public void setEnvdSandboxUrl(String envdSandboxUrl) {
+        this.envdSandboxUrl = envdSandboxUrl;
+    }
+
     public String getEnvdAccessToken() {
         return envdAccessToken;
     }
@@ -85,6 +95,14 @@ public class E2bSandboxState extends SandboxState {
 
     public void setEnvdVersion(String envdVersion) {
         this.envdVersion = envdVersion;
+    }
+
+    public String getWorkspaceRoot() {
+        return workspaceRoot;
+    }
+
+    public void setWorkspaceRoot(String workspaceRoot) {
+        this.workspaceRoot = workspaceRoot;
     }
 
     public boolean isSandboxOwned() {
