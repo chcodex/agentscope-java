@@ -24,6 +24,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 import okhttp3.HttpUrl;
@@ -60,7 +61,7 @@ final class E2bPlatformHttp {
     }
 
     JsonNode createSandbox(String templateId, int timeoutSeconds) throws IOException {
-        return createSandbox(templateId, timeoutSeconds, null);
+        return createSandbox(templateId, timeoutSeconds, null, Map.of());
     }
 
     /**
@@ -71,6 +72,21 @@ final class E2bPlatformHttp {
      * propagate with the response body via {@link #postJson}.
      */
     JsonNode createSandbox(String templateId, int timeoutSeconds, List<E2bVolumeMount> mounts)
+            throws IOException {
+        return createSandbox(templateId, timeoutSeconds, mounts, Map.of());
+    }
+
+    JsonNode createSandbox(String templateId, int timeoutSeconds, Map<String, String> envVars)
+            throws IOException {
+        return createSandbox(templateId, timeoutSeconds, null, envVars);
+    }
+
+    /** Creates a sandbox with both pre-existing volume mounts and environment variables. */
+    JsonNode createSandbox(
+            String templateId,
+            int timeoutSeconds,
+            List<E2bVolumeMount> mounts,
+            Map<String, String> envVars)
             throws IOException {
         ObjectNode body = json.createObjectNode();
         body.put("templateID", templateId);
@@ -90,6 +106,10 @@ final class E2bPlatformHttp {
             if (count == 0) {
                 body.remove("volumeMounts");
             }
+        }
+        if (envVars != null && !envVars.isEmpty()) {
+            ObjectNode envs = body.putObject("envVars");
+            envVars.forEach(envs::put);
         }
         String url = trimSlash(opt.getApiBaseUrl()) + "/sandboxes";
         return E2bRetry.withRetries(
