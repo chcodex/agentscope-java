@@ -261,6 +261,14 @@ class AguiClient {
                     callbacks.onStateSnapshot?.(event.snapshot);
                     break;
 
+                case 'MESSAGES_SNAPSHOT':
+                    callbacks.onMessagesSnapshot?.(event.messages || []);
+                    break;
+
+                case 'ACTIVITY_SNAPSHOT':
+                    callbacks.onActivitySnapshot?.(event);
+                    break;
+
                 case 'STATE_DELTA':
                     callbacks.onStateDelta?.(event.delta);
                     break;

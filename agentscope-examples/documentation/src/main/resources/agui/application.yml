@@ -53,6 +53,12 @@ agentscope:
     max-thread-sessions: 1000
     session-timeout-minutes: 30
     enable-reasoning: true
+    # Presentation snapshot store: AG-UI events are materialized per thread and
+    # empty-transcript requests (page reload) hydrate from the stored snapshot.
+    snapshot-store-enabled: true
+    # Keep the agent running after the client disconnects so the run completes,
+    # its events are recorded, and a page reload can hydrate from the snapshot.
+    interrupt-on-disconnect: false
 
 # Logging
 logging:
