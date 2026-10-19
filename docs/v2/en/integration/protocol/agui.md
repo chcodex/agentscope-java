@@ -229,6 +229,7 @@ agentscope:
     enable-reasoning: false
     emit-run-finished-after-error: false
     server-side-memory: false
+    snapshot-store-enabled: false
     interrupt-on-disconnect: true
 ```
 
@@ -257,6 +258,63 @@ AguiRuntimeContextResolver runtimeContextResolver() {
 ```
 
 `forwardedProps` comes from the client request body and is suitable for UI options or frontend context. Do not treat it as a trusted identity source; server-side user identity should come from authentication or a server-side resolver.
+
+## Presentation Snapshot Store
+
+The AG-UI protocol is streaming-only: when a page reloads or a new client joins a thread, only the backend can rebuild the conversation view. The presentation snapshot store (opt-in) materializes each thread's AG-UI presentation state and replays it as a synthetic run.
+
+Enable it with:
+
+```yaml
+agentscope:
+  agui:
+    snapshot-store-enabled: true
+```
+
+When enabled without further configuration, the starter registers an in-memory, latest-only store per web app. Register your own `AguiSnapshotStore` bean to replace it (for example, a Redis-backed one).
+
+```java
+@Bean
+AguiSnapshotStore aguiSnapshotStore() {
+    return new InMemoryAguiSnapshotStore(2000); // max threads kept in memory
+}
+```
+
+### What is stored, and what is not
+
+The snapshot is presentation state only. It is a different responsibility from `server-side-memory`, which keeps Agent execution state (`AgentStateStore`) per thread:
+
+| | `server-side-memory` (Agent state store) | `snapshot-store-enabled` (AG-UI snapshot store) |
+| --- | --- | --- |
+| Contents | Agent runtime state, conversation memory | AG-UI messages, UI state, render activity, open interrupts metadata |
+| Serves | Agent continuity: an Agent instance and its history are preserved per thread | Client continuity: a frontend can recover the conversation view |
+| Consumed by | The Agent runtime | The AG-UI frontend |
+| Default | `false` | `false` |
+
+The two options are independent: a backend can run memory on the server without snapshots, or snapshots without server-side memory (agents are then recreated per request and re-fed with the client transcript).
+
+### Hydrate
+
+A run request triggers hydration when all four conditions hold:
+
+- the request carries no `messages`,
+- the request carries no `resume`,
+- the snapshot store is enabled,
+- a stored snapshot exists for the request's `threadId`.
+
+A hydrate candidate with a missing or blank `threadId` is rejected with a `RUN_ERROR` lifecycle instead of being served from a fallback key. Hydration is a read-only synthetic run — it never invokes an Agent or an LLM — with the frame sequence:
+
+```
+RUN_STARTED → [STATE_SNAPSHOT] → [MESSAGES_SNAPSHOT] → [ACTIVITY_SNAPSHOT]* → RUN_FINISHED(interrupts?)
+```
+
+Empty sections are skipped. `RUN_FINISHED` carries the still-unresolved interrupt outcome, if any, so the frontend can re-render the approval UI. This is presentation-level only: HITL resume state stays authoritative with the resume coordinator and the Agent runtime.
+
+### Limitations
+
+- The default store is in-process memory (LRU evicts the least recently used thread over 1000 threads). Snapshots are lost on restart and are not shared between replicas; use a custom `AguiSnapshotStore` bean for shared or persistent storage.
+- A completing run replaces the previous snapshot for its thread (latest-only covering write).
+- Interrupts that never settled remain in `RUN_FINISHED` replays; settle or resume the thread to clear them.
 
 ## Frontend Tools And Merge Mode
 

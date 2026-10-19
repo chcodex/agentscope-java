@@ -229,6 +229,7 @@ agentscope:
     enable-reasoning: false
     emit-run-finished-after-error: false
     server-side-memory: false
+    snapshot-store-enabled: false
     interrupt-on-disconnect: true
 ```
 
@@ -256,6 +257,63 @@ AguiRuntimeContextResolver runtimeContextResolver() {
 ```
 
 `forwardedProps` 来自客户端请求体，适合传递 UI 选项或前端上下文。不要把它当作可信身份来源；服务端用户身份应由认证链路或服务端 resolver 注入。
+
+## 展示态快照存储（Presentation Snapshot Store）
+
+AG-UI 协议本身是纯流式的：页面刷新或有新客户端加入某个 thread 时，只有后端才能把它们看不到的会话视图补回来。展示态快照存储（opt-in）会把每个 thread 的 AG-UI 展示态落盘成快照，并以一次合成 run 的形式重放给新客户端。
+
+开启方式：
+
+```yaml
+agentscope:
+  agui:
+    snapshot-store-enabled: true
+```
+
+不做额外配置时，starter 默认注册一个进程内、latest-only 的存储。需要替换时（例如换成 Redis 实现）注册自己的 `AguiSnapshotStore` bean 即可。
+
+```java
+@Bean
+AguiSnapshotStore aguiSnapshotStore() {
+    return new InMemoryAguiSnapshotStore(2000); // 最多保留的 thread 数
+}
+```
+
+### 存与不存的内容
+
+快照只保存展示态，与 `server-side-memory` 的职责不同——后者在 `AgentStateStore` 中保存 Agent 执行态：
+
+| | `server-side-memory`（Agent 状态存储） | `snapshot-store-enabled`（AG-UI 快照存储） |
+| --- | --- | --- |
+| 内容 | Agent 运行态与对话记忆 | AG-UI 消息、UI state、渲染 activity、未决 interrupt 元数据 |
+| 服务对象 | Agent 连续性：每个 thread 保留 Agent 实例与历史 | 客户端连续性：前端可以恢复会话视图 |
+| 消费方 | Agent runtime | AG-UI 前端 |
+| 默认值 | `false` | `false` |
+
+两者互相独立：可以只开服务端记忆不开快照，也可以只开快照不开服务端记忆（此时每次请求会重建 Agent，由客户端带来的完整 transcript 驱动）。
+
+### Hydrate
+
+一次 run 请求在同时满足以下四个条件时触发 hydrate：
+
+- 请求不带 `messages`；
+- 请求不带 `resume`；
+- 快照存储已启用；
+- 该请求的 `threadId` 在存储中有快照。
+
+当 hydrate 候选请求的 `threadId` 缺失或为空串时，直接以 `RUN_ERROR` 生命周期拒绝，而不是回退到某个合成 key。Hydrate 是一次只读的合成 run——不会调用 Agent 或 LLM——帧序为：
+
+```
+RUN_STARTED → [STATE_SNAPSHOT] → [MESSAGES_SNAPSHOT] → [ACTIVITY_SNAPSHOT]* → RUN_FINISHED(interrupts?)
+```
+
+段落为空时跳过对应帧。如果 thread 上仍有未决 interrupt，`RUN_FINISHED` 会带上这些 interrupt outcome，前端据此重新渲染审批 UI。这只是展示层信息：HITL resume 的权威状态仍由 resume coordinator 与 Agent runtime 维护。
+
+### 限制
+
+- 默认存储是进程内内存（LRU，最多保留 1000 个 thread，超出时淘汰最久未使用的）。重启即丢失，多实例之间不共享；共享或持久化需求请注册自定义 `AguiSnapshotStore` bean。
+- 一次 run 正常完成后会覆盖该 thread 之前的快照（latest-only 覆盖写）。
+- 从未落定的 interrupt 会一直留在 `RUN_FINISHED` 重放中；让线程完成 resume 或置为已决后即会清除。
 
 ## Frontend Tools 与合并模式
 
