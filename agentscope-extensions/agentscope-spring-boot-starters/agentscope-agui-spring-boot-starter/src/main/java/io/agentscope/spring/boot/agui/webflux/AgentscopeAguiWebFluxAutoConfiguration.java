@@ -23,6 +23,8 @@ import io.agentscope.core.agui.adapter.strategy.AguiEventEnricher;
 import io.agentscope.core.agui.registry.AguiAgentRegistry;
 import io.agentscope.core.agui.runtime.AguiRequestBodyParser;
 import io.agentscope.core.agui.runtime.AguiRuntimeContextResolver;
+import io.agentscope.core.agui.store.AguiSnapshotStore;
+import io.agentscope.core.agui.store.InMemoryAguiSnapshotStore;
 import io.agentscope.spring.boot.agui.common.AguiProperties;
 import io.agentscope.spring.boot.agui.common.ThreadSessionManager;
 import org.springframework.beans.factory.ObjectProvider;
@@ -30,6 +32,7 @@ import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplication;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
@@ -87,6 +90,25 @@ public class AgentscopeAguiWebFluxAutoConfiguration {
     }
 
     /**
+     * Creates the AG-UI presentation snapshot store bean.
+     *
+     * <p>Only created when {@code agentscope.agui.snapshot-store-enabled} is {@code true}
+     * (default {@code false}). Applications can register their own {@link AguiSnapshotStore}
+     * bean, which takes precedence and disables this default.
+     *
+     * @return An in-memory, latest-only {@link AguiSnapshotStore}
+     */
+    @Bean
+    @ConditionalOnMissingBean(AguiSnapshotStore.class)
+    @ConditionalOnProperty(
+            prefix = "agentscope.agui",
+            name = "snapshot-store-enabled",
+            havingValue = "true")
+    public AguiSnapshotStore aguiSnapshotStore() {
+        return new InMemoryAguiSnapshotStore();
+    }
+
+    /**
      * Creates the AG-UI WebFlux handler bean.
      *
      * @param registry The agent registry
@@ -104,6 +126,7 @@ public class AgentscopeAguiWebFluxAutoConfiguration {
             ObjectProvider<AguiEventEnricher> eventEnrichersProvider,
             ObjectProvider<AguiRuntimeContextResolver> runtimeContextResolverProvider,
             ObjectProvider<AguiAgentAdapterFactory> adapterFactoryProvider,
+            ObjectProvider<AguiSnapshotStore> snapshotStoreProvider,
             AguiRequestBodyParser requestBodyParser) {
         AguiAdapterConfig config =
                 AguiAdapterConfig.builder()
@@ -127,6 +150,7 @@ public class AgentscopeAguiWebFluxAutoConfiguration {
                 .interruptOnDisconnect(props.isInterruptOnDisconnect())
                 .runtimeContextResolver(runtimeContextResolverProvider.getIfAvailable())
                 .adapterFactory(adapterFactoryProvider.getIfAvailable())
+                .snapshotStore(snapshotStoreProvider.getIfAvailable())
                 .requestBodyParser(requestBodyParser)
                 .config(config)
                 .build();

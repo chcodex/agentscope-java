@@ -41,6 +41,7 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  *     emit-token-usage: false
  *     emit-run-finished-after-error: false
  *     interrupt-on-disconnect: true
+ *     snapshot-store-enabled: false
  * </pre>
  */
 @ConfigurationProperties(prefix = "agentscope.agui")
@@ -128,6 +129,13 @@ public class AguiProperties {
 
     /** Whether to interrupt the agent when the client disconnects. */
     private boolean interruptOnDisconnect = true;
+
+    /**
+     * Whether to enable the AG-UI presentation snapshot store (opt-in). When enabled, AG-UI
+     * events are materialized into a latest-only {@code AguiThreadSnapshot} per thread and empty
+     * transcript requests hydrate from it. Decoupled from {@code serverSideMemory}.
+     */
+    private boolean snapshotStoreEnabled = false;
 
     public String getPathPrefix() {
         return pathPrefix;
@@ -271,5 +279,13 @@ public class AguiProperties {
 
     public void setInterruptOnDisconnect(boolean interruptOnDisconnect) {
         this.interruptOnDisconnect = interruptOnDisconnect;
+    }
+
+    public boolean isSnapshotStoreEnabled() {
+        return snapshotStoreEnabled;
+    }
+
+    public void setSnapshotStoreEnabled(boolean snapshotStoreEnabled) {
+        this.snapshotStoreEnabled = snapshotStoreEnabled;
     }
 }

@@ -25,6 +25,7 @@ import io.agentscope.core.agui.processor.AguiRequestProcessor;
 import io.agentscope.core.agui.registry.AguiAgentRegistry;
 import io.agentscope.core.agui.runtime.AguiRuntimeContextRequest;
 import io.agentscope.core.agui.runtime.AguiRuntimeContextResolver;
+import io.agentscope.core.agui.store.AguiSnapshotStore;
 import io.agentscope.spring.boot.agui.common.DefaultAgentResolver;
 import io.agentscope.spring.boot.agui.common.ThreadSessionManager;
 import jakarta.servlet.http.HttpServletRequest;
@@ -94,6 +95,7 @@ public class AguiMvcController {
                                         : AguiAdapterConfig.defaultConfig())
                         .adapterFactory(builder.adapterFactory)
                         .runtimeContextResolver(builder.runtimeContextResolver)
+                        .snapshotStore(builder.snapshotStore)
                         .build();
         this.encoder = new AguiEventEncoder();
         this.agentIdHeader =
@@ -360,6 +362,7 @@ public class AguiMvcController {
         private boolean interruptOnDisconnect = true;
         private AguiRuntimeContextResolver runtimeContextResolver;
         private AguiAgentAdapterFactory adapterFactory;
+        private AguiSnapshotStore snapshotStore;
 
         /**
          * Set the agent registry.
@@ -457,6 +460,17 @@ public class AguiMvcController {
          */
         public Builder adapterFactory(AguiAgentAdapterFactory adapterFactory) {
             this.adapterFactory = adapterFactory;
+            return this;
+        }
+
+        /**
+         * Set the AG-UI snapshot store for presentation state hydrate.
+         *
+         * @param snapshotStore The snapshot store, may be null to disable snapshot support
+         * @return This builder
+         */
+        public Builder snapshotStore(AguiSnapshotStore snapshotStore) {
+            this.snapshotStore = snapshotStore;
             return this;
         }
 
