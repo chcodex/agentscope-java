@@ -173,6 +173,17 @@ final class AguiResumeCoordinator {
     }
 
     /**
+     * Interrupt outcomes still open on a thread.
+     *
+     * @param threadId The AG-UI thread ID
+     * @return the unresolved interrupts in stable order, empty when none are open
+     */
+    List<AguiEvent.Interrupt> unresolvedInterrupts(String threadId) {
+        Map<String, AguiEvent.Interrupt> pending = pendingInterruptsByThread.get(threadId);
+        return pending == null || pending.isEmpty() ? List.of() : List.copyOf(pending.values());
+    }
+
+    /**
      * Track interrupt outcomes emitted by the adapter for subsequent resume requests.
      *
      * @param threadId The AG-UI thread ID

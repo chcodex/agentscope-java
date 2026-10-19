@@ -27,6 +27,7 @@ import io.agentscope.core.agui.model.AguiMessage;
 import io.agentscope.core.agui.model.RunAgentInput;
 import io.agentscope.core.agui.runtime.AguiRuntimeContextRequest;
 import io.agentscope.core.agui.runtime.AguiRuntimeContextResolver;
+import io.agentscope.core.agui.store.AguiSnapshotStore;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -34,6 +35,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import reactor.core.publisher.Flux;
+import reactor.core.publisher.SignalType;
 
 /**
  * Core processor for AG-UI requests.
@@ -47,6 +49,8 @@ import reactor.core.publisher.Flux;
  *   <li>Message extraction for server-side memory scenarios</li>
  *   <li>Agent resolution via {@link AgentResolver}</li>
  *   <li>Event stream generation via {@link AguiAgentAdapter}</li>
+ *   <li>Snapshot recording and hydration via {@link AguiSnapshotCoordinator}, when a snapshot
+ *       store is present</li>
  * </ul>
  *
  * <p><b>Usage:</b>
@@ -72,6 +76,7 @@ public class AguiRequestProcessor {
     private final AguiAgentAdapterFactory adapterFactory;
     private final AguiResumeCoordinator resumeCoordinator;
     private final AguiRuntimeContextResolver runtimeContextResolver;
+    private final AguiSnapshotCoordinator snapshotCoordinator;
 
     private AguiRequestProcessor(Builder builder) {
         this.agentResolver =
@@ -83,6 +88,10 @@ public class AguiRequestProcessor {
                         : AguiAgentAdapterFactory.defaultFactory();
         this.resumeCoordinator = new AguiResumeCoordinator();
         this.runtimeContextResolver = builder.runtimeContextResolver;
+        this.snapshotCoordinator =
+                builder.snapshotStore != null
+                        ? new AguiSnapshotCoordinator(builder.snapshotStore, builder.maxSnapshots)
+                        : null;
     }
 
     /**
@@ -108,6 +117,10 @@ public class AguiRequestProcessor {
          * @param threadId The AG-UI thread id for this request
          */
         public void interrupt(String threadId) {
+            if (agent == null) {
+                // Hydrate runs are read-only synthetic replay; there is no agent to interrupt.
+                return;
+            }
             ReActAgent reActAgent = AguiUtil.asReActAgent(agent);
             if (reActAgent != null) {
                 RuntimeContext interruptContext =
@@ -138,6 +151,19 @@ public class AguiRequestProcessor {
         String threadId = input.getThreadId();
         String runId = input.getRunId();
 
+        // Hydrate targets are classified before any Agent wiring: a hydrate run is read-only
+        // synthetic replay from the snapshot store and must never resolve or invoke an Agent.
+        if (snapshotCoordinator != null) {
+            List<AguiEvent> hydrateEvents =
+                    snapshotCoordinator.tryHydrate(
+                            input,
+                            config.isEmitRunFinishedAfterError(),
+                            resumeCoordinator.unresolvedInterrupts(threadId));
+            if (hydrateEvents != null) {
+                return new ProcessResult(null, Flux.fromIterable(hydrateEvents), null);
+            }
+        }
+
         RuntimeContext resolved =
                 runtimeContextResolver != null ? runtimeContextResolver.resolve(request) : null;
         RuntimeContext runtimeContext =
@@ -161,6 +187,13 @@ public class AguiRequestProcessor {
                                                 beginResult.message(),
                                                 config.isEmitRunFinishedAfterError()));
                             }
+
+                            final AguiSnapshotCoordinator snapshotCoordinator =
+                                    this.snapshotCoordinator;
+                            AguiSnapshotAccumulator accumulator =
+                                    snapshotCoordinator != null
+                                            ? snapshotCoordinator.begin(input)
+                                            : null;
 
                             try {
                                 // Determine effective input based on server-side memory
@@ -195,6 +228,9 @@ public class AguiRequestProcessor {
                                                             runId,
                                                             event,
                                                             runErrorSeen.get());
+                                                    if (accumulator != null) {
+                                                        accumulator.observe(event);
+                                                    }
                                                 })
                                         // Finish the run before the terminal signal reaches
                                         // the caller. doFinally runs after onComplete/onError
@@ -207,16 +243,37 @@ public class AguiRequestProcessor {
                                         // guarantee; finishRun is idempotent, and doFinally
                                         // still covers the cancellation path.
                                         .doOnComplete(
-                                                () -> resumeCoordinator.finishRun(threadId, runId))
+                                                () -> {
+                                                    if (snapshotCoordinator != null) {
+                                                        snapshotCoordinator.finishRun(
+                                                                threadId, accumulator, true);
+                                                    }
+                                                    resumeCoordinator.finishRun(threadId, runId);
+                                                })
                                         .doOnError(
-                                                error ->
-                                                        resumeCoordinator.finishRun(
-                                                                threadId, runId))
+                                                error -> {
+                                                    if (snapshotCoordinator != null) {
+                                                        snapshotCoordinator.finishRun(
+                                                                threadId, accumulator, false);
+                                                    }
+                                                    resumeCoordinator.finishRun(threadId, runId);
+                                                })
                                         .doFinally(
-                                                signalType ->
-                                                        resumeCoordinator.finishRun(
-                                                                threadId, runId));
+                                                signalType -> {
+                                                    // doFinally still covers cancellation (and
+                                                    // re-covers error) paths; ON_COMPLETE work
+                                                    // already happened in doOnComplete.
+                                                    if (signalType != SignalType.ON_COMPLETE
+                                                            && snapshotCoordinator != null) {
+                                                        snapshotCoordinator.finishRun(
+                                                                threadId, accumulator, false);
+                                                    }
+                                                    resumeCoordinator.finishRun(threadId, runId);
+                                                });
                             } catch (Throwable error) {
+                                if (snapshotCoordinator != null) {
+                                    snapshotCoordinator.finishRun(threadId, accumulator, false);
+                                }
                                 resumeCoordinator.finishRun(threadId, runId);
                                 return processorErrorEvents(input, error);
                             }
@@ -375,10 +432,14 @@ public class AguiRequestProcessor {
     /** Builder for AguiRequestProcessor. */
     public static class Builder {
 
+        private static final int DEFAULT_MAX_SNAPSHOTS = 1000;
+
         private AgentResolver agentResolver;
         private AguiAdapterConfig config;
         private AguiAgentAdapterFactory adapterFactory;
         private AguiRuntimeContextResolver runtimeContextResolver;
+        private AguiSnapshotStore snapshotStore;
+        private int maxSnapshots = DEFAULT_MAX_SNAPSHOTS;
 
         /**
          * Set the agent resolver.
@@ -422,6 +483,30 @@ public class AguiRequestProcessor {
          */
         public Builder runtimeContextResolver(AguiRuntimeContextResolver runtimeContextResolver) {
             this.runtimeContextResolver = runtimeContextResolver;
+            return this;
+        }
+
+        /**
+         * Set the snapshot store used to record AG-UI presentation snapshots and to serve hydrate
+         * requests. Optional; when null, no snapshot recording or hydration happens and behavior
+         * is unchanged.
+         *
+         * @param snapshotStore The AG-UI snapshot store, may be null
+         * @return This builder
+         */
+        public Builder snapshotStore(AguiSnapshotStore snapshotStore) {
+            this.snapshotStore = snapshotStore;
+            return this;
+        }
+
+        /**
+         * Set the bounded size of the per-run snapshot accumulator registry as a leak guard.
+         *
+         * @param maxSnapshots maximum live accumulators kept in memory
+         * @return This builder
+         */
+        public Builder maxSnapshots(int maxSnapshots) {
+            this.maxSnapshots = maxSnapshots;
             return this;
         }
 
