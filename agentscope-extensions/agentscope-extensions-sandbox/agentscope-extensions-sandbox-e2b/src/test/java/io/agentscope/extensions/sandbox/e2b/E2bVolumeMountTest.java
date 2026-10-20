@@ -171,7 +171,7 @@ class E2bVolumeMountTest {
         E2bSandboxClientOptions onVolume = new E2bSandboxClientOptions();
         onVolume.setWorkspaceRoot("/mnt/data/ws");
         onVolume.addVolumeMount("vol-a", "/mnt/data");
-        Sandbox s = client.create(workspaceSpec(), null, onVolume);
+        Sandbox s = client.create(workspaceSpec("/mnt/data/ws"), null, onVolume);
         E2bSandboxState st = (E2bSandboxState) s.getState();
         assertTrue(st.isWorkspaceOnVolume());
         assertEquals(List.of(new E2bVolumeMount("vol-a", "/mnt/data")), st.getVolumeMounts());
@@ -180,7 +180,8 @@ class E2bVolumeMountTest {
         offVolume.setWorkspaceRoot("/home/user");
         offVolume.addVolumeMount("vol-a", "/mnt/data");
         E2bSandboxState st2 =
-                (E2bSandboxState) client.create(workspaceSpec(), null, offVolume).getState();
+                (E2bSandboxState)
+                        client.create(workspaceSpec("/home/user"), null, offVolume).getState();
         assertFalse(st2.isWorkspaceOnVolume());
     }
 
@@ -290,7 +291,7 @@ class E2bVolumeMountTest {
     @Test
     void tarCommandQuotesExcludeArgs() throws Exception {
         E2bSandboxState state = new E2bSandboxState();
-        state.setWorkspaceSpec(workspaceSpec());
+        state.setWorkspaceSpec(workspaceSpec("/home/user"));
         state.setWorkspaceRoot("/home/user");
         state.setVolumeMounts(List.of(new E2bVolumeMount("vol-a", "/home/user/my data")));
         E2bSandbox sandbox = new E2bSandbox(state, options());
@@ -308,7 +309,7 @@ class E2bVolumeMountTest {
     @Test
     void workspaceOnVolumeBranchesAreNoOpsWithoutEnvd() throws Exception {
         E2bSandboxState state = new E2bSandboxState();
-        state.setWorkspaceSpec(workspaceSpec());
+        state.setWorkspaceSpec(workspaceSpec("/mnt/data/ws"));
         state.setWorkspaceRoot("/mnt/data/ws");
         state.setVolumeMounts(List.of(new E2bVolumeMount("vol-a", "/mnt/data")));
         state.setWorkspaceOnVolume(true);
@@ -369,8 +370,12 @@ class E2bVolumeMountTest {
     }
 
     private static WorkspaceSpec workspaceSpec() {
+        return workspaceSpec("/tmp/agentscope-test-workspace");
+    }
+
+    private static WorkspaceSpec workspaceSpec(String root) {
         WorkspaceSpec ws = new WorkspaceSpec();
-        ws.setRoot("/tmp/agentscope-test-workspace");
+        ws.setRoot(root);
         return ws;
     }
 }
