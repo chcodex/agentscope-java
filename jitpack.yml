@@ -4,6 +4,9 @@ jdk:
 before_install:
   - sdk install maven 3.9.9
   - sdk use maven 3.9.9
+  # service-dataplane has a test-scope dependency on agentscope-examples/jev, so
+  # install it before dropping the examples module from the reactor below.
+  - mvn -B -pl agentscope-examples/jev -am install -DskipTests -Dspotless.check.skip=true -Drevision=$VERSION
   - sed -i '/<module>agentscope-examples<\/module>/d' pom.xml
 install:
   - mvn clean install -DskipTests -Dspotless.check.skip=true -Drevision=$VERSION
