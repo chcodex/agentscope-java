@@ -26,6 +26,6 @@ class E2bFilesystemSpecTest {
     void defaultWorkspaceSpec_hasE2bRoot() {
         E2bFilesystemSpec spec = new E2bFilesystemSpec();
         WorkspaceSpec ws = spec.workspaceSpec();
-        assertEquals("/home/user/workspace", ws.getRoot());
+        assertEquals("/workspace", ws.getRoot());
     }
 }

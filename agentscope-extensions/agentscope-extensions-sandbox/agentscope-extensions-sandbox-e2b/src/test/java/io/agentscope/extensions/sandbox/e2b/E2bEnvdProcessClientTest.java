@@ -1090,7 +1090,8 @@ class E2bEnvdProcessClientTest {
         when(state.getSandboxDomain()).thenReturn("custom.com");
         when(state.getSandboxId()).thenReturn("test-id");
 
-        String result = (String) method.invoke(null, state);
+        String result =
+                (String) method.invoke(new E2bEnvdProcessClient(options(E2bCodec.JSON)), state);
         assertEquals("https://49983-test-id.custom.com", result);
     }
 
@@ -1104,7 +1105,8 @@ class E2bEnvdProcessClientTest {
         when(state.getSandboxDomain()).thenReturn(null);
         when(state.getSandboxId()).thenReturn("test-id");
 
-        String result = (String) method.invoke(null, state);
+        String result =
+                (String) method.invoke(new E2bEnvdProcessClient(options(E2bCodec.JSON)), state);
         assertEquals("https://49983-test-id.e2b.app", result);
     }
 

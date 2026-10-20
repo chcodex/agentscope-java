@@ -51,6 +51,7 @@ class E2bSandboxFileTransferTest {
         E2bSandboxState state = new E2bSandboxState();
         WorkspaceSpec workspaceSpec = new WorkspaceSpec();
         workspaceSpec.setRoot("/home/user/workspace");
+        state.setWorkspaceRoot("/home/user/workspace");
         state.setWorkspaceSpec(workspaceSpec);
         return new E2bSandbox(state, new E2bSandboxClientOptions());
     }

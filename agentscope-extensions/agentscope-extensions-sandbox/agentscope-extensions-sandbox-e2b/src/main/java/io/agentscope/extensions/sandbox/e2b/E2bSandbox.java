@@ -256,7 +256,7 @@ public class E2bSandbox extends AbstractBaseSandbox implements SandboxFileTransf
     }
 
     @Override
-    protected String getWorkspaceRoot() {
+    public String getWorkspaceRoot() {
         return e2bState.getWorkspaceRoot();
     }
 
