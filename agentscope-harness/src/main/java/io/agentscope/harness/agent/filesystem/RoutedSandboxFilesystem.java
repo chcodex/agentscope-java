@@ -50,7 +50,9 @@ public final class RoutedSandboxFilesystem implements AbstractSandboxFilesystem 
         this.composite = new CompositeFilesystem(primary, routes);
     }
 
-    /** Returns the primary sandbox filesystem (lifecycle middleware injects into this). */
+    /**
+     * Returns the primary sandbox filesystem (lifecycle middleware injects into this).
+     */
     public AbstractSandboxFilesystem primary() {
         return primary;
     }
@@ -140,5 +142,10 @@ public final class RoutedSandboxFilesystem implements AbstractSandboxFilesystem 
     @Override
     public boolean exists(RuntimeContext runtimeContext, String path) {
         return composite.exists(runtimeContext, path);
+    }
+
+    @Override
+    public String getWorkspaceRoot() {
+        return primary.getWorkspaceRoot();
     }
 }
