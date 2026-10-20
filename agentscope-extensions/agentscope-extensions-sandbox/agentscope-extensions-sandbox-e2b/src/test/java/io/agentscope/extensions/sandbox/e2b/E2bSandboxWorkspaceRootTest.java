@@ -18,6 +18,7 @@ package io.agentscope.extensions.sandbox.e2b;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 import io.agentscope.harness.agent.sandbox.Sandbox;
+import io.agentscope.harness.agent.sandbox.SandboxContext;
 import io.agentscope.harness.agent.sandbox.WorkspaceSpec;
 import org.junit.jupiter.api.Test;
 
@@ -47,5 +48,24 @@ class E2bSandboxWorkspaceRootTest {
 
         assertEquals("/root/workspace", ((E2bSandbox) sandbox).getWorkspaceRoot());
         assertEquals("/root/workspace", state.getWorkspaceRoot());
+    }
+
+    @Test
+    void filesystemSpecPropagatesWorkspaceSpecRoot() {
+        WorkspaceSpec spec = new WorkspaceSpec();
+        spec.setRoot("/root/workspace");
+        E2bFilesystemSpec filesystemSpec = new E2bFilesystemSpec().workspaceSpec(spec);
+        SandboxContext context = filesystemSpec.toSandboxContext();
+
+        assertEquals("/root/workspace", context.getWorkspaceSpec().getRoot());
+
+        Sandbox sandbox =
+                new E2bSandboxClient()
+                        .create(
+                                context.getWorkspaceSpec(),
+                                null,
+                                (E2bSandboxClientOptions) context.getClientOptions());
+
+        assertEquals("/root/workspace", ((E2bSandbox) sandbox).getWorkspaceRoot());
     }
 }
