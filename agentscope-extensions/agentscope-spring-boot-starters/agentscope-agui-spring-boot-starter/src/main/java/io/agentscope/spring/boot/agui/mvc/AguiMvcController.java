@@ -29,7 +29,6 @@ import io.agentscope.core.agui.store.AguiSnapshotStore;
 import io.agentscope.spring.boot.agui.common.DefaultAgentResolver;
 import io.agentscope.spring.boot.agui.common.ThreadSessionManager;
 import jakarta.servlet.http.HttpServletRequest;
-import java.io.IOException;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -307,28 +306,28 @@ public class AguiMvcController {
         try {
             String jsonData = encoder.encodeToJson(event);
             emitter.send(SseEmitter.event().data(jsonData, MediaType.APPLICATION_JSON));
-        } catch (IOException e) {
-            logger.debug("Failed to send SSE event: {}", e.getMessage());
+        } catch (Exception e) {
+            // The emitter may already be completed (client disconnected). Sending must never
+            // throw into the subscriber: that would cancel the upstream run and stop the agent
+            // even when interrupt-on-disconnect is disabled.
+            logger.debug("Failed to send SSE event (emitter likely completed): {}", e.getMessage());
         }
     }
 
     private void sendErrorAndComplete(
             SseEmitter emitter, String threadId, String runId, String errorMessage) {
         try {
+            String safeMessage = errorMessage != null ? errorMessage : "run error";
             String errorJson =
                     encoder.encodeToJson(
-                            new AguiEvent.Raw(threadId, runId, Map.of("error", errorMessage)));
+                            new AguiEvent.Raw(threadId, runId, Map.of("error", safeMessage)));
             String finishJson = encoder.encodeToJson(new AguiEvent.RunFinished(threadId, runId));
             emitter.send(SseEmitter.event().data(errorJson, MediaType.APPLICATION_JSON));
             emitter.send(SseEmitter.event().data(finishJson, MediaType.APPLICATION_JSON));
             emitter.complete();
-        } catch (IOException e) {
+        } catch (Exception e) {
+            // The emitter may already be completed; completing it again is a no-op here.
             logger.debug("Failed to send error event: {}", e.getMessage());
-            try {
-                emitter.completeWithError(e);
-            } catch (Exception ex) {
-                logger.debug("Failed to complete emitter with error: {}", ex.getMessage());
-            }
         }
     }
 

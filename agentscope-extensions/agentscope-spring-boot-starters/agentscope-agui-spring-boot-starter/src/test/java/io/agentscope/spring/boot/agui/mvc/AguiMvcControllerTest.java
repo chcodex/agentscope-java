@@ -16,9 +16,11 @@
 package io.agentscope.spring.boot.agui.mvc;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 
 import io.agentscope.core.ReActAgent;
@@ -44,6 +46,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.test.util.ReflectionTestUtils;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 import reactor.core.publisher.Flux;
+import reactor.core.publisher.Sinks;
 
 class AguiMvcControllerTest {
 
@@ -139,6 +142,47 @@ class AguiMvcControllerTest {
 
             assertEquals(2, fixture.runCount.get());
             verify(fixture.agent).interrupt(any(RuntimeContext.class));
+        } finally {
+            fixture.executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void completedEmitterDoesNotCancelTheRun() throws Exception {
+        Sinks.Many<AguiEvent> events = Sinks.many().unicast().onBackpressureBuffer();
+        ControllerFixture fixture = fixture(false, events.asFlux());
+        try {
+            SseEmitter emitter = fixture.controller.handle(input("run-1"), null);
+            assertTrue(fixture.firstRunSubscribed.await(5, TimeUnit.SECONDS));
+
+            // Simulate a client disconnect before the next event arrives: the container marks
+            // the emitter completed while the agent keeps running.
+            emitter.complete();
+
+            events.tryEmitNext(new AguiEvent.RunStarted("thread-1", "run-1", null, null));
+            events.tryEmitNext(new AguiEvent.RunFinished("thread-1", "run-1"));
+
+            // The subscriber must keep consuming despite send failures: the run is not
+            // terminated, the thread stays busy and the agent is never interrupted.
+            assertFalse(fixture.firstRunTerminated.await(200, TimeUnit.MILLISECONDS));
+            assertEquals(1, fixture.runCount.get());
+            verify(fixture.agent, never()).interrupt(any(RuntimeContext.class));
+
+            events.tryEmitComplete();
+            assertTrue(fixture.firstRunTerminated.await(5, TimeUnit.SECONDS));
+        } finally {
+            fixture.executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void streamErrorWithNullMessageCompletesEmitter() throws Exception {
+        ControllerFixture fixture = fixture(true, Flux.error(new RuntimeException()));
+        try {
+            SseEmitter emitter = fixture.controller.handle(input("run-1"), null);
+
+            assertTrue(fixture.firstRunTerminated.await(5, TimeUnit.SECONDS));
+            assertTrue((Boolean) ReflectionTestUtils.getField(emitter, "complete"));
         } finally {
             fixture.executor.shutdownNow();
         }
