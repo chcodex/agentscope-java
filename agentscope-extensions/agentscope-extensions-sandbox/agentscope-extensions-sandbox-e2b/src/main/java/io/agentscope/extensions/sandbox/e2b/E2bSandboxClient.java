@@ -23,6 +23,7 @@ import io.agentscope.harness.agent.sandbox.SandboxState;
 import io.agentscope.harness.agent.sandbox.WorkspaceSpec;
 import io.agentscope.harness.agent.sandbox.json.HarnessSandboxJacksonModule;
 import io.agentscope.harness.agent.sandbox.snapshot.SandboxSnapshotSpec;
+import java.util.List;
 import java.util.UUID;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -58,13 +59,14 @@ public class E2bSandboxClient implements SandboxClient<E2bSandboxClientOptions> 
             E2bSandboxClientOptions options) {
         String sessionId = UUID.randomUUID().toString();
         E2bSandboxClientOptions merged = merge(options);
-        requireAbsoluteWorkspaceRoot(merged.getWorkspaceRoot());
+        String workspaceRoot = resolveWorkspaceRoot(workspaceSpec, merged.getWorkspaceRoot());
+        requireAbsoluteWorkspaceRoot(workspaceRoot);
 
         E2bSandboxState state = new E2bSandboxState();
         state.setSessionId(sessionId);
         state.setWorkspaceSpec(workspaceSpec);
         state.setTemplateId(merged.getTemplateId());
-        state.setWorkspaceRoot(merged.getWorkspaceRoot());
+        state.setWorkspaceRoot(workspaceRoot);
         state.setSandboxOwned(true);
         state.setWorkspaceRootReady(false);
         state.setPersistenceMode(merged.getPersistenceMode());
@@ -72,7 +74,7 @@ public class E2bSandboxClient implements SandboxClient<E2bSandboxClientOptions> 
         state.setSandboxDomain(merged.getDomain());
         state.setEnvdSandboxUrl(merged.getEnvdSandboxUrl());
         state.setVolumeMounts(merged.getVolumeMounts());
-        state.setWorkspaceOnVolume(isWorkspaceOnVolume(merged));
+        state.setWorkspaceOnVolume(isWorkspaceOnVolume(workspaceRoot, merged.getVolumeMounts()));
 
         if (snapshotSpec != null) {
             state.setSnapshot(snapshotSpec.build(sessionId));
@@ -88,7 +90,9 @@ public class E2bSandboxClient implements SandboxClient<E2bSandboxClientOptions> 
             throw new IllegalArgumentException(
                     "Expected E2bSandboxState but got: " + state.getClass().getName());
         }
-        requireAbsoluteWorkspaceRoot(e2b.getWorkspaceRoot());
+        String workspaceRoot = resolveWorkspaceRoot(e2b.getWorkspaceSpec(), e2b.getWorkspaceRoot());
+        requireAbsoluteWorkspaceRoot(workspaceRoot);
+        e2b.setWorkspaceRoot(workspaceRoot);
         E2bSandboxClientOptions resumed = copy(defaultOptions);
         resumed.setCodec(e2b.getCodec());
         resumed.setEnvdSandboxUrl(e2b.getEnvdSandboxUrl());
@@ -197,12 +201,25 @@ public class E2bSandboxClient implements SandboxClient<E2bSandboxClientOptions> 
      * @param opt merged client options
      * @return true when a mount covers the workspace root
      */
-    private static boolean isWorkspaceOnVolume(E2bSandboxClientOptions opt) {
-        String root = opt.getWorkspaceRoot();
-        if (root == null || root.isBlank() || opt.getVolumeMounts() == null) {
+    private static String resolveWorkspaceRoot(WorkspaceSpec spec, String fallback) {
+        if (spec != null && spec.getRoot() != null && !spec.getRoot().isBlank()) {
+            return spec.getRoot();
+        }
+        return fallback;
+    }
+
+    /**
+     * Returns whether a mount covers the effective workspace root.
+     *
+     * @param root effective workspace root
+     * @param mounts configured volume mounts
+     * @return true when a mount covers the workspace root
+     */
+    private static boolean isWorkspaceOnVolume(String root, List<E2bVolumeMount> mounts) {
+        if (root == null || root.isBlank() || mounts == null) {
             return false;
         }
-        for (E2bVolumeMount m : opt.getVolumeMounts()) {
+        for (E2bVolumeMount m : mounts) {
             if (m != null && E2bVolumeMount.coversWorkspaceRoot(root, m.getPath())) {
                 return true;
             }
