@@ -77,30 +77,6 @@ public class E2bSandbox extends AbstractBaseSandbox implements SandboxFileTransf
         this.e2bState = state;
         this.opt = opt != null ? opt : new E2bSandboxClientOptions();
         this.platform = new E2bPlatformHttp(this.opt);
-        adoptWorkspaceSpecRoot();
-    }
-
-    /**
-     * Keeps the persisted state root aligned with the caller's {@link WorkspaceSpec}.
-     *
-     * <p>A resumed state can carry an older default root while the configured spec already points
-     * at a different in-sandbox directory; the spec is the authority for this instance.
-     */
-    private void adoptWorkspaceSpecRoot() {
-        WorkspaceSpec spec = e2bState.getWorkspaceSpec();
-        if (spec == null || spec.getRoot() == null || spec.getRoot().isBlank()) {
-            return;
-        }
-        String root = spec.getRoot();
-        e2bState.setWorkspaceRoot(root);
-        boolean onVolume = false;
-        for (E2bVolumeMount mount : e2bState.getVolumeMounts()) {
-            if (mount != null && E2bVolumeMount.coversWorkspaceRoot(root, mount.getPath())) {
-                onVolume = true;
-                break;
-            }
-        }
-        e2bState.setWorkspaceOnVolume(onVolume);
     }
 
     @Override
