@@ -26,7 +26,6 @@ import io.agentscope.core.agui.registry.AguiAgentRegistry;
 import io.agentscope.core.agui.runtime.AguiRequestBodyParser;
 import io.agentscope.core.agui.runtime.AguiRuntimeContextRequest;
 import io.agentscope.core.agui.runtime.AguiRuntimeContextResolver;
-import io.agentscope.core.agui.store.AguiSnapshotStore;
 import io.agentscope.spring.boot.agui.common.DefaultAgentResolver;
 import io.agentscope.spring.boot.agui.common.ThreadSessionManager;
 import java.util.LinkedHashMap;
@@ -98,7 +97,6 @@ public class AguiWebFluxHandler {
                                         : AguiAdapterConfig.defaultConfig())
                         .adapterFactory(builder.adapterFactory)
                         .runtimeContextResolver(builder.runtimeContextResolver)
-                        .snapshotStore(builder.snapshotStore)
                         .build();
         this.encoder = new AguiEventEncoder();
         this.requestBodyParser =
@@ -294,7 +292,6 @@ public class AguiWebFluxHandler {
         private AguiRuntimeContextResolver runtimeContextResolver;
         private AguiAgentAdapterFactory adapterFactory;
         private AguiRequestBodyParser requestBodyParser;
-        private AguiSnapshotStore snapshotStore;
 
         /**
          * Set the agent registry.
@@ -392,17 +389,6 @@ public class AguiWebFluxHandler {
          */
         public Builder requestBodyParser(AguiRequestBodyParser requestBodyParser) {
             this.requestBodyParser = requestBodyParser;
-            return this;
-        }
-
-        /**
-         * Set the AG-UI snapshot store for presentation state hydrate.
-         *
-         * @param snapshotStore The snapshot store, may be null to disable snapshot support
-         * @return This builder
-         */
-        public Builder snapshotStore(AguiSnapshotStore snapshotStore) {
-            this.snapshotStore = snapshotStore;
             return this;
         }
 
