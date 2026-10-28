@@ -58,6 +58,7 @@ public final class SessionRecorder {
     public static final String CONTEXT_KEY = "agentscope.session.recorder";
     public static final String PARENT_KEY = "agentscope.session.parent";
     private final AtomicBoolean exporting = new AtomicBoolean();
+    private final AtomicBoolean exportRequested = new AtomicBoolean();
     public static final String TURN_ID_KEY = "agentscope.session.turnId";
     private static final Duration LEASE = Duration.ofMinutes(2);
     private final SessionLog log;
@@ -270,18 +271,26 @@ public final class SessionRecorder {
 
     private void exportCommitted() {
         if (exporter == null) return;
+        exportRequested.set(true);
         if (!exporting.compareAndSet(false, true)) return;
         Schedulers.boundedElastic()
                 .schedule(
                         () -> {
                             try {
-                                exporter.drain();
+                                // A request arriving while a drain is running must not be lost.
+                                while (exportRequested.compareAndSet(true, false)) {
+                                    exporter.drain();
+                                }
                             } catch (RuntimeException error) {
+                                // Leave the committed prefix for the retry path instead of
+                                // spinning.
+                                exportRequested.set(false);
                                 LOGGER.warn(
                                         "Committed session export pending retry: {}",
                                         error.toString());
                             } finally {
                                 exporting.set(false);
+                                if (exportRequested.get()) exportCommitted();
                             }
                         });
     }
@@ -507,6 +516,7 @@ public final class SessionRecorder {
         if (closed) return;
         closed = true;
         heartbeat.dispose();
+        exportCommitted();
         try {
             log.release(writer);
         } catch (RuntimeException e) {
