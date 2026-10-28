@@ -273,26 +273,35 @@ public final class SessionRecorder {
         if (exporter == null) return;
         exportRequested.set(true);
         if (!exporting.compareAndSet(false, true)) return;
-        Schedulers.boundedElastic()
-                .schedule(
-                        () -> {
-                            try {
-                                // A request arriving while a drain is running must not be lost.
-                                while (exportRequested.compareAndSet(true, false)) {
-                                    exporter.drain();
+        try {
+            Schedulers.boundedElastic()
+                    .schedule(
+                            () -> {
+                                try {
+                                    // A request arriving while a drain is running must not be
+                                    // lost.
+                                    while (exportRequested.compareAndSet(true, false)) {
+                                        exporter.drain();
+                                    }
+                                } catch (RuntimeException error) {
+                                    // Clear the request so the retry path does not spin. A failure
+                                    // after close() has no in-process trigger left and waits for
+                                    // an external retry.
+                                    exportRequested.set(false);
+                                    LOGGER.warn(
+                                            "Committed session export pending retry: {}",
+                                            error.toString());
+                                } finally {
+                                    exporting.set(false);
+                                    if (exportRequested.get()) exportCommitted();
                                 }
-                            } catch (RuntimeException error) {
-                                // Leave the committed prefix for the retry path instead of
-                                // spinning.
-                                exportRequested.set(false);
-                                LOGGER.warn(
-                                        "Committed session export pending retry: {}",
-                                        error.toString());
-                            } finally {
-                                exporting.set(false);
-                                if (exportRequested.get()) exportCommitted();
-                            }
-                        });
+                            });
+        } catch (RuntimeException error) {
+            // A shutting-down scheduler must neither fail the caller nor leave the
+            // export latch set; the committed prefix stays for the retry path.
+            exporting.set(false);
+            LOGGER.warn("Committed session export not scheduled: {}", error.toString());
+        }
     }
 
     /** Explicit acknowledged boundary for existing synchronous domain mutation code. */
