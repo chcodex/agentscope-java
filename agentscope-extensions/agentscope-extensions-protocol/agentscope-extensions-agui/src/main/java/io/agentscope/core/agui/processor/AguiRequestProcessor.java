@@ -23,11 +23,12 @@ import io.agentscope.core.agui.adapter.AguiAdapterConfig;
 import io.agentscope.core.agui.adapter.AguiAgentAdapter;
 import io.agentscope.core.agui.adapter.AguiAgentAdapterFactory;
 import io.agentscope.core.agui.event.AguiEvent;
+import io.agentscope.core.agui.event.AguiFramedEvent;
 import io.agentscope.core.agui.model.AguiMessage;
 import io.agentscope.core.agui.model.RunAgentInput;
 import io.agentscope.core.agui.runtime.AguiRuntimeContextRequest;
 import io.agentscope.core.agui.runtime.AguiRuntimeContextResolver;
-import io.agentscope.core.agui.store.AguiSnapshotStore;
+import io.agentscope.core.session.SessionLog;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -35,7 +36,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import reactor.core.publisher.Flux;
-import reactor.core.publisher.SignalType;
 
 /**
  * Core processor for AG-UI requests.
@@ -49,8 +49,6 @@ import reactor.core.publisher.SignalType;
  *   <li>Message extraction for server-side memory scenarios</li>
  *   <li>Agent resolution via {@link AgentResolver}</li>
  *   <li>Event stream generation via {@link AguiAgentAdapter}</li>
- *   <li>Snapshot recording and hydration via {@link AguiSnapshotCoordinator}, when a snapshot
- *       store is present</li>
  * </ul>
  *
  * <p><b>Usage:</b>
@@ -76,7 +74,6 @@ public class AguiRequestProcessor {
     private final AguiAgentAdapterFactory adapterFactory;
     private final AguiResumeCoordinator resumeCoordinator;
     private final AguiRuntimeContextResolver runtimeContextResolver;
-    private final AguiSnapshotCoordinator snapshotCoordinator;
 
     private AguiRequestProcessor(Builder builder) {
         this.agentResolver =
@@ -88,10 +85,6 @@ public class AguiRequestProcessor {
                         : AguiAgentAdapterFactory.defaultFactory();
         this.resumeCoordinator = new AguiResumeCoordinator();
         this.runtimeContextResolver = builder.runtimeContextResolver;
-        this.snapshotCoordinator =
-                builder.snapshotStore != null
-                        ? new AguiSnapshotCoordinator(builder.snapshotStore, builder.maxSnapshots)
-                        : null;
     }
 
     /**
@@ -117,23 +110,28 @@ public class AguiRequestProcessor {
          * @param threadId The AG-UI thread id for this request
          */
         public void interrupt(String threadId) {
-            if (agent == null) {
-                // Hydrate runs are read-only synthetic replay; there is no agent to interrupt.
-                return;
-            }
-            ReActAgent reActAgent = AguiUtil.asReActAgent(agent);
-            if (reActAgent != null) {
-                RuntimeContext interruptContext =
-                        RuntimeContext.builder(runtimeContext).sessionId(threadId).build();
-                reActAgent.interrupt(interruptContext);
-            } else {
-                agent.interrupt();
-            }
+            interruptAgent(agent, runtimeContext, threadId);
+        }
+    }
+
+    private static void interruptAgent(
+            Agent agent, RuntimeContext runtimeContext, String threadId) {
+        ReActAgent reActAgent = AguiUtil.asReActAgent(agent);
+        if (reActAgent != null) {
+            RuntimeContext interruptContext =
+                    RuntimeContext.builder(runtimeContext).sessionId(threadId).build();
+            reActAgent.interrupt(interruptContext);
+        } else {
+            agent.interrupt();
         }
     }
 
     /**
-     * Process an AG-UI request and return the result containing agent and event stream.
+     * Process an ordinary AG-UI run request.
+     *
+     * <p>This method always follows the normal run path. SessionLog recovery is an explicit
+     * AgentScope extension available through {@link #attach(AguiRuntimeContextRequest)}; it is not
+     * inferred from empty messages on the standard run endpoint.
      *
      * <p>The {@link AguiRuntimeContextResolver} (if configured on this processor) is invoked with
      * the given request to obtain a caller-provided {@link RuntimeContext}. That context is copied
@@ -150,19 +148,6 @@ public class AguiRequestProcessor {
         String pathAgentId = request.getPathAgentId();
         String threadId = input.getThreadId();
         String runId = input.getRunId();
-
-        // Hydrate targets are classified before any Agent wiring: a hydrate run is read-only
-        // synthetic replay from the snapshot store and must never resolve or invoke an Agent.
-        if (snapshotCoordinator != null) {
-            List<AguiEvent> hydrateEvents =
-                    snapshotCoordinator.tryHydrate(
-                            input,
-                            config.isEmitRunFinishedAfterError(),
-                            resumeCoordinator.unresolvedInterrupts(threadId));
-            if (hydrateEvents != null) {
-                return new ProcessResult(null, Flux.fromIterable(hydrateEvents), null);
-            }
-        }
 
         RuntimeContext resolved =
                 runtimeContextResolver != null ? runtimeContextResolver.resolve(request) : null;
@@ -187,13 +172,6 @@ public class AguiRequestProcessor {
                                                 beginResult.message(),
                                                 config.isEmitRunFinishedAfterError()));
                             }
-
-                            final AguiSnapshotCoordinator snapshotCoordinator =
-                                    this.snapshotCoordinator;
-                            AguiSnapshotAccumulator accumulator =
-                                    snapshotCoordinator != null
-                                            ? snapshotCoordinator.begin(input)
-                                            : null;
 
                             try {
                                 // Determine effective input based on server-side memory
@@ -228,9 +206,6 @@ public class AguiRequestProcessor {
                                                             runId,
                                                             event,
                                                             runErrorSeen.get());
-                                                    if (accumulator != null) {
-                                                        accumulator.observe(event);
-                                                    }
                                                 })
                                         // Finish the run before the terminal signal reaches
                                         // the caller. doFinally runs after onComplete/onError
@@ -243,45 +218,107 @@ public class AguiRequestProcessor {
                                         // guarantee; finishRun is idempotent, and doFinally
                                         // still covers the cancellation path.
                                         .doOnComplete(
-                                                () -> {
-                                                    if (snapshotCoordinator != null) {
-                                                        snapshotCoordinator.finishRun(
-                                                                threadId, accumulator, true);
-                                                    }
-                                                    resumeCoordinator.finishRun(threadId, runId);
-                                                })
+                                                () -> resumeCoordinator.finishRun(threadId, runId))
                                         .doOnError(
-                                                error -> {
-                                                    if (snapshotCoordinator != null) {
-                                                        snapshotCoordinator.finishRun(
-                                                                threadId, accumulator, false);
-                                                    }
-                                                    resumeCoordinator.finishRun(threadId, runId);
-                                                })
+                                                error ->
+                                                        resumeCoordinator.finishRun(
+                                                                threadId, runId))
                                         .doFinally(
-                                                signalType -> {
-                                                    // doFinally still covers cancellation (and
-                                                    // re-covers error) paths; ON_COMPLETE work
-                                                    // already happened in doOnComplete.
-                                                    if (signalType != SignalType.ON_COMPLETE
-                                                            && snapshotCoordinator != null) {
-                                                        snapshotCoordinator.finishRun(
-                                                                threadId, accumulator, false);
-                                                    }
-                                                    resumeCoordinator.finishRun(threadId, runId);
-                                                });
+                                                signalType ->
+                                                        resumeCoordinator.finishRun(
+                                                                threadId, runId));
                             } catch (Throwable error) {
-                                if (snapshotCoordinator != null) {
-                                    snapshotCoordinator.finishRun(threadId, accumulator, false);
-                                }
                                 resumeCoordinator.finishRun(threadId, runId);
-                                return processorErrorEvents(input, error);
+                                return Flux.fromIterable(processorErrorEvents(input, error));
                             }
                         });
         return new ProcessResult(agent, events, runtimeContext);
     }
 
-    private Flux<AguiEvent> processorErrorEvents(RunAgentInput input, Throwable error) {
+    /**
+     * Attaches to an active AgentScope run after a recovery cursor.
+     *
+     * <p>This is an AgentScope extension, not an AG-UI standard endpoint. The application supplies
+     * the conversation history and a cursor that is a presentation boundary; this method replays
+     * committed events after that cursor and follows the run until it ends. It never starts or
+     * resumes an Agent run.
+     *
+     * @param request the AG-UI request context
+     * @param after the cursor returned by the application history query
+     * @param executionRunId the SessionLog execution run id, or {@code null} to follow active runs
+     * @return framed AG-UI replay events
+     */
+    public Flux<AguiFramedEvent> attach(
+            AguiRuntimeContextRequest<?> request, long after, String executionRunId) {
+        RunAgentInput input = request.getInput();
+        RuntimeContext resolved =
+                runtimeContextResolver != null ? runtimeContextResolver.resolve(request) : null;
+        RuntimeContext runtimeContext =
+                RuntimeContext.builder(resolved).sessionId(input.getThreadId()).build();
+        String agentId =
+                resolveAgentId(input, request.getHeaderAgentId(), request.getPathAgentId());
+        Agent agent =
+                agentResolver.resolveAgent(
+                        agentId, input.getThreadId(), runtimeContext.getUserId());
+        SessionLog sessionLog;
+        try {
+            sessionLog = AguiUtil.sessionLog(agent, runtimeContext);
+        } catch (RuntimeException error) {
+            return Flux.fromIterable(framed(processorErrorEvents(input, error), -1));
+        }
+        if (sessionLog == null) {
+            return Flux.fromIterable(
+                    framed(
+                            processorErrorEvents(
+                                    input,
+                                    new IllegalStateException(
+                                            "Session log attach requires a HarnessAgent with"
+                                                    + " SessionHistoryMode.EVENT_LOG")),
+                            -1));
+        }
+        return AguiSessionLogAttach.attach(input, sessionLog, after, executionRunId, config);
+    }
+
+    /**
+     * Attaches using the cursor and execution run id carried by the request.
+     *
+     * <p>The cursor comes from {@code Last-Event-ID} or {@code forwardedProps.agentscope
+     * .afterSequence}; the run id comes from {@code forwardedProps.agentscope.runId} or {@code
+     * forwardedProps.agentscope.executionRunId}.
+     *
+     * @param request the AG-UI request context
+     * @return framed AG-UI replay events
+     */
+    public Flux<AguiFramedEvent> attach(AguiRuntimeContextRequest<?> request) {
+        RunAgentInput input = request.getInput();
+        Long after;
+        try {
+            after = AguiSessionCursor.resolve(request, input);
+        } catch (IllegalArgumentException error) {
+            return Flux.fromIterable(framed(processorErrorEvents(input, error), -1));
+        }
+        if (after == null) {
+            return Flux.fromIterable(
+                    framed(
+                            processorErrorEvents(
+                                    input,
+                                    new IllegalArgumentException(
+                                            "An attach cursor is required: Last-Event-ID or"
+                                                    + " forwardedProps.agentscope.afterSequence")),
+                            -1));
+        }
+        return attach(request, after, AguiSessionCursor.resolveRunId(input));
+    }
+
+    private static List<AguiFramedEvent> framed(List<AguiEvent> events, long seq) {
+        List<AguiFramedEvent> framed = new ArrayList<>(events.size());
+        for (AguiEvent event : events) {
+            framed.add(new AguiFramedEvent(seq, event));
+        }
+        return framed;
+    }
+
+    private List<AguiEvent> processorErrorEvents(RunAgentInput input, Throwable error) {
         String errorMessage =
                 error.getMessage() != null ? error.getMessage() : error.getClass().getSimpleName();
         List<AguiEvent> events = new ArrayList<>();
@@ -297,7 +334,7 @@ public class AguiRequestProcessor {
         if (config.isEmitRunFinishedAfterError()) {
             events.add(new AguiEvent.RunFinished(input.getThreadId(), input.getRunId()));
         }
-        return Flux.fromIterable(events);
+        return List.copyOf(events);
     }
 
     private static String mapErrorCode(Throwable error) {
@@ -432,14 +469,10 @@ public class AguiRequestProcessor {
     /** Builder for AguiRequestProcessor. */
     public static class Builder {
 
-        private static final int DEFAULT_MAX_SNAPSHOTS = 1000;
-
         private AgentResolver agentResolver;
         private AguiAdapterConfig config;
         private AguiAgentAdapterFactory adapterFactory;
         private AguiRuntimeContextResolver runtimeContextResolver;
-        private AguiSnapshotStore snapshotStore;
-        private int maxSnapshots = DEFAULT_MAX_SNAPSHOTS;
 
         /**
          * Set the agent resolver.
@@ -483,30 +516,6 @@ public class AguiRequestProcessor {
          */
         public Builder runtimeContextResolver(AguiRuntimeContextResolver runtimeContextResolver) {
             this.runtimeContextResolver = runtimeContextResolver;
-            return this;
-        }
-
-        /**
-         * Set the snapshot store used to record AG-UI presentation snapshots and to serve hydrate
-         * requests. Optional; when null, no snapshot recording or hydration happens and behavior
-         * is unchanged.
-         *
-         * @param snapshotStore The AG-UI snapshot store, may be null
-         * @return This builder
-         */
-        public Builder snapshotStore(AguiSnapshotStore snapshotStore) {
-            this.snapshotStore = snapshotStore;
-            return this;
-        }
-
-        /**
-         * Set the bounded size of the per-run snapshot accumulator registry as a leak guard.
-         *
-         * @param maxSnapshots maximum live accumulators kept in memory
-         * @return This builder
-         */
-        public Builder maxSnapshots(int maxSnapshots) {
-            this.maxSnapshots = maxSnapshots;
             return this;
         }
 

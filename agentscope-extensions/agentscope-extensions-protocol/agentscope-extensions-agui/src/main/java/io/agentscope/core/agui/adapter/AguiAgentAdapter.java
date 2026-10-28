@@ -292,6 +292,7 @@ public class AguiAgentAdapter {
             RunAgentInput input, RuntimeContext runtimeContext) {
         ToolRequestConfig perCallRequestConfig = buildToolRequestConfig(input);
         return RuntimeContext.builder(runtimeContext)
+                .runId(input.getRunId())
                 .sessionId(input.getThreadId())
                 .toolRequestConfig(perCallRequestConfig)
                 .put(RunAgentInput.class, input)
