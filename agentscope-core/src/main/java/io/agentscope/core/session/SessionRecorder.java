@@ -59,6 +59,7 @@ public final class SessionRecorder {
     public static final String PARENT_KEY = "agentscope.session.parent";
     private final AtomicBoolean exporting = new AtomicBoolean();
     private final AtomicBoolean exportRequested = new AtomicBoolean();
+    private final AtomicBoolean exportRejectionLogged = new AtomicBoolean();
     public static final String TURN_ID_KEY = "agentscope.session.turnId";
     private static final Duration LEASE = Duration.ofMinutes(2);
     private final SessionLog log;
@@ -296,11 +297,15 @@ public final class SessionRecorder {
                                     if (exportRequested.get()) exportCommitted();
                                 }
                             });
+            exportRejectionLogged.set(false);
         } catch (RuntimeException error) {
             // A shutting-down scheduler must neither fail the caller nor leave the
-            // export latch set; the committed prefix stays for the retry path.
+            // export latch set; the committed prefix stays for the retry path. The
+            // rejection repeats with every heartbeat, so log it at warn once.
             exporting.set(false);
-            LOGGER.warn("Committed session export not scheduled: {}", error.toString());
+            if (exportRejectionLogged.compareAndSet(false, true))
+                LOGGER.warn("Committed session export not scheduled: {}", error.toString());
+            else LOGGER.debug("Committed session export not scheduled: {}", error.toString());
         }
     }
 

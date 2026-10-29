@@ -26,6 +26,8 @@ public final class SessionLogExporter {
     }
 
     public synchronized void drain() {
+        // Concurrent drains (e.g. a closing recorder overlapping a later run) are tolerated:
+        // a cursor CAS conflict defers the remaining events to the next export trigger.
         long cursor = log.exportCursor(sink.name());
         for (var event : log.scan(cursor, log.head().seq())) {
             sink.accept(event);

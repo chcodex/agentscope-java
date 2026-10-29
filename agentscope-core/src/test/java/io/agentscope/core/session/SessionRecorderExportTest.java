@@ -31,8 +31,8 @@ import org.junit.jupiter.api.Test;
 class SessionRecorderExportTest {
 
     private static final long WAIT_SECONDS = 5;
-    // The heartbeat retries exports every second, so a shorter window proves the drain loop.
-    private static final long DRAIN_LOOP_WAIT_MILLIS = 800;
+    // The heartbeat retries exports every second, so a tighter window proves the drain loop.
+    private static final long DRAIN_LOOP_WAIT_MILLIS = 500;
 
     @Test
     void exportRequestedWhileDrainingIsExportedBeforeClose() throws Exception {
