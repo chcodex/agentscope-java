@@ -275,28 +275,7 @@ public final class SessionRecorder {
         exportRequested.set(true);
         if (!exporting.compareAndSet(false, true)) return;
         try {
-            Schedulers.boundedElastic()
-                    .schedule(
-                            () -> {
-                                try {
-                                    // A request arriving while a drain is running must not be
-                                    // lost.
-                                    while (exportRequested.compareAndSet(true, false)) {
-                                        exporter.drain();
-                                    }
-                                } catch (RuntimeException error) {
-                                    // Clear the request so the retry path does not spin. A failure
-                                    // after close() has no in-process trigger left and waits for
-                                    // an external retry.
-                                    exportRequested.set(false);
-                                    LOGGER.warn(
-                                            "Committed session export pending retry: {}",
-                                            error.toString());
-                                } finally {
-                                    exporting.set(false);
-                                    if (exportRequested.get()) exportCommitted();
-                                }
-                            });
+            Schedulers.boundedElastic().schedule(this::drainRequested);
             exportRejectionLogged.set(false);
         } catch (RuntimeException error) {
             // A shutting-down scheduler must neither fail the caller nor leave the
@@ -306,6 +285,24 @@ public final class SessionRecorder {
             if (exportRejectionLogged.compareAndSet(false, true))
                 LOGGER.warn("Committed session export not scheduled: {}", error.toString());
             else LOGGER.debug("Committed session export not scheduled: {}", error.toString());
+        }
+    }
+
+    private void drainRequested() {
+        try {
+            // A request arriving while a drain is running must not be lost.
+            while (exportRequested.compareAndSet(true, false)) {
+                exporter.drain();
+            }
+        } catch (RuntimeException error) {
+            // Clear the request so the retry path does not spin. A failure
+            // after close() has no in-process trigger left and waits for
+            // an external retry.
+            exportRequested.set(false);
+            LOGGER.warn("Committed session export pending retry: {}", error.toString());
+        } finally {
+            exporting.set(false);
+            if (exportRequested.get()) exportCommitted();
         }
     }
 
