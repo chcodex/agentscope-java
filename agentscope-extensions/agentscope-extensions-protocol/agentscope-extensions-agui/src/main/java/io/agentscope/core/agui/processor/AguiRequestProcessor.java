@@ -230,84 +230,10 @@ public class AguiRequestProcessor {
                                                                 threadId, runId));
                             } catch (Throwable error) {
                                 resumeCoordinator.finishRun(threadId, runId);
-                                return processorErrorEvents(input, error);
+                                return Flux.fromIterable(processorErrorEvents(input, error));
                             }
                         });
         return new ProcessResult(agent, events, runtimeContext);
-    }
-
-    /**
-     * Attaches to an active AgentScope run after a recovery cursor.
-     *
-     * <p>This is an AgentScope extension, not an AG-UI standard endpoint. The application supplies
-     * the conversation history and a cursor that is a presentation boundary; this method replays
-     * committed events after that cursor and follows the run until it ends. It never starts or
-     * resumes an Agent run.
-     *
-     * @param request the AG-UI request context
-     * @param after the cursor returned by the application history query
-     * @param executionRunId the SessionLog execution run id, or {@code null} to follow active runs
-     * @return framed AG-UI replay events
-     */
-    public Flux<AguiFramedEvent> attach(
-            AguiRuntimeContextRequest<?> request, long after, String executionRunId) {
-        RunAgentInput input = request.getInput();
-        RuntimeContext runtimeContext = resolveRuntimeContext(request);
-        String agentId =
-                resolveAgentId(input, request.getHeaderAgentId(), request.getPathAgentId());
-        Agent agent =
-                agentResolver.resolveAgent(
-                        agentId, input.getThreadId(), runtimeContext.getUserId());
-        SessionLog sessionLog;
-        try {
-            sessionLog = AguiUtil.sessionLog(agent, runtimeContext);
-        } catch (RuntimeException error) {
-            return framed(processorErrorEvents(input, error), -1);
-        }
-        if (sessionLog == null) {
-            return framed(
-                    processorErrorEvents(
-                            input,
-                            new IllegalStateException(
-                                    "Session log attach requires a HarnessAgent with"
-                                            + " SessionHistoryMode.EVENT_LOG")),
-                    -1);
-        }
-        return AguiSessionLogAttach.attach(input, sessionLog, after, executionRunId, config);
-    }
-
-    /**
-     * Attaches using the cursor and execution run id carried by the request.
-     *
-     * <p>The cursor comes from {@code Last-Event-ID} or {@code forwardedProps.agentscope
-     * .afterSequence}; the run id comes from {@code forwardedProps.agentscope.runId} or {@code
-     * forwardedProps.agentscope.executionRunId}.
-     *
-     * @param request the AG-UI request context
-     * @return framed AG-UI replay events
-     */
-    public Flux<AguiFramedEvent> attach(AguiRuntimeContextRequest<?> request) {
-        RunAgentInput input = request.getInput();
-        Long after;
-        try {
-            after = AguiSessionCursor.resolve(request, input);
-        } catch (IllegalArgumentException error) {
-            return framed(processorErrorEvents(input, error), -1);
-        }
-        if (after == null) {
-            return framed(
-                    processorErrorEvents(
-                            input,
-                            new IllegalArgumentException(
-                                    "An attach cursor is required: Last-Event-ID or"
-                                            + " forwardedProps.agentscope.afterSequence")),
-                    -1);
-        }
-        return attach(request, after, AguiSessionCursor.resolveRunId(input));
-    }
-
-    private static Flux<AguiFramedEvent> framed(Flux<AguiEvent> events, long seq) {
-        return events.map(event -> new AguiFramedEvent(seq, event));
     }
 
     /**
@@ -345,7 +271,110 @@ public class AguiRequestProcessor {
         return contextBuilder.build();
     }
 
-    private Flux<AguiEvent> processorErrorEvents(RunAgentInput input, Throwable error) {
+    /**
+     * Reconnects to an existing AgentScope run after a recovery cursor.
+     *
+     * <p>This is an AgentScope extension, not an AG-UI standard endpoint. It is the reconnect
+     * path of a run: the application supplies the conversation history and a cursor that is a
+     * presentation boundary, and this method delivers everything after that cursor. It never
+     * starts, resumes or re-executes an Agent run, never calls a model, and never writes to the
+     * session log, so calling it repeatedly with the same cursor is idempotent.
+     *
+     * <p>When the run is still active in this process, the frames published by the original
+     * request are used as a low-latency tail: the log is replayed up to the tail's position and
+     * the tail continues without a gap or a duplicate. Otherwise the committed log is replayed and
+     * then followed by polling, which is slower but always correct.
+     *
+     * <p>{@code after} must be the sequence of an event whose effects are fully present in the
+     * application history; a cursor from the middle of a message replays partial frames.
+     *
+     * @param request the AG-UI request context
+     * @param after the cursor returned by the application history query
+     * @param executionRunId the SessionLog execution run id, or {@code null} to follow active runs
+     * @return framed AG-UI reconnect events
+     */
+    public Flux<AguiFramedEvent> attach(
+            AguiRuntimeContextRequest<?> request, long after, String executionRunId) {
+        RunAgentInput input = request.getInput();
+        RuntimeContext runtimeContext;
+        try {
+            runtimeContext = resolveRuntimeContext(request);
+        } catch (RuntimeException error) {
+            // A failing resolver is reported like any other attach error instead of escaping as a
+            // transport exception.
+            return Flux.fromIterable(framed(processorErrorEvents(input, error), -1));
+        }
+        String agentId =
+                resolveAgentId(input, request.getHeaderAgentId(), request.getPathAgentId());
+        Agent agent;
+        try {
+            agent =
+                    agentResolver.resolveAgent(
+                            agentId, input.getThreadId(), runtimeContext.getUserId());
+        } catch (RuntimeException error) {
+            // AgentNotFoundException and other resolver failures are reported like any other
+            // attach error instead of escaping as a transport exception.
+            return Flux.fromIterable(framed(processorErrorEvents(input, error), -1));
+        }
+        SessionLog sessionLog;
+        try {
+            sessionLog = AguiUtil.sessionLog(agent, runtimeContext);
+        } catch (RuntimeException error) {
+            return Flux.fromIterable(framed(processorErrorEvents(input, error), -1));
+        }
+        if (sessionLog == null) {
+            return Flux.fromIterable(
+                    framed(
+                            processorErrorEvents(
+                                    input,
+                                    new IllegalStateException(
+                                            "Session log attach requires a HarnessAgent with"
+                                                    + " SessionHistoryMode.EVENT_LOG")),
+                            -1));
+        }
+        return AguiSessionLogAttach.attach(input, sessionLog, after, executionRunId, config);
+    }
+
+    /**
+     * Attaches using the cursor and execution run id carried by the request.
+     *
+     * <p>The cursor comes from {@code Last-Event-ID} or {@code forwardedProps.agentscope
+     * .afterSequence}; the run id comes from {@code forwardedProps.agentscope.runId} or {@code
+     * forwardedProps.agentscope.executionRunId}.
+     *
+     * @param request the AG-UI request context
+     * @return framed AG-UI replay events
+     */
+    public Flux<AguiFramedEvent> attach(AguiRuntimeContextRequest<?> request) {
+        RunAgentInput input = request.getInput();
+        Long after;
+        try {
+            after = AguiSessionCursor.resolve(request, input);
+        } catch (IllegalArgumentException error) {
+            return Flux.fromIterable(framed(processorErrorEvents(input, error), -1));
+        }
+        if (after == null) {
+            return Flux.fromIterable(
+                    framed(
+                            processorErrorEvents(
+                                    input,
+                                    new IllegalArgumentException(
+                                            "An attach cursor is required: Last-Event-ID or"
+                                                    + " forwardedProps.agentscope.afterSequence")),
+                            -1));
+        }
+        return attach(request, after, AguiSessionCursor.resolveRunId(input));
+    }
+
+    private static List<AguiFramedEvent> framed(List<AguiEvent> events, long seq) {
+        List<AguiFramedEvent> framed = new ArrayList<>(events.size());
+        for (AguiEvent event : events) {
+            framed.add(new AguiFramedEvent(seq, event));
+        }
+        return framed;
+    }
+
+    private List<AguiEvent> processorErrorEvents(RunAgentInput input, Throwable error) {
         String errorMessage =
                 error.getMessage() != null ? error.getMessage() : error.getClass().getSimpleName();
         List<AguiEvent> events = new ArrayList<>();
@@ -361,7 +390,7 @@ public class AguiRequestProcessor {
         if (config.isEmitRunFinishedAfterError()) {
             events.add(new AguiEvent.RunFinished(input.getThreadId(), input.getRunId()));
         }
-        return Flux.fromIterable(events);
+        return List.copyOf(events);
     }
 
     private static String mapErrorCode(Throwable error) {

@@ -55,6 +55,7 @@ final class AguiSessionPresentation {
 
     private final String threadId;
     private final String runId;
+    private final RunAgentInput input;
     private final boolean enableReasoning;
     private final boolean emitToolCallArgs;
     private final Set<String> externalToolNames;
@@ -71,6 +72,7 @@ final class AguiSessionPresentation {
             String threadId, String runId, AguiAdapterConfig config, RunAgentInput input) {
         this.threadId = threadId;
         this.runId = runId;
+        this.input = input;
         this.enableReasoning = config.isEnableReasoning();
         this.emitToolCallArgs = config.isEmitToolCallArgs();
         Set<String> external = new LinkedHashSet<>();
@@ -101,6 +103,9 @@ final class AguiSessionPresentation {
                 if (event.executionRunId() != null) {
                     activeRuns.add(event.executionRunId());
                 }
+                // The run lifecycle frame is produced from the committed event, so a reconnect
+                // that already passed it does not emit RUN_STARTED twice.
+                out.add(new AguiEvent.RunStarted(threadId, runId, null, input));
             }
             case "run/end" -> {
                 if (event.executionRunId() != null) {

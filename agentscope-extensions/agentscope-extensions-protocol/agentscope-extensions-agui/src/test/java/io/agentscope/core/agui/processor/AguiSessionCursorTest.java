@@ -131,6 +131,53 @@ class AguiSessionCursorTest {
     }
 
     @Test
+    void rejectsFractionalAndOutOfRangeNumericCursors() {
+        RunAgentInput fractional =
+                RunAgentInput.builder()
+                        .threadId("thread-1")
+                        .runId("run-1")
+                        .forwardedProps(Map.of("afterSequence", 2.5d))
+                        .build();
+        assertThrows(
+                IllegalArgumentException.class,
+                () ->
+                        AguiSessionCursor.resolve(
+                                AguiRuntimeContextRequest.builder().input(fractional).build(),
+                                fractional));
+
+        RunAgentInput outOfRange =
+                RunAgentInput.builder()
+                        .threadId("thread-1")
+                        .runId("run-1")
+                        .forwardedProps(
+                                Map.of(
+                                        "afterSequence",
+                                        new java.math.BigInteger("9223372036854775808")))
+                        .build();
+        assertThrows(
+                IllegalArgumentException.class,
+                () ->
+                        AguiSessionCursor.resolve(
+                                AguiRuntimeContextRequest.builder().input(outOfRange).build(),
+                                outOfRange));
+    }
+
+    @Test
+    void acceptsIntegralNumericCursors() {
+        RunAgentInput input =
+                RunAgentInput.builder()
+                        .threadId("thread-1")
+                        .runId("run-1")
+                        .forwardedProps(Map.of("afterSequence", 4.0d))
+                        .build();
+
+        assertEquals(
+                4L,
+                AguiSessionCursor.resolve(
+                        AguiRuntimeContextRequest.builder().input(input).build(), input));
+    }
+
+    @Test
     void rejectsNegativeAndMalformedCursors() {
         RunAgentInput input = RunAgentInput.builder().threadId("thread-1").runId("run-1").build();
         assertThrows(

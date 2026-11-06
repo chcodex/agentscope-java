@@ -11,11 +11,13 @@ zh_link: /v2/zh/integration/protocol/agui
 
 `AguiMessage.content` is represented as typed message content. For text-only code paths, use `getTextContent()`.
 
-Multimodal input supports text, image, audio, and video. Document input is not supported yet: the adapter rejects it with `RUN_ERROR` and code `INVALID_INPUT_ERROR`, without including the document source or metadata in the error message.
+Multimodal input supports image/audio/video/document. Document parts are converted to `DocumentBlock`; model providers that cannot consume a document report an error instead of silently dropping the content.
 
-This protection applies only to the `RUN_ERROR` message, not to the entire event stream. The preceding `RUN_STARTED.input` retains the original request, including rejected document content. Consumers that log or forward events must redact sensitive input themselves.
+`RUN_STARTED.input` retains the original request, so consumers that log or forward events must redact sensitive input themselves.
 
-`AguiMessageConverter.toAguiMessageList()` expands a TOOL `Msg` containing multiple `ToolResultBlock`s into one AG-UI tool message per tool result. `toAguiMessage()` remains for messages with at most one tool result and rejects a multi-result TOOL message; use `toAguiMessages()` for the expanded form. It currently preserves text and tool-call fields only; image, audio, video, and document content blocks are not serialized back into AG-UI message content.
+`AguiMessageConverter.toAguiMessageList()` expands a TOOL `Msg` containing multiple `ToolResultBlock`s into one AG-UI tool message per tool result. `toAguiMessage()` remains for messages with at most one tool result and rejects a multi-result TOOL message; use `toAguiMessages()` for the expanded form.
+
+On the outbound path, URL-backed `ImageBlock` / `AudioBlock` / `VideoBlock` / `DocumentBlock` content is serialized into AG-UI `MessageContent.Blocks` (`image` / `audio` / `video` / `document`); URL-backed `DataBlock` is routed by its resolved MIME type. Base64 media sources are skipped on outbound conversion for now.
 
 ## When To Use
 
@@ -131,14 +133,14 @@ The reusable entry point is `AguiRequestProcessor.attach(AguiRuntimeContextReque
 
 ### What attach does
 
-Attach is a read-only observer. It never starts, resumes, or interrupts an Agent run, and it does not emit a message snapshot.
+Attach is the reconnect path of an existing run. It is a read-only observer: it never starts, resumes, or interrupts an Agent run, never calls a model, and never writes to the session log. The same cursor always produces the same events, so retrying a reconnect is safe.
 
-- It checks the session head; when the head advances, it reads committed events after the cursor.
-- If the run is still active, it polls for further commits until `run/end`.
-- If the run already ended, it drains the available tail and finishes.
+- It replays committed events after the cursor, and exposes the cursor as the SSE `id` on the last frame produced by each committed event.
+- While the run is still active, attach follows the session log by polling. This is slower than a live feed, but always correct.
+- If the run already ended, it drains the remaining events and finishes with `RUN_FINISHED` or `RUN_ERROR`.
 - Text and tool output after the cursor become `TEXT_MESSAGE_*`, `REASONING_MESSAGE_*`, `TOOL_CALL_*`, and `RUN_*` events.
 - A tool call that is already part of the application history is not restarted: a later result becomes `TOOL_CALL_RESULT` for the existing tool-call id.
-- The cursor is exposed as the SSE `id` on the last frame produced by each committed event.
+- `RUN_STARTED` is replayed from the committed `run/start` event, so a cursor past it does not announce a new run.
 
 The cursor is a native `SessionEvent.seq()`, not an AG-UI field and not interchangeable with another session or the Service SSE cursor.
 
@@ -153,7 +155,7 @@ A status query is useful for choosing between history-only and attach, but attac
 ### Limitations
 
 - Completed turns and HITL are application-level history/state; they are not part of this recovery contract.
-- The recovery path is poll-based; there is no push notification.
+- The recovery path is poll-based, so commits are delivered in batches at the recorder flush granularity.
 - The run must survive the disconnected browser request. Use `AgentSession` or a long-lived agent with `interrupt-on-disconnect=false`.
 - Server restarts require `AgentSession`/durable scheduling; an in-memory subscription does not survive.
 - Multi-instance deployments need the same `SessionLogStore` and namespace.

@@ -17,6 +17,7 @@ package io.agentscope.core.agui.processor;
 
 import io.agentscope.core.agui.model.RunAgentInput;
 import io.agentscope.core.agui.runtime.AguiRuntimeContextRequest;
+import java.math.BigDecimal;
 import java.util.Map;
 
 /**
@@ -80,7 +81,14 @@ final class AguiSessionCursor {
     private static long parse(Object value, String source) {
         long seq;
         if (value instanceof Number number) {
-            seq = number.longValue();
+            // longValue() silently truncates fractions and wraps out-of-range values, which would
+            // resume from a wrong position; require an exact non-negative integer.
+            try {
+                seq = new BigDecimal(number.toString()).longValueExact();
+            } catch (NumberFormatException | ArithmeticException error) {
+                throw new IllegalArgumentException(
+                        source + " must be a non-negative integer", error);
+            }
         } else {
             String text = String.valueOf(value).trim();
             if (text.isEmpty()) {

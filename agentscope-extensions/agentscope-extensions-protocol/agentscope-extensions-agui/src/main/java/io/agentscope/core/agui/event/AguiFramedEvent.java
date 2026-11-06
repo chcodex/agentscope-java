@@ -25,15 +25,30 @@ import java.util.Objects;
  * A negative {@code seq} means the frame has no cursor (ordinary live runs, or frames preceding the
  * last frame of a multi-frame committed event).
  *
+ * <p>{@code sourceSeq} is the sequence of the event that produced the frame, whether or not this
+ * particular frame advances the cursor. It lets a consumer filter whole events, which the cursor
+ * alone cannot do because only the last frame of an event is cursored.
+ *
  * <p>The cursor is an AgentScope extension to AG-UI transport, not an AG-UI protocol field.
  *
  * @param seq cursor, or a negative value when this frame advances no cursor
+ * @param sourceSeq sequence of the event that produced this frame, or negative when unknown
  * @param event the AG-UI event
  */
-public record AguiFramedEvent(long seq, AguiEvent event) {
+public record AguiFramedEvent(long seq, long sourceSeq, AguiEvent event) {
 
     public AguiFramedEvent {
         Objects.requireNonNull(event, "event cannot be null");
+    }
+
+    /**
+     * Creates a frame whose event sequence equals its cursor.
+     *
+     * @param seq cursor and source sequence
+     * @param event the AG-UI event
+     */
+    public AguiFramedEvent(long seq, AguiEvent event) {
+        this(seq, seq, event);
     }
 
     /**
@@ -43,7 +58,7 @@ public record AguiFramedEvent(long seq, AguiEvent event) {
      * @return a cursor-less frame
      */
     public static AguiFramedEvent uncursored(AguiEvent event) {
-        return new AguiFramedEvent(-1, event);
+        return new AguiFramedEvent(-1, -1, event);
     }
 
     /**
@@ -53,5 +68,18 @@ public record AguiFramedEvent(long seq, AguiEvent event) {
      */
     public boolean hasCursor() {
         return seq >= 0;
+    }
+
+    /**
+     * Whether this frame belongs to an event after the given sequence.
+     *
+     * <p>Unlike {@link #hasCursor()}, this also covers the leading frames of a multi-frame event,
+     * so a consumer can drop an entire event it has already delivered.
+     *
+     * @param cursor the last delivered event sequence
+     * @return {@code true} when the frame's source event is newer than {@code cursor}
+     */
+    public boolean isAfter(long cursor) {
+        return sourceSeq > cursor;
     }
 }

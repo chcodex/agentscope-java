@@ -24,6 +24,7 @@ import io.agentscope.core.session.SessionLog;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import reactor.core.Disposable;
@@ -41,10 +42,26 @@ import reactor.core.scheduler.Schedulers;
  *
  * <p>The wait between polls is scheduled through Reactor, so an idle attach does not hold a worker
  * thread. The blocking store reads run briefly on {@code boundedElastic}.
+ *
+ * <p>{@code config.getRunTimeout()} bounds an idle wait, not the total duration: it fires when the
+ * committed head stops advancing for that long, not while the run keeps producing events.
+ *
+ * <p>{@code executionRunId}, when provided, must be the session writer's run id — the
+ * {@link SessionLog.Head#owner()} value written by the {@code SessionRecorder} that produced the
+ * events — not an unrelated application-level run identifier. Ownership decides whether a cursor
+ * ahead of the committed head is still reachable.
  */
 final class AguiSessionLogAttach {
 
     static final Duration DEFAULT_POLL_INTERVAL = Duration.ofMillis(200);
+
+    /**
+     * Upper bound for waiting on an uncommitted cursor or boundary. Commits happen on the writer's
+     * heartbeat, so this is a short wait, not a full attach: reusing the run timeout would keep an
+     * SSE connection open long after the client or gateway has given up.
+     */
+    private static final Duration COMMIT_WAIT_TIMEOUT = Duration.ofSeconds(30);
+
     private static final int BATCH_SIZE = 256;
 
     private AguiSessionLogAttach() {}
@@ -69,6 +86,223 @@ final class AguiSessionLogAttach {
                 sink -> runAttach(sink, input, log, after, executionRunId, config, pollInterval));
     }
 
+    /**
+     * Replays committed events in {@code (after, through]} and completes, without following the
+     * run. Used to bridge the gap between the application cursor and a live tail buffer whose
+     * oldest frame is newer than the cursor.
+     *
+     * <p>Like {@link #attach}, a range that cannot be replayed ends with a {@code RUN_ERROR} frame
+     * instead of a transport error, so the caller can bridge a live tail or fall back to a full
+     * replay. An inverted range ({@code after > through}) is rejected as invalid input.
+     */
+    static Flux<AguiFramedEvent> attachUntil(
+            RunAgentInput input,
+            SessionLog log,
+            long after,
+            long through,
+            String executionRunId,
+            AguiAdapterConfig config) {
+        return attachUntil(input, log, after, through, executionRunId, config, null);
+    }
+
+    /**
+     * Replays a range, optionally continuing the projection state of an earlier call so that a
+     * message started before the range still receives its terminal frame.
+     */
+    private static Flux<AguiFramedEvent> attachUntil(
+            RunAgentInput input,
+            SessionLog log,
+            long after,
+            long through,
+            String executionRunId,
+            AguiAdapterConfig config,
+            AguiSessionPresentation sharedPresentation) {
+        return Flux.create(
+                sink -> {
+                    if (after > through) {
+                        emitFrames(
+                                sink,
+                                errorFrames(
+                                        input,
+                                        after,
+                                        "Session log attach range is inverted: after="
+                                                + after
+                                                + " through="
+                                                + through,
+                                        "INVALID_INPUT_ERROR",
+                                        config,
+                                        false));
+                        return;
+                    }
+                    if (after == through) {
+                        sink.complete();
+                        return;
+                    }
+                    AtomicReference<Disposable> pending = new AtomicReference<>();
+                    sink.onDispose(
+                            () -> {
+                                Disposable disposable = pending.getAndSet(null);
+                                if (disposable != null) {
+                                    disposable.dispose();
+                                }
+                            });
+                    Disposable scheduled =
+                            Schedulers.boundedElastic()
+                                    .schedule(
+                                            () -> {
+                                                if (sink.isCancelled()) {
+                                                    return;
+                                                }
+                                                // Hoisted so a failure frame reports the last
+                                                // fully emitted sequence, not the bridge start.
+                                                long cursor = after;
+                                                try {
+                                                    AguiSessionPresentation presentation =
+                                                            sharedPresentation != null
+                                                                    ? sharedPresentation
+                                                                    : new AguiSessionPresentation(
+                                                                            input.getThreadId(),
+                                                                            input.getRunId(),
+                                                                            config,
+                                                                            input);
+                                                    long deadline =
+                                                            System.nanoTime()
+                                                                    + commitWaitTimeout(config)
+                                                                            .toNanos();
+                                                    while (cursor < through
+                                                            && !sink.isCancelled()) {
+                                                        List<SessionEvent> batch =
+                                                                log.readAfter(cursor, BATCH_SIZE);
+                                                        if (batch.isEmpty()) {
+                                                            SessionLog.Head head = log.head();
+                                                            // The boundary is either buffered in
+                                                            // the writer or readAfter raced the
+                                                            // head update it already reflects.
+                                                            // Retry while it stays reachable; a
+                                                            // dead writer with an unreachable
+                                                            // boundary ends below.
+                                                            boolean reachable =
+                                                                    head.seq() >= through
+                                                                            || isActive(
+                                                                                    head,
+                                                                                    executionRunId);
+                                                            if (!reachable) break;
+                                                            if (System.nanoTime() >= deadline) {
+                                                                emitFrames(
+                                                                        sink,
+                                                                        errorFrames(
+                                                                                input,
+                                                                                cursor,
+                                                                                "Session log attach"
+                                                                                        + " timed"
+                                                                                        + " out at"
+                                                                                        + " cursor="
+                                                                                        + cursor
+                                                                                        + " through="
+                                                                                        + through,
+                                                                                "TIMEOUT_ERROR",
+                                                                                config,
+                                                                                false));
+                                                                return;
+                                                            }
+                                                            try {
+                                                                Thread.sleep(
+                                                                        DEFAULT_POLL_INTERVAL
+                                                                                .toMillis());
+                                                            } catch (
+                                                                    InterruptedException
+                                                                            interrupted) {
+                                                                Thread.currentThread().interrupt();
+                                                                if (!sink.isCancelled()) {
+                                                                    emitFrames(
+                                                                            sink,
+                                                                            errorFrames(
+                                                                                    input,
+                                                                                    cursor,
+                                                                                    "Session log"
+                                                                                        + " attach"
+                                                                                        + " interrupted",
+                                                                                    "SESSION_LOG_ERROR",
+                                                                                    config,
+                                                                                    false));
+                                                                }
+                                                                return;
+                                                            }
+                                                            continue;
+                                                        }
+                                                        long before = cursor;
+                                                        for (SessionEvent event : batch) {
+                                                            if (event.seq() > through) break;
+                                                            boolean target =
+                                                                    executionRunId == null
+                                                                            || executionRunId
+                                                                                    .equals(
+                                                                                            event
+                                                                                                    .executionRunId());
+                                                            if (target) {
+                                                                for (AguiFramedEvent frame :
+                                                                        frames(
+                                                                                presentation.apply(
+                                                                                        event),
+                                                                                event.seq(),
+                                                                                cursored(
+                                                                                        event
+                                                                                                .type()))) {
+                                                                    if (sink.isCancelled()) {
+                                                                        return;
+                                                                    }
+                                                                    sink.next(frame);
+                                                                }
+                                                            }
+                                                            // Advance only after the event's
+                                                            // frames are emitted, so a later
+                                                            // failure reports a cursor the client
+                                                            // already holds.
+                                                            cursor = event.seq();
+                                                        }
+                                                        if (cursor == before) break;
+                                                    }
+                                                    if (cursor < through) {
+                                                        emitFrames(
+                                                                sink,
+                                                                errorFrames(
+                                                                        input,
+                                                                        cursor,
+                                                                        "Session log attach"
+                                                                                + " range not fully"
+                                                                                + " committed:"
+                                                                                + " cursor="
+                                                                                + cursor
+                                                                                + " through="
+                                                                                + through,
+                                                                        "INVALID_INPUT_ERROR",
+                                                                        config,
+                                                                        false));
+                                                    } else {
+                                                        sink.complete();
+                                                    }
+                                                } catch (RuntimeException error) {
+                                                    emitFrames(
+                                                            sink,
+                                                            errorFrames(
+                                                                    input,
+                                                                    cursor,
+                                                                    errorMessage(error),
+                                                                    "SESSION_LOG_ERROR",
+                                                                    config,
+                                                                    false));
+                                                }
+                                            });
+                    pending.set(scheduled);
+                    if (sink.isCancelled()) {
+                        Disposable disposable = pending.getAndSet(null);
+                        if (disposable != null) {
+                            disposable.dispose();
+                        }
+                    }
+                });
+    }
+
     private static void runAttach(
             FluxSink<AguiFramedEvent> sink,
             RunAgentInput input,
@@ -77,42 +311,6 @@ final class AguiSessionLogAttach {
             String executionRunId,
             AguiAdapterConfig config,
             Duration pollInterval) {
-        try {
-            long head = log.head().seq();
-            if (after > head) {
-                emitFrames(
-                        sink,
-                        errorFrames(
-                                input,
-                                -1,
-                                "Session log cursor " + after + " is ahead of " + head,
-                                "INVALID_INPUT_ERROR",
-                                config,
-                                true));
-                return;
-            }
-        } catch (RuntimeException error) {
-            emitFrames(
-                    sink,
-                    errorFrames(input, -1, errorMessage(error), "SESSION_LOG_ERROR", config, true));
-            return;
-        }
-
-        Duration poll = pollInterval != null ? pollInterval : DEFAULT_POLL_INTERVAL;
-        Duration timeout =
-                config.getRunTimeout() != null ? config.getRunTimeout() : Duration.ofMinutes(10);
-        long deadline = System.nanoTime() + timeout.toNanos();
-        AttachState state =
-                new AttachState(
-                        after,
-                        new AguiSessionPresentation(
-                                input.getThreadId(), input.getRunId(), config, input));
-
-        sink.next(
-                AguiFramedEvent.uncursored(
-                        new AguiEvent.RunStarted(
-                                input.getThreadId(), input.getRunId(), null, input)));
-
         AtomicReference<Disposable> pending = new AtomicReference<>();
         sink.onDispose(
                 () -> {
@@ -122,13 +320,92 @@ final class AguiSessionLogAttach {
                     }
                 });
 
+        // The store is a blocking SPI: probe the head off the subscribing thread, and only emit
+        // RUN_STARTED once the probe succeeded.
+        Schedulers.boundedElastic()
+                .schedule(
+                        () -> {
+                            if (sink.isCancelled()) {
+                                return;
+                            }
+                            try {
+                                // A cursor may reference an event that is appended but not yet
+                                // committed; that case waits in pollOnce while the writer is
+                                // alive. A cursor that no writer can ever commit is rejected
+                                // now, not on the first asynchronous poll after RUN_STARTED.
+                                SessionLog.Head head =
+                                        Objects.requireNonNull(log.head(), "session log head");
+                                if (after > head.seq() && !isActive(head, executionRunId)) {
+                                    emitFrames(
+                                            sink,
+                                            errorFrames(
+                                                    input,
+                                                    // Never publish the invalid cursor itself:
+                                                    // a non-negative seq is an SSE id a client
+                                                    // would store and resume from again.
+                                                    -1,
+                                                    "Session log cursor "
+                                                            + after
+                                                            + " is ahead of "
+                                                            + head.seq(),
+                                                    "INVALID_INPUT_ERROR",
+                                                    config,
+                                                    true));
+                                    return;
+                                }
+                            } catch (RuntimeException error) {
+                                emitFrames(
+                                        sink,
+                                        errorFrames(
+                                                input,
+                                                -1,
+                                                errorMessage(error),
+                                                "SESSION_LOG_ERROR",
+                                                config,
+                                                true));
+                                return;
+                            }
+                            startAttach(
+                                    sink,
+                                    input,
+                                    log,
+                                    after,
+                                    executionRunId,
+                                    config,
+                                    pollInterval,
+                                    pending);
+                        });
+    }
+
+    private static void startAttach(
+            FluxSink<AguiFramedEvent> sink,
+            RunAgentInput input,
+            SessionLog log,
+            long after,
+            String executionRunId,
+            AguiAdapterConfig config,
+            Duration pollInterval,
+            AtomicReference<Disposable> pending) {
+        Duration poll = pollInterval != null ? pollInterval : DEFAULT_POLL_INTERVAL;
+        Duration timeout =
+                config.getRunTimeout() != null ? config.getRunTimeout() : Duration.ofMinutes(10);
+        long deadline = System.nanoTime() + timeout.toNanos();
+        long commitDeadline = System.nanoTime() + commitWaitTimeout(config).toNanos();
+        AttachState state =
+                new AttachState(
+                        after,
+                        new AguiSessionPresentation(
+                                input.getThreadId(), input.getRunId(), config, input));
+
+        // RUN_STARTED is projected from the committed run/start event, so a reconnect that already
+        // passed it is not told a new run began.
         AtomicReference<Runnable> pollRef = new AtomicReference<>();
         Runnable pollTask =
                 () -> {
                     if (sink.isCancelled()) {
                         return;
                     }
-                    pending.set(
+                    Disposable scheduled =
                             Schedulers.boundedElastic()
                                     .schedule(
                                             () -> {
@@ -144,7 +421,8 @@ final class AguiSessionLogAttach {
                                                                     input,
                                                                     executionRunId,
                                                                     config,
-                                                                    deadline);
+                                                                    deadline,
+                                                                    commitDeadline);
                                                 } catch (RuntimeException error) {
                                                     outcome =
                                                             new PollOutcome(
@@ -177,10 +455,26 @@ final class AguiSessionLogAttach {
                                                                         pollRef.get(),
                                                                         delay,
                                                                         TimeUnit.MILLISECONDS));
-                                            }));
+                                            });
+                    pending.set(scheduled);
+                    if (sink.isCancelled()) {
+                        Disposable disposable = pending.getAndSet(null);
+                        if (disposable != null) {
+                            disposable.dispose();
+                        }
+                    }
                 };
         pollRef.set(pollTask);
-        pending.set(Schedulers.parallel().schedule(pollTask, 0, TimeUnit.MILLISECONDS));
+        Schedulers.parallel().schedule(pollTask, 0, TimeUnit.MILLISECONDS);
+    }
+
+    /** Returns the committed event at the given sequence, or {@code null} when unavailable. */
+    private static SessionEvent eventAt(SessionLog log, long seq) {
+        if (seq <= 0) {
+            return null;
+        }
+        List<SessionEvent> events = log.readAfter(seq - 1, 1);
+        return events.isEmpty() ? null : events.get(0);
     }
 
     private static PollOutcome pollOnce(
@@ -189,12 +483,92 @@ final class AguiSessionLogAttach {
             RunAgentInput input,
             String executionRunId,
             AguiAdapterConfig config,
-            long deadline) {
+            long deadline,
+            long commitDeadline) {
         SessionLog.Head head = log.head();
-        if (head.seq() <= state.cursor) {
+        if (head.seq() < state.cursor) {
+            // The cursor references an event that is appended but not yet committed. Wait for the
+            // writer to commit it; a dead writer means the cursor can never be satisfied. This
+            // wait is bounded by commitDeadline, not by the run timeout: a cursor that does not
+            // belong to this log must not hold the stream open for the whole run.
             if (!isActive(head, executionRunId)) {
                 return new PollOutcome(
-                        finishFrames(input, state.presentation, state.cursor, null, config), true);
+                        errorFrames(
+                                input,
+                                state.cursor,
+                                "Session log cursor "
+                                        + state.cursor
+                                        + " is ahead of committed "
+                                        + head.seq(),
+                                "INVALID_INPUT_ERROR",
+                                config,
+                                false),
+                        true);
+            }
+            if (System.nanoTime() >= commitDeadline) {
+                return new PollOutcome(
+                        errorFrames(
+                                input,
+                                state.cursor,
+                                "Session log has not committed cursor " + state.cursor,
+                                "TIMEOUT_ERROR",
+                                config,
+                                false),
+                        true);
+            }
+            return new PollOutcome(List.of(), false);
+        }
+        if (head.seq() == state.cursor) {
+            if (!isActive(head, executionRunId)) {
+                // The cursor may already cover a failed run/end. Recover the terminal status from
+                // the log instead of reporting every finished run as successful.
+                if (state.cursor == 0 && head.seq() == 0) {
+                    if (executionRunId != null) {
+                        // A run was requested but the log holds nothing for this session: report
+                        // it instead of pretending the run finished successfully.
+                        return new PollOutcome(
+                                errorFrames(
+                                        input,
+                                        -1,
+                                        "Session log has no events for run " + executionRunId,
+                                        "INVALID_INPUT_ERROR",
+                                        config,
+                                        false),
+                                true);
+                    }
+                    // Nothing was ever committed for this session.
+                    return new PollOutcome(
+                            finishFrames(input, state.presentation, 0, null, config), true);
+                }
+                SessionEvent terminal = eventAt(log, state.cursor);
+                boolean terminalRunEnd =
+                        terminal != null
+                                && "run/end".equals(terminal.type())
+                                && (executionRunId == null
+                                        || executionRunId.equals(terminal.executionRunId()));
+                if (terminalRunEnd) {
+                    return new PollOutcome(
+                            finishFrames(input, state.presentation, state.cursor, terminal, config),
+                            true);
+                }
+                if (executionRunId != null && !state.targetSeen) {
+                    // The target run ended at or before the cursor; any later events belong to
+                    // another run on the same session.
+                    return new PollOutcome(
+                            finishFrames(input, state.presentation, state.cursor, null, config),
+                            true);
+                }
+                // The writer is gone but the log does not end with a run/end of this run: the
+                // process died mid-run, so a successful finish would be a lie.
+                return new PollOutcome(
+                        errorFrames(
+                                input,
+                                state.cursor,
+                                "Session log ended without a terminal run event",
+                                "INTERNAL_ERROR",
+                                config,
+                                false),
+                        true);
             }
             if (System.nanoTime() >= deadline) {
                 return new PollOutcome(
@@ -212,36 +586,70 @@ final class AguiSessionLogAttach {
 
         List<SessionEvent> batch = log.readAfter(state.cursor, BATCH_SIZE);
         if (batch.isEmpty()) {
+            // The head already reported committed events after the cursor, so an empty read
+            // cannot mean the run ended: finishing here would drop them permanently.
             if (!isActive(head, executionRunId)) {
                 return new PollOutcome(
-                        finishFrames(input, state.presentation, state.cursor, null, config), true);
+                        errorFrames(
+                                input,
+                                state.cursor,
+                                "Session log has committed events that could not be read",
+                                "SESSION_LOG_ERROR",
+                                config,
+                                false),
+                        true);
+            }
+            if (System.nanoTime() >= deadline) {
+                return new PollOutcome(
+                        errorFrames(
+                                input,
+                                state.cursor,
+                                "Session log observation timed out",
+                                "TIMEOUT_ERROR",
+                                config,
+                                false),
+                        true);
             }
             return new PollOutcome(List.of(), false);
         }
 
+        // Advance only after the batch is projected, so a failure mid-batch leaves the cursor at
+        // the last sequence the caller already received.
+        long cursor = state.cursor;
         List<AguiFramedEvent> frames = new ArrayList<>();
         for (SessionEvent event : batch) {
-            state.cursor = event.seq();
             boolean target =
                     executionRunId == null || executionRunId.equals(event.executionRunId());
-            if (!target) {
-                continue;
-            }
-            frames.addAll(frames(state.presentation.apply(event), event.seq()));
-            if ("run/end".equals(event.type())) {
-                if (executionRunId != null && executionRunId.equals(event.executionRunId())) {
+            if (target) {
+                state.targetSeen = true;
+                frames.addAll(
+                        frames(
+                                state.presentation.apply(event),
+                                event.seq(),
+                                cursored(event.type())));
+                if ("run/end".equals(event.type()) && executionRunId != null) {
+                    state.cursor = event.seq();
                     frames.addAll(
-                            finishFrames(input, state.presentation, state.cursor, event, config));
-                    return new PollOutcome(frames, true);
-                }
-                if (executionRunId == null && state.presentation.activeRuns().isEmpty()) {
-                    frames.addAll(
-                            finishFrames(input, state.presentation, state.cursor, event, config));
+                            finishFrames(input, state.presentation, event.seq(), event, config));
                     return new PollOutcome(frames, true);
                 }
             }
+            // Without a target run id the stream follows the log instead of stopping at the first
+            // run/end: the cursor may sit inside an older run, and ending there would drop the run
+            // the caller is actually reconnecting to.
+            cursor = event.seq();
         }
+        state.cursor = cursor;
         return new PollOutcome(frames, false);
+    }
+
+    /** Keeps an uncommitted-cursor wait short even when the configured run timeout is larger. */
+    private static Duration commitWaitTimeout(AguiAdapterConfig config) {
+        Duration runTimeout = config.getRunTimeout();
+        if (runTimeout != null && runTimeout.compareTo(COMMIT_WAIT_TIMEOUT) < 0) {
+            return runTimeout;
+        }
+        return COMMIT_WAIT_TIMEOUT;
     }
 
     private static boolean isActive(SessionLog.Head head, String executionRunId) {
@@ -323,13 +731,22 @@ final class AguiSessionLogAttach {
         return frames;
     }
 
-    private static List<AguiFramedEvent> frames(List<AguiEvent> events, long cursor) {
+    private static List<AguiFramedEvent> frames(
+            List<AguiEvent> events, long sourceSeq, boolean cursored) {
         List<AguiFramedEvent> frames = new ArrayList<>(events.size());
         for (int i = 0; i < events.size(); i++) {
-            long seq = i == events.size() - 1 ? cursor : -1;
-            frames.add(new AguiFramedEvent(seq, events.get(i)));
+            long seq = cursored && i == events.size() - 1 ? sourceSeq : -1;
+            frames.add(new AguiFramedEvent(seq, sourceSeq, events.get(i)));
         }
         return frames;
+    }
+
+    /**
+     * A streamed chunk is not a replay boundary: its frames must not advance the SSE cursor, so a
+     * reconnecting client resumes from a whole message instead of the middle of one.
+     */
+    private static boolean cursored(String type) {
+        return !"model/chunk".equals(type);
     }
 
     private static void emitFrames(FluxSink<AguiFramedEvent> sink, List<AguiFramedEvent> frames) {
@@ -357,6 +774,10 @@ final class AguiSessionLogAttach {
 
     private static final class AttachState {
         private long cursor;
+
+        /** Whether an event of the target run has been projected since the cursor. */
+        private boolean targetSeen;
+
         private final AguiSessionPresentation presentation;
 
         private AttachState(long cursor, AguiSessionPresentation presentation) {

@@ -22,13 +22,14 @@ import io.agentscope.core.session.SessionLog;
 import reactor.core.publisher.Flux;
 
 /**
- * Replays a {@link SessionLog} as AG-UI events, for callers that resolve the log themselves.
+ * Reconnects a client to a {@link SessionLog}-backed run, for callers that resolve the log
+ * themselves.
  *
  * <p>This is the entry point for applications whose AG-UI agent registry does not expose a
  * {@code HarnessAgent}, for example when a placeholder agent delegates execution to custom code.
- * It performs a pure replay after the caller-supplied cursor: it never starts or resumes an Agent
- * run and never builds a message snapshot. The application must supply the conversation history
- * up to the same cursor.
+ * It never starts or resumes an Agent run, never calls a model and never writes to the log, so it
+ * is the reconnect path of an existing run: the same cursor yields the same events. The
+ * application supplies the conversation history up to that cursor.
  *
  * @see AguiRequestProcessor#attach(io.agentscope.core.agui.runtime.AguiRuntimeContextRequest)
  */
@@ -37,7 +38,7 @@ public final class AguiSessionLogReplay {
     private AguiSessionLogReplay() {}
 
     /**
-     * Replays committed session events after a cursor.
+     * Reconnects to a run, following the session log after the cursor.
      *
      * @param input the AG-UI input; only {@code threadId}, {@code runId} and {@code tools} are used
      * @param log the session log to observe
@@ -45,9 +46,9 @@ public final class AguiSessionLogReplay {
      * @param executionRunId the session log execution run id, or {@code null} to follow any active
      *     run
      * @param config the adapter config controlling replay detail
-     * @return framed AG-UI replay events, ending when the run finishes
+     * @return framed AG-UI reconnect events, ending when the run finishes
      */
-    public static Flux<AguiFramedEvent> replay(
+    public static Flux<AguiFramedEvent> attach(
             RunAgentInput input,
             SessionLog log,
             long after,

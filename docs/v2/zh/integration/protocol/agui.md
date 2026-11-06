@@ -11,11 +11,13 @@ en_link: /v2/en/integration/protocol/agui
 
 `AguiMessage.content` 现在使用类型化消息内容表示。仅处理纯文本时，请使用 `getTextContent()`。
 
-多模态输入支持 text、image、audio 和 video。暂不支持 document 输入：adapter 会通过 `RUN_ERROR` 拒绝请求，错误码为 `INVALID_INPUT_ERROR`，错误信息不包含文档来源或 metadata。
+多模态输入支持 image/audio/video/document。document part 会转换为 `DocumentBlock`；无法消费文档的模型提供方会返回错误，而不是静默丢弃内容。
 
-这一保护仅针对 `RUN_ERROR` 的错误消息，不针对整个事件流。此前的 `RUN_STARTED.input` 保留原始请求，包括被拒绝的文档内容。记录日志或转发事件的使用方需要自行对敏感输入脱敏。
+`RUN_STARTED.input` 会保留原始请求，记录日志或转发事件的使用方需要自行对敏感输入脱敏。
 
-`AguiMessageConverter.toAguiMessageList()` 会把包含多个 `ToolResultBlock` 的 TOOL `Msg` 展开成每个 tool result 一条 AG-UI tool message。`toAguiMessage()` 仅用于最多一个 tool result 的消息，多结果时会拒绝；需要展开结果时请使用 `toAguiMessages()`。目前仍只保留文本和工具调用字段；image、audio、video、document 内容块不会被序列化回 AG-UI message content。
+`AguiMessageConverter.toAguiMessageList()` 会把包含多个 `ToolResultBlock` 的 TOOL `Msg` 展开成每个 tool result 一条 AG-UI tool message。`toAguiMessage()` 仅用于最多一个 tool result 的消息，多结果时会拒绝；需要展开结果时请使用 `toAguiMessages()`。
+
+出站方向会把带 URL 的 `ImageBlock` / `AudioBlock` / `VideoBlock` / `DocumentBlock` 序列化为 AG-UI `MessageContent.Blocks`（`image` / `audio` / `video` / `document`），带 URL 的 `DataBlock` 会按解析出的 MIME 类型路由。目前出站会跳过 Base64 媒体来源。
 
 ## 何时使用
 
@@ -131,14 +133,14 @@ AG-UI 恢复路径是 AgentScope 扩展，不属于 AG-UI 协议。标准 `/agui
 
 ### attach 做什么
 
-attach 是只读观察者：不启动、不继续、不中断 Agent，也不发送消息快照。
+attach 是已有 run 的重连路径。它是只读观察者：不启动、不继续、不中断 Agent，不调用模型，也不写会话日志。同一个游标始终得到相同的事件，因此重复重连是安全的。
 
-- 检查 session head；head 前进时才读取游标之后的已提交事件。
-- run 仍在执行时，轮询后续提交直到 `run/end`。
-- run 已结束时，排空可用尾部后结束；
+- 回放游标之后的已提交事件，并把每个 committed 事件的游标写入最后一帧的 SSE `id`。
+- run 仍在执行时，attach 通过轮询跟随会话日志。速度较慢，但结果始终正确。
+- run 已结束时，排空剩余事件并以 `RUN_FINISHED` / `RUN_ERROR` 结束。
 - 游标之后的文本和工具输出映射为 `TEXT_MESSAGE_*`、`REASONING_MESSAGE_*`、`TOOL_CALL_*`、`RUN_*`；
 - 已经在应用历史中的工具调用不会重新 Start；后续结果以 `TOOL_CALL_RESULT` 关联已有 toolCallId；
-- 每个 committed 事件产生的最后一帧把游标写入 SSE `id`。
+- `RUN_STARTED` 由已提交的 `run/start` 事件产生，游标越过它时不会再次宣告新 run。
 
 游标是原生 `SessionEvent.seq()`，不是 AG-UI 字段，也不能与其他会话或 Service SSE 游标混用。
 
@@ -153,7 +155,7 @@ attach 是只读观察者：不启动、不继续、不中断 Agent，也不发�
 ### 限制
 
 - 完成态和 HITL 属于应用层历史/状态，不在本次恢复契约内。
-- 恢复路径基于轮询，没有推送。
+- 恢复路径基于轮询，提交批次按 recorder flush 粒度到达。
 - 运行必须能在浏览器请求断开后继续；使用 `AgentSession` 或 `interrupt-on-disconnect=false` + 长期存活的 Agent。
 - 服务端重启需要 `AgentSession`/持久化调度；内存中的订阅不会存活。
 - 多实例需要共享 `SessionLogStore` 与 namespace。
