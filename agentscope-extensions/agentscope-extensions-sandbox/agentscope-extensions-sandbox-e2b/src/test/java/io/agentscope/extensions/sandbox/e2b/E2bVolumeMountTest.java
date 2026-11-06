@@ -26,6 +26,7 @@ import io.agentscope.harness.agent.sandbox.Sandbox;
 import io.agentscope.harness.agent.sandbox.SandboxException;
 import io.agentscope.harness.agent.sandbox.SandboxState;
 import io.agentscope.harness.agent.sandbox.WorkspaceSpec;
+import io.agentscope.harness.agent.sandbox.layout.BindMountEntry;
 import java.util.Collections;
 import java.util.List;
 import okhttp3.mockwebserver.MockResponse;
@@ -171,7 +172,7 @@ class E2bVolumeMountTest {
         E2bSandboxClientOptions onVolume = new E2bSandboxClientOptions();
         onVolume.setWorkspaceRoot("/mnt/data/ws");
         onVolume.addVolumeMount("vol-a", "/mnt/data");
-        Sandbox s = client.create(workspaceSpec("/mnt/data/ws"), null, onVolume);
+        Sandbox s = client.create(workspaceSpec(), null, onVolume);
         E2bSandboxState st = (E2bSandboxState) s.getState();
         assertTrue(st.isWorkspaceOnVolume());
         assertEquals(List.of(new E2bVolumeMount("vol-a", "/mnt/data")), st.getVolumeMounts());
@@ -180,8 +181,7 @@ class E2bVolumeMountTest {
         offVolume.setWorkspaceRoot("/home/user");
         offVolume.addVolumeMount("vol-a", "/mnt/data");
         E2bSandboxState st2 =
-                (E2bSandboxState)
-                        client.create(workspaceSpec("/home/user"), null, offVolume).getState();
+                (E2bSandboxState) client.create(workspaceSpec(), null, offVolume).getState();
         assertFalse(st2.isWorkspaceOnVolume());
     }
 
@@ -279,21 +279,19 @@ class E2bVolumeMountTest {
     @Test
     void createRejectsRelativeWorkspaceRoot() {
         E2bSandboxClient client = new E2bSandboxClient();
+        E2bSandboxClientOptions relative = new E2bSandboxClientOptions();
+        relative.setWorkspaceRoot("relative/ws");
         SandboxException.SandboxConfigurationException e =
                 assertThrows(
                         SandboxException.SandboxConfigurationException.class,
-                        () ->
-                                client.create(
-                                        workspaceSpec("relative/ws"),
-                                        null,
-                                        new E2bSandboxClientOptions()));
+                        () -> client.create(workspaceSpec(), null, relative));
         assertTrue(e.getMessage().contains("workspaceRoot"), e.getMessage());
     }
 
     @Test
     void tarCommandQuotesExcludeArgs() throws Exception {
         E2bSandboxState state = new E2bSandboxState();
-        state.setWorkspaceSpec(workspaceSpec("/home/user"));
+        state.setWorkspaceSpec(workspaceSpec());
         state.setWorkspaceRoot("/home/user");
         state.setVolumeMounts(List.of(new E2bVolumeMount("vol-a", "/home/user/my data")));
         E2bSandbox sandbox = new E2bSandbox(state, options());
@@ -306,12 +304,42 @@ class E2bVolumeMountTest {
         assertTrue(
                 script.contains("'--exclude=./my data'"),
                 "exclude with spaces must be shell-quoted, got: " + script);
+        String extract = (String) m.invoke(sandbox, false, "/tmp/ws.tar", "/home/user");
+        assertTrue(
+                extract.contains("'--exclude=./my data'"),
+                "volume excludes must apply to the -xf branch too, got: " + extract);
+    }
+
+    @Test
+    void tarCommandQuotesBindMountExcludeArgs() throws Exception {
+        E2bSandboxState state = new E2bSandboxState();
+        WorkspaceSpec ws = workspaceSpec();
+        BindMountEntry bind = new BindMountEntry();
+        bind.setHostPath("/host/shared dir");
+        bind.setReadOnly(false);
+        ws.getEntries().put("my shares", bind);
+        state.setWorkspaceSpec(ws);
+        state.setWorkspaceRoot("/home/user");
+        E2bSandbox sandbox = new E2bSandbox(state, options());
+
+        java.lang.reflect.Method m =
+                E2bSandbox.class.getDeclaredMethod(
+                        "buildTarCommand", boolean.class, String.class, String.class);
+        m.setAccessible(true);
+        String script = (String) m.invoke(sandbox, true, "/tmp/ws.tar", "/home/user");
+        assertTrue(
+                script.contains("'--exclude=./my shares'"),
+                "bind-mount exclude with spaces must be shell-quoted, got: " + script);
+        String extract = (String) m.invoke(sandbox, false, "/tmp/ws.tar", "/home/user");
+        assertTrue(
+                extract.contains("'--exclude=./my shares'"),
+                "bind-mount excludes must be quoted on the -xf branch too, got: " + extract);
     }
 
     @Test
     void workspaceOnVolumeBranchesAreNoOpsWithoutEnvd() throws Exception {
         E2bSandboxState state = new E2bSandboxState();
-        state.setWorkspaceSpec(workspaceSpec("/mnt/data/ws"));
+        state.setWorkspaceSpec(workspaceSpec());
         state.setWorkspaceRoot("/mnt/data/ws");
         state.setVolumeMounts(List.of(new E2bVolumeMount("vol-a", "/mnt/data")));
         state.setWorkspaceOnVolume(true);
@@ -372,12 +400,8 @@ class E2bVolumeMountTest {
     }
 
     private static WorkspaceSpec workspaceSpec() {
-        return workspaceSpec("/tmp/agentscope-test-workspace");
-    }
-
-    private static WorkspaceSpec workspaceSpec(String root) {
         WorkspaceSpec ws = new WorkspaceSpec();
-        ws.setRoot(root);
+        ws.setRoot("/tmp/agentscope-test-workspace");
         return ws;
     }
 }

@@ -16,6 +16,11 @@
 package io.agentscope.harness.agent.filesystem.util;
 
 import io.agentscope.harness.agent.filesystem.model.EditResult;
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.CharsetDecoder;
+import java.nio.charset.CodingErrorAction;
+import java.nio.charset.StandardCharsets;
 import java.util.Set;
 
 /**
@@ -24,6 +29,16 @@ import java.util.Set;
 public final class FilesystemUtils {
 
     private FilesystemUtils() {}
+
+    /** Decode UTF-8 strictly, rejecting malformed or unmappable byte sequences. */
+    public static String decodeUtf8Strict(byte[] bytes) throws CharacterCodingException {
+        CharsetDecoder decoder =
+                StandardCharsets.UTF_8
+                        .newDecoder()
+                        .onMalformedInput(CodingErrorAction.REPORT)
+                        .onUnmappableCharacter(CodingErrorAction.REPORT);
+        return decoder.decode(ByteBuffer.wrap(bytes)).toString();
+    }
 
     private static final Set<String> BINARY_EXTENSIONS =
             Set.of(
@@ -69,13 +84,13 @@ public final class FilesystemUtils {
      *
      * <p>Both are rejected uniformly so all implementations behave identically: a {@code null}
      * {@code newString} is not a deletion (pass {@code ""} for that, which keeps the normal
-     * replacement semantics and occurrence count), and an empty {@code oldString} would make
-     * {@link #countOccurrences} loop forever.
+     * replacement semantics and occurrence count), and an empty {@code oldString} is invalid.
+     * {@link #countOccurrences} defensively treats an empty substring as zero matches.
      *
      * @return an {@link EditResult#fail} result when the arguments are invalid, otherwise
      *         {@code null} to signal that the edit may proceed
      */
-    public static EditResult validateEditArguments(String filePath, String oldStr, String newStr) {
+    public static EditResult validateEditArguments(String oldStr, String newStr) {
         if (oldStr == null || oldStr.isEmpty()) {
             return EditResult.fail("Error: oldString must not be null or empty");
         }
@@ -92,16 +107,15 @@ public final class FilesystemUtils {
      *
      * @return {@code Object[]} of {@code [newContent, occurrenceCount]} on success, or a
      *         single-element array {@code [errorMessage]} on failure
-     * @deprecated superseded by {@link #stringReplacement(String, String, String, boolean)},
-     *     which returns the same result as a typed value. {@code agentscope-harness} is
-     *     published to Maven Central and this method shipped with the {@code Object[]}
-     *     signature in v2.0.1-v2.0.3, so the old signature is retained as a source/binary
-     *     compatibility bridge for downstream callers.
+     * @deprecated superseded by {@link #stringReplacement(String, String, String, boolean)}.
+     *     This compatibility bridge preserves the exact string-matching behavior of the
+     *     published v2.0.1-v2.0.3 implementation, including line endings. The typed method
+     *     normalizes CRLF/lone-CR to LF.
      */
     @Deprecated
     public static Object[] performStringReplacement(
             String content, String oldString, String newString, boolean replaceAll) {
-        ReplacementResult result = stringReplacement(content, oldString, newString, replaceAll);
+        ReplacementResult result = replaceExact(content, oldString, newString, replaceAll);
         if (!result.isSuccess()) {
             return new Object[] {result.error()};
         }
@@ -111,11 +125,44 @@ public final class FilesystemUtils {
     /**
      * Perform string replacement with occurrence validation.
      *
+     * <p>Line endings are normalized to {@code \n} on the content and on both patterns first, so
+     * a caller need not care whether the file uses CRLF or lone CR. The returned content is
+     * therefore always LF-terminated: on a Unix-style filesystem CRLF is a defect worth removing,
+     * and every implementation must agree on this or the same edit would match on one backend and
+     * not on another.
+     *
      * @return {@link ReplacementResult#success(String, int)} on success, or
      *         {@link ReplacementResult#error(String)} on failure
      */
     public static ReplacementResult stringReplacement(
             String content, String oldString, String newString, boolean replaceAll) {
+        if (oldString == null || oldString.isEmpty()) {
+            return ReplacementResult.error("Error: oldString must not be null or empty");
+        }
+        if (newString == null) {
+            return ReplacementResult.error(
+                    "Error: newString must not be null; pass an empty string to delete the"
+                            + " matched text");
+        }
+        String normalizedContent = normalizeLineEndings(content);
+        String normalizedOld = normalizeLineEndings(oldString);
+        String normalizedNew = normalizeLineEndings(newString);
+
+        return replaceExact(normalizedContent, normalizedOld, normalizedNew, replaceAll);
+    }
+
+    /** Exact-string replacement used by the deprecated compatibility bridge. */
+    private static ReplacementResult replaceExact(
+            String content, String oldString, String newString, boolean replaceAll) {
+        if (oldString == null || oldString.isEmpty()) {
+            return ReplacementResult.error("Error: oldString must not be null or empty");
+        }
+        if (newString == null) {
+            return ReplacementResult.error(
+                    "Error: newString must not be null; pass an empty string to delete the"
+                            + " matched text");
+        }
+
         int occurrences = countOccurrences(content, oldString);
 
         if (occurrences == 0) {
@@ -146,8 +193,19 @@ public final class FilesystemUtils {
         return ReplacementResult.success(newContent, occurrences);
     }
 
-    /** Count non-overlapping occurrences of a substring. */
+    /** Normalize CRLF and lone CR to LF. */
+    private static String normalizeLineEndings(String text) {
+        if (text.indexOf('\r') < 0) {
+            return text;
+        }
+        return text.replace("\r\n", "\n").replace("\r", "\n");
+    }
+
+    /** Count non-overlapping occurrences of a substring; an empty substring has zero matches. */
     public static int countOccurrences(String text, String sub) {
+        if (sub == null || sub.isEmpty()) {
+            return 0;
+        }
         int count = 0;
         int idx = 0;
         while ((idx = text.indexOf(sub, idx)) >= 0) {

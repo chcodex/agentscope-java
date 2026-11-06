@@ -56,6 +56,8 @@ HarnessAgent agent = HarnessAgent.builder()
 | `addSharedPrefix(String)` | Route additional workspace-relative prefixes to the KV (e.g. `"prompts/"`, `"configs/"`) | none |
 | `workspaceIndex(WorkspaceIndex)` | SQLite index to accelerate remote ls/glob/grep | none (falls back to full store scan) |
 
+`WorkspaceIndex.open(workspaceRoot)` returns `null` when the optional local index cannot initialize, for example if `.index/workspace.db` is corrupt. It closes any connection acquired during that failed attempt, so callers can fall back to remote scans without retaining the failed connection. A successfully returned index keeps its connection until `close()` is called.
+
 #### Built-in routing rules
 
 The framework automatically routes the following paths to the shared KV, each in its own namespace segment to prevent key collisions:
@@ -516,11 +518,17 @@ The four-layer priority is unchanged (low â†’ high): `projectGlobalSkillsDir` â†
 
 All file tools call through the `AbstractFilesystem` interface, passing the current `RuntimeContext` on every operation. The filesystem implementation decides the actual read/write location. Agent code is completely unaware of the mode.
 
+`read_file` bounds each response to 16,000 Unicode code points by default, even when `limit` is omitted or a single line is very long. Set the optional `max_chars` to request a different page size (hard maximum: 32,000). `offset` and `limit` still select lines; `char_offset` selects a character page **within that same line selection**, starting at zero. When truncated, the result supplies the next `char_offset`: keep the same path, `offset`, and `limit` to continue. Unicode surrogate pairs are never split. Read a stable file when assembling multiple pages; offsets do not identify an immutable snapshot.
+
+This also bounds reads of offloaded tool artifacts. These limits apply to tool output for all filesystem backends; they do not bound the backend's allocation or I/O when producing the selected content. Binary content is paged as its encoded text and must be reassembled before decoding.
+
 | Mode | Read/write behavior |
 |------|-------------------|
 | Local | `OverlayFilesystem`: writes land in workspace (upper); reads check workspace first, then project (lower). With `projectWritable(true)`, non-metadata writes are routed to the project directory |
 | Shared store | `CompositeFilesystem`: routed paths go through KV overlay (remote upper + local template lower); others go local |
 | Sandbox | All file operations forwarded into the sandbox container |
+
+`edit_file` requires a non-empty `oldString` and a non-null `newString`; pass `""` as `newString` to delete the matched text. Replacement normalizes CRLF and lone-CR line endings to LF before matching and writes the edited content with LF line endings, consistently across filesystem modes.
 
 ### Shell execution (execute)
 

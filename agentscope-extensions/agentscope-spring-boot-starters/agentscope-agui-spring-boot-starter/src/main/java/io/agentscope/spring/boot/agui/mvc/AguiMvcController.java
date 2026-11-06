@@ -28,6 +28,7 @@ import io.agentscope.core.agui.runtime.AguiRuntimeContextResolver;
 import io.agentscope.spring.boot.agui.common.DefaultAgentResolver;
 import io.agentscope.spring.boot.agui.common.ThreadSessionManager;
 import jakarta.servlet.http.HttpServletRequest;
+import java.io.IOException;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -177,7 +178,14 @@ public class AguiMvcController {
                                 new BaseSubscriber<>() {
                                     @Override
                                     protected void hookOnNext(AguiEvent event) {
-                                        sendEvent(emitter, event);
+                                        if (sendEvent(emitter, event) || !interruptOnDisconnect) {
+                                            return;
+                                        }
+                                        logger.info(
+                                                "SSE event send failed for run {}, interrupting"
+                                                        + " agent",
+                                                runId);
+                                        interruptAndCancel(result, threadId, this);
                                     }
 
                                     @Override
@@ -300,32 +308,41 @@ public class AguiMvcController {
         return queryParams;
     }
 
-    private void sendEvent(SseEmitter emitter, AguiEvent event) {
+    private boolean sendEvent(SseEmitter emitter, AguiEvent event) {
+        String jsonData = encoder.encodeToJson(event);
         try {
-            String jsonData = encoder.encodeToJson(event);
             emitter.send(SseEmitter.event().data(jsonData, MediaType.APPLICATION_JSON));
-        } catch (Exception e) {
-            // The emitter may already be completed (client disconnected). Sending must never
-            // throw into the subscriber: that would cancel the upstream run and stop the agent
-            // even when interrupt-on-disconnect is disabled.
-            logger.debug("Failed to send SSE event (emitter likely completed): {}", e.getMessage());
+            return true;
+        } catch (IOException | IllegalStateException e) {
+            logger.debug("Failed to send SSE event: {}", e.getMessage());
+            return false;
         }
     }
 
     private void sendErrorAndComplete(
             SseEmitter emitter, String threadId, String runId, String errorMessage) {
         try {
-            String safeMessage = errorMessage != null ? errorMessage : "run error";
             String errorJson =
                     encoder.encodeToJson(
-                            new AguiEvent.Raw(threadId, runId, Map.of("error", safeMessage)));
+                            new AguiEvent.Raw(
+                                    threadId,
+                                    runId,
+                                    Map.of(
+                                            "error",
+                                            errorMessage != null
+                                                    ? errorMessage
+                                                    : "Unknown error")));
             String finishJson = encoder.encodeToJson(new AguiEvent.RunFinished(threadId, runId));
             emitter.send(SseEmitter.event().data(errorJson, MediaType.APPLICATION_JSON));
             emitter.send(SseEmitter.event().data(finishJson, MediaType.APPLICATION_JSON));
             emitter.complete();
         } catch (Exception e) {
-            // The emitter may already be completed; completing it again is a no-op here.
             logger.debug("Failed to send error event: {}", e.getMessage());
+            try {
+                emitter.completeWithError(e);
+            } catch (Exception ex) {
+                logger.debug("Failed to complete emitter with error: {}", ex.getMessage());
+            }
         }
     }
 

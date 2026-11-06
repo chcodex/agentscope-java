@@ -19,9 +19,12 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.agentscope.harness.agent.filesystem.model.EditResult;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.StandardCharsets;
 import org.junit.jupiter.api.Test;
 
 class FilesystemUtilsTest {
@@ -79,6 +82,107 @@ class FilesystemUtilsTest {
     }
 
     // ================================================================
+    // Line-ending normalization — shared by all filesystem implementations
+    // ================================================================
+
+    @Test
+    void stringReplacement_matchesAcrossCrLf() {
+        FilesystemUtils.ReplacementResult r =
+                FilesystemUtils.stringReplacement("a\r\nb\r\nc", "a\nb", "x", false);
+
+        assertTrue(r.isSuccess(), "a CRLF file must match an LF pattern: " + r.error());
+        assertEquals(1, r.occurrences());
+    }
+
+    @Test
+    void stringReplacement_matchesAcrossLoneCr() {
+        FilesystemUtils.ReplacementResult r =
+                FilesystemUtils.stringReplacement("a\rb\rc", "a\nb", "x", false);
+
+        assertTrue(r.isSuccess());
+        assertEquals(1, r.occurrences());
+    }
+
+    @Test
+    void stringReplacement_normalizesCrlfPatternGivenByCaller() {
+        FilesystemUtils.ReplacementResult r =
+                FilesystemUtils.stringReplacement("a\nb", "a\r\nb", "x", false);
+
+        assertTrue(r.isSuccess(), "a CRLF pattern must match an LF file: " + r.error());
+        assertEquals(1, r.occurrences());
+    }
+
+    @Test
+    void stringReplacement_writesBackLfOnly() {
+        FilesystemUtils.ReplacementResult r =
+                FilesystemUtils.stringReplacement("keep\r\nthis\r\nx\r\n", "x", "y", false);
+
+        assertTrue(r.isSuccess());
+        // CRLF is normalized away on a Unix-style filesystem, matching LocalFilesystem's
+        // long-standing behavior so all three implementations agree.
+        assertEquals("keep\nthis\ny\n", r.content());
+        assertFalse(r.content().contains("\r"));
+    }
+
+    @Test
+    void stringReplacement_replaceAll_countsAcrossMixedLineEndings() {
+        // CRLF, LF and a lone CR in one content: all three must count as the same separator,
+        // so the caller gets the same occurrence count on every filesystem.
+        FilesystemUtils.ReplacementResult r =
+                FilesystemUtils.stringReplacement("a\r\na\ra\na", "a\na", "-", true);
+
+        assertTrue(r.isSuccess());
+        // 4 separators-joined 'a' pairs, but occurrences are counted non-overlapping
+        assertEquals(2, r.occurrences());
+        assertEquals("-\n-", r.content());
+    }
+
+    @Test
+    void stringReplacement_multipleAcrossCrLf_preservesOccurrenceGuard() {
+        // The >1 guard must fire on CRLF content exactly as it does on LF content, otherwise the
+        // same edit would be accepted on one backend and rejected on another.
+        FilesystemUtils.ReplacementResult r =
+                FilesystemUtils.stringReplacement("a\r\na", "a", "x", false);
+
+        assertFalse(r.isSuccess());
+        assertTrue(r.error().contains("2 times"));
+    }
+
+    @Test
+    void stringReplacement_lfOnlyFileIsUnchangedSemantics() {
+        FilesystemUtils.ReplacementResult r =
+                FilesystemUtils.stringReplacement("Hello World", "World", "Java", false);
+
+        assertTrue(r.isSuccess());
+        assertEquals("Hello Java", r.content());
+    }
+
+    @Test
+    void stringReplacement_rejectsEmptyOldStringDirectly() {
+        FilesystemUtils.ReplacementResult r =
+                FilesystemUtils.stringReplacement("content", "", "replacement", false);
+
+        assertFalse(r.isSuccess());
+        assertTrue(r.error().contains("oldString must not be null or empty"));
+    }
+
+    @Test
+    void countOccurrences_emptySubstringReturnsZero() {
+        assertEquals(0, FilesystemUtils.countOccurrences("content", ""));
+    }
+
+    @Test
+    void decodeUtf8Strict_acceptsValidTextAndRejectsMalformedBytes()
+            throws CharacterCodingException {
+        assertEquals(
+                "héllo",
+                FilesystemUtils.decodeUtf8Strict("héllo".getBytes(StandardCharsets.UTF_8)));
+        assertThrows(
+                CharacterCodingException.class,
+                () -> FilesystemUtils.decodeUtf8Strict(new byte[] {'a', (byte) 0xFF, 'b'}));
+    }
+
+    // ================================================================
     // Deprecated bridge — the v2.0.1-v2.0.3 Object[] contract
     // ================================================================
 
@@ -108,6 +212,23 @@ class FilesystemUtilsTest {
 
     @SuppressWarnings("deprecation")
     @Test
+    void performStringReplacement_bridgePreservesExactLineEndingSemantics() {
+        String content = "first\r\nsecond\r\n";
+        Object[] exact =
+                FilesystemUtils.performStringReplacement(content, "first\nsecond", "x", false);
+        FilesystemUtils.ReplacementResult normalized =
+                FilesystemUtils.stringReplacement(content, "first\nsecond", "x", false);
+
+        // The bridge preserves behavior shipped in v2.0.x; the new typed API deliberately
+        // normalizes line endings. Do not silently change the published method's semantics.
+        assertEquals(1, exact.length);
+        assertTrue(((String) exact[0]).contains("String not found"));
+        assertTrue(normalized.isSuccess());
+        assertEquals("x\n", normalized.content());
+    }
+
+    @SuppressWarnings("deprecation")
+    @Test
     void performStringReplacement_bridge_agreesWithTypedResult() {
         for (String[] pair :
                 new String[][] {
@@ -133,18 +254,34 @@ class FilesystemUtilsTest {
         }
     }
 
+    @SuppressWarnings("deprecation")
+    @Test
+    void performStringReplacement_bridgeKeepsPublishedExactLineEndingBehavior() {
+        String content = "first\r\nsecond\r\n";
+        Object[] legacy =
+                FilesystemUtils.performStringReplacement(content, "first\nsecond", "x", false);
+
+        assertEquals(1, legacy.length);
+        assertTrue(((String) legacy[0]).contains("String not found"));
+
+        FilesystemUtils.ReplacementResult current =
+                FilesystemUtils.stringReplacement(content, "first\nsecond", "x", false);
+        assertTrue(current.isSuccess());
+        assertEquals("x\n", current.content());
+    }
+
     // ================================================================
     // validateEditArguments
     // ================================================================
 
     @Test
     void validateEditArguments_acceptsDeletionAsEmptyString() {
-        assertNull(FilesystemUtils.validateEditArguments("/f.txt", "World", ""));
+        assertNull(FilesystemUtils.validateEditArguments("World", ""));
     }
 
     @Test
     void validateEditArguments_rejectsNullNewString() {
-        EditResult r = FilesystemUtils.validateEditArguments("/f.txt", "World", null);
+        EditResult r = FilesystemUtils.validateEditArguments("World", null);
 
         assertNotNull(r);
         assertFalse(r.isSuccess());
@@ -154,11 +291,11 @@ class FilesystemUtilsTest {
 
     @Test
     void validateEditArguments_rejectsEmptyOrNullOldString() {
-        EditResult empty = FilesystemUtils.validateEditArguments("/f.txt", "", "x");
+        EditResult empty = FilesystemUtils.validateEditArguments("", "x");
         assertNotNull(empty);
         assertTrue(empty.error().contains("oldString must not be null or empty"));
 
-        EditResult nulled = FilesystemUtils.validateEditArguments("/f.txt", null, "x");
+        EditResult nulled = FilesystemUtils.validateEditArguments(null, "x");
         assertNotNull(nulled);
         assertTrue(nulled.error().contains("oldString must not be null or empty"));
     }

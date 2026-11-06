@@ -203,6 +203,23 @@ Model model = ModelRegistry.resolve("openai:gpt-4.1-mini", context);
 
 如果 `CachePolicy.ENABLED` 搭配 `option(...)` 或 `component(...)` 使用，用户必须提供 `cacheId`。
 
+调用 `registerFactory` 会清掉 model id 与新正则匹配的缓存实例，之后再解析这些 id 就会使用新工厂。被清掉的实例不会被关闭，因为调用方可能仍在使用。同一个可缓存 id 的并发首次解析只会创建一次，所有调用方拿到同一个实例。
+
+### 注册中心生命周期
+
+`unregister(name)` 移除 `register(name, model)` 创建的命名注册，返回被移除的实例；名称从未注册过则返回 `null`。
+
+这两个方法只改变注册中心的映射：调用方已持有的实例不受影响、继续可用，注册中心也不会关闭它们。
+
+`evictResolvedCache(ModelCreationContext, String modelId)` 清除 `resolve(...)` 缓存的实例：`context` 为 `null` 匹配所有缓存身份，`modelId` 为 `null`（或空白）匹配该身份下的所有 id，两者都提供时精确清除一条，两者都缺席则抛出异常。
+
+```java
+Model removed = ModelRegistry.unregister("my-gpt4o"); // 从未注册过则返回 null
+ModelRegistry.evictResolvedCache(null, "openai:gpt-4.1-mini"); // modelId 相等的所有条目
+ModelRegistry.evictResolvedCache(context, null); // 该 context 下的所有缓存条目
+ModelRegistry.evictResolvedCache(context, "openai:gpt-4.1-mini"); // 精确一条
+```
+
 ### ModelProvider SPI
 
 模型提供商扩展模块通过 Java SPI 暴露 `META-INF/services/io.agentscope.core.model.spi.ModelProvider`，由 `ModelRegistry` 自动发现。新的模型提供商可以实现 `supports(String, ModelCreationContext)` 和 `create(String, ModelCreationContext)` 来消费 context。简单模型提供商仍可只实现原有的 `supports(String)` 和 `create(String)`，因为 context-aware 方法提供了兼容默认实现。
@@ -340,6 +357,8 @@ model.stream(
 
 `ChatResponse` 包含若干 content block（`TextBlock`、`ThinkingBlock`、`ToolUseBlock`、`DataBlock`）以及记录 token 数与耗时的 `ChatUsage`。
 
+**参数优先级：**传给 `stream(messages, tools, options)` 的单次调用选项优先于 builder 的 `defaultOptions`；单次调用未设置的字段回退到模型默认值。这同样适用于 `toolChoice`：默认配置如 `Specific("get_weather")` 会约束每一次调用，只有调用方显式设置自己的 `toolChoice`（例如 `None`）才会覆盖。对 Gemini 而言，只要请求声明了工具，有效的 toolChoice 就会投影为请求中的 `toolConfig`（`Specific` → `mode=ANY` 加 `allowedFunctionNames`；`None` → `mode=NONE`），因此默认配置与同值的单次配置产生一致的请求。
+
 实际开发中通常不需要直接调模型，而是通过 `ReActAgent` 调度；要直连模型做轻量调用时，推荐参考 `agentscope-examples/documentation/.../model/ModelRegistryExample.java`。
 
 ### 生成结构化输出
@@ -369,7 +388,7 @@ Msg msg =
 WeatherInfo info = msg.getStructuredData(WeatherInfo.class);
 ```
 
-实现细节：框架会基于目标 Class 生成输出 schema，按下文规则选择 Native 或 fallback 路径，解析 native JSON 响应或按 schema 校验 fallback 工具入参，并把结果挂到 `Msg.metadata` 的 `_structured_output` 字段，供 `getStructuredData(Class)` 直接反序列化。完整示例：`agentscope-examples/documentation/.../structuredoutput/StructuredOutputExample.java`。
+实现细节：框架会基于目标 Class 生成输出 schema，按下文规则选择 Native 或 fallback 路径，解析并按 schema 校验 native JSON 响应，或校验 fallback 工具入参，并把结果挂到 `Msg.metadata` 的 `_structured_output` 字段，供 `getStructuredData(Class)` 直接反序列化。完整示例：`agentscope-examples/documentation/.../structuredoutput/StructuredOutputExample.java`。
 
 #### 结构化输出路径选择
 
@@ -380,7 +399,9 @@ WeatherInfo info = msg.getStructuredData(WeatherInfo.class);
 | **Native** | `supportsNativeStructuredOutput() = true` | 通过 `response_format` + `json_schema` 让模型直接输出合规 JSON |
 | **Fallback**（默认） | `supportsNativeStructuredOutput() = false` | 注入 `generate_response` 合成工具，模型通过 tool call 返回结构化数据 |
 
-当 native 路径失败（如模型返回 400），框架会**自动降级**到 fallback 路径，无需用户干预。
+当 native 路径失败（例如提供商拒绝请求，或输出为空、不是合法 JSON、不符合 schema）时，框架会**自动降级**到 fallback 路径，无需用户干预。被拒绝的 native 响应不会保留在会话上下文中。
+
+Native 响应校验默认开启。如果提供商已保证 schema 合规，并希望避免客户端侧校验及其降级行为，可以使用 `ReActAgent.builder().validateStructuredOutput(false)` 显式关闭。
 
 Native structured output 默认不会强制 schema 进入 strict 模式。OpenAI 与 OpenAI Official
 厂商可以通过 `strictJsonSchema(true)` 显式开启；schema 内的 `strict` 值优先。

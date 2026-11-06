@@ -31,10 +31,7 @@ import io.agentscope.harness.agent.filesystem.model.LsResult;
 import io.agentscope.harness.agent.filesystem.model.ReadResult;
 import io.agentscope.harness.agent.filesystem.model.WriteResult;
 import io.agentscope.harness.agent.filesystem.util.FilesystemUtils;
-import java.nio.ByteBuffer;
 import java.nio.charset.CharacterCodingException;
-import java.nio.charset.CharsetDecoder;
-import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Base64;
@@ -50,11 +47,12 @@ import org.slf4j.LoggerFactory;
  * delegating
  * to shell commands via {@link #execute}. File listing, grep, and glob use standard Unix
  * commands. Read uses server-side commands for paginated access. Write delegates content
- * transfer to {@link #uploadFiles}. Edit runs a static inline Python script inside the sandbox
- * ({@code old}/{@code new} cross the boundary as files, the command line carries paths only),
- * falling back to download via {@link #downloadFiles}, Java replacement via
- * {@link io.agentscope.harness.agent.filesystem.util.FilesystemUtils}, and re-upload via
- * {@link #uploadFiles} when {@code python3} is unavailable.
+ * transfer to {@link #uploadFiles}. Edit runs a static inline Python script inside the sandbox,
+ * with {@code old}/{@code new} passed base64-encoded on the command line (that alphabet has no
+ * shell metacharacters, so user content cannot break out of its argument) and the target file
+ * itself never leaving the sandbox; it falls back to download via {@link #downloadFiles}, Java
+ * replacement via {@link FilesystemUtils#stringReplacement(String, String, String, boolean)},
+ * and re-upload via {@link #uploadFiles} when {@code python3} is unavailable.
  *
  * <p>Subclasses must implement:
  * <ul>
@@ -208,13 +206,15 @@ public abstract class BaseSandboxFilesystem implements AbstractSandboxFilesystem
     @Override
     public WriteResult write(RuntimeContext runtimeContext, String filePath, String content) {
         String escapedPath = FilesystemUtils.shellQuote(filePath);
+        // No "$(dirname ...)" here: the docker CLI on Windows hosts mangles arguments that
+        // contain double-quoted command substitution before the container shell sees them
+        // (upstream #3850), while an unquoted substitution would word-split parents that
+        // contain spaces. Compute the parent in Java and pass it as a single-quoted literal.
         String checkCmd =
                 "if [ -e "
                         + escapedPath
-                        + " ]; then echo 'EXISTS'; exit 1; fi; "
-                        + "mkdir -p \"$(dirname "
-                        + escapedPath
-                        + ")\" 2>&1";
+                        + " ]; then echo 'EXISTS'; exit 1; fi"
+                        + parentDirMkdir(filePath);
 
         ExecuteResponse checkResult = execute(runtimeContext, checkCmd, null);
         if (checkResult.exitCode() != null && checkResult.exitCode() != 0) {
@@ -273,6 +273,13 @@ public abstract class BaseSandboxFilesystem implements AbstractSandboxFilesystem
             except Exception as e:
                 result({"error": "read_failed", "detail": str(e)})
                 sys.exit(0)
+            # Same LF normalization as FilesystemUtils.stringReplacement, so the native path
+            # and the transfer fallback accept and reject exactly the same edits. The escapes
+            # are doubled: a text block would otherwise turn them into real CR/LF bytes and
+            # split the Python string literal across lines.
+            def norm(s):
+                return s.replace("\\r\\n", "\\n").replace("\\r", "\\n")
+            text, old, new = norm(text), norm(old), norm(new)
             if len(text) == 0:
                 result({"error": "empty"})
                 sys.exit(0)
@@ -289,8 +296,10 @@ public abstract class BaseSandboxFilesystem implements AbstractSandboxFilesystem
             # itself would break workspace symlinks) and stays on target's mount.
             # uuid4 keeps the temp name unique per edit even when concurrent edits
             # share a long-lived shell process (os.getpid() would not be unique).
+            # A hard process kill before os.replace can leave this uniquely named sibling
+            # behind; it is visible in directory listings and can enter a workspace snapshot.
+            # Do not sweep by age here: a slow concurrent edit could still own such a file.
             real = os.path.realpath(target)
-            st = os.stat(real)
             tmp_out = real + ".agentscope-edit-tmp-" + uuid.uuid4().hex
             try:
                 # Failure here (including a read-only directory that forbids creating
@@ -299,6 +308,10 @@ public abstract class BaseSandboxFilesystem implements AbstractSandboxFilesystem
                 # non-atomic copy fallback would reintroduce the truncate-on-failure
                 # risk. Java then retries via the transfer path, whose shell
                 # redirection needs only file write permission.
+                # stat and the write share this try so a target that disappears between
+                # the read above and this point maps to a write_failed result instead of
+                # an uncaught traceback.
+                st = os.stat(real)
                 with open(tmp_out, "wb") as f:
                     f.write(out_bytes)
                 os.chmod(tmp_out, st.st_mode)
@@ -315,6 +328,11 @@ public abstract class BaseSandboxFilesystem implements AbstractSandboxFilesystem
             """;
 
     private static final String EDIT_HEREDOC_DELIMITER = "__AGENTSCOPE_EDIT_PY__";
+
+    // Pre-encoded script for the single-line command form (no heredoc, no newlines in the
+    // shell command string). The base64 alphabet contains no shell metacharacters.
+    private static final String EDIT_SCRIPT_B64 =
+            Base64.getEncoder().encodeToString(EDIT_SCRIPT.getBytes(StandardCharsets.UTF_8));
 
     private static final String EDIT_RESULT_MARKER = "__RESULT__";
 
@@ -364,7 +382,10 @@ public abstract class BaseSandboxFilesystem implements AbstractSandboxFilesystem
      * preserved. The native path writes only via a same-directory temp file + atomic rename,
      * so a {@code write_failed} result means the file is unchanged; {@code edit()} then
      * retries through the transfer path, whose shell redirection needs only file write
-     * permission.
+     * permission. A hard kill between temp creation and rename can leave a uniquely named
+     * sibling temp file in the workspace. It may appear in listings or snapshots; the
+     * implementation does not sweep these because an age-based cleanup could race with a slow
+     * concurrent edit.
      *
      * @param runtimeContext per-call agent context; may be {@code null}
      * @param filePath path of the file to edit
@@ -381,7 +402,7 @@ public abstract class BaseSandboxFilesystem implements AbstractSandboxFilesystem
             String oldString,
             String newString,
             boolean replaceAll) {
-        EditResult invalid = FilesystemUtils.validateEditArguments(filePath, oldString, newString);
+        EditResult invalid = FilesystemUtils.validateEditArguments(oldString, newString);
         if (invalid != null) {
             return invalid;
         }
@@ -425,15 +446,15 @@ public abstract class BaseSandboxFilesystem implements AbstractSandboxFilesystem
         if (isPythonMissing(execResult)) {
             return editViaTransfer(runtimeContext, filePath, oldString, newString, replaceAll);
         }
-        String stripped = output.strip();
-        String excerpt = stripped.substring(0, Math.min(200, stripped.length()));
-        return EditResult.fail(
-                "Error editing file '"
-                        + filePath
-                        + "' (exitCode="
-                        + execResult.exitCode()
-                        + "): unexpected server response: "
-                        + excerpt);
+        // No __RESULT__ marker: the native command may have failed before Python started
+        // (e.g. heredoc mangled by the transport layer, shell syntax error). Fall back to
+        // the transfer path, which uses the filesystem REST API and is independent of shell.
+        log.warn(
+                "[sandbox-fs] native edit returned no result marker (exit={}), falling back"
+                        + " to transfer: {}",
+                execResult.exitCode(),
+                output.length() > 200 ? output.substring(0, 200) + "..." : output);
+        return editViaTransfer(runtimeContext, filePath, oldString, newString, replaceAll);
     }
 
     /**
@@ -450,20 +471,19 @@ public abstract class BaseSandboxFilesystem implements AbstractSandboxFilesystem
 
     private static String nativeEditCommand(
             String filePath, String oldString, String newString, boolean replaceAll) {
-        return "python3 - "
+        // Single-line command: the script travels as base64 inside a double-quoted Python -c
+        // argument, avoiding heredoc and multi-line shell syntax entirely. This makes the
+        // command robust against transport layers that mangle newlines or split arguments.
+        return "python3 -c \"exec(__import__('base64').b64decode(b'"
+                + EDIT_SCRIPT_B64
+                + "').decode())\" "
                 + FilesystemUtils.shellQuote(filePath)
                 + " "
                 + FilesystemUtils.shellQuote(encodeBase64(oldString))
                 + " "
                 + FilesystemUtils.shellQuote(encodeBase64(newString))
                 + " "
-                + (replaceAll ? "true" : "false")
-                + " <<'"
-                + EDIT_HEREDOC_DELIMITER
-                + "'\n"
-                + EDIT_SCRIPT
-                + EDIT_HEREDOC_DELIMITER
-                + "\n__ec=$?; exit $__ec";
+                + (replaceAll ? "true" : "false");
     }
 
     private static String encodeBase64(String value) {
@@ -544,16 +564,6 @@ public abstract class BaseSandboxFilesystem implements AbstractSandboxFilesystem
     /** The {@code __RESULT__} payload the sandbox script prints on a single line. */
     private record NativeScriptResult(String error, Integer count, String detail) {}
 
-    /** Decode bytes as UTF-8, failing on malformed input instead of substituting. */
-    private static String decodeUtf8Strict(byte[] bytes) throws CharacterCodingException {
-        CharsetDecoder decoder =
-                StandardCharsets.UTF_8
-                        .newDecoder()
-                        .onMalformedInput(CodingErrorAction.REPORT)
-                        .onUnmappableCharacter(CodingErrorAction.REPORT);
-        return decoder.decode(ByteBuffer.wrap(bytes)).toString();
-    }
-
     /**
      * Fallback when {@code python3} is unavailable: download, replace in Java, re-upload.
      *
@@ -571,7 +581,15 @@ public abstract class BaseSandboxFilesystem implements AbstractSandboxFilesystem
             boolean replaceAll) {
         List<FileDownloadResponse> downloaded = downloadFiles(runtimeContext, List.of(filePath));
         if (downloaded.isEmpty() || !downloaded.get(0).isSuccess()) {
-            return EditResult.fail("Error: File '" + filePath + "' not found");
+            // Distinguish "the backend could not read the file" (permissions, transport, a
+            // truncated response) from "the path does not exist": reporting a download failure
+            // as file_not_found sends the caller off to re-read a file it already has.
+            String cause = downloaded.isEmpty() ? "no response" : downloaded.get(0).error();
+            return EditResult.fail(
+                    "Error: Could not read file '"
+                            + filePath
+                            + "' for editing: "
+                            + (cause != null ? cause : "unknown error"));
         }
         byte[] contentBytes = downloaded.get(0).content();
         if (contentBytes == null || contentBytes.length == 0) {
@@ -582,7 +600,7 @@ public abstract class BaseSandboxFilesystem implements AbstractSandboxFilesystem
         // file it cannot represent.
         String content;
         try {
-            content = decodeUtf8Strict(contentBytes);
+            content = FilesystemUtils.decodeUtf8Strict(contentBytes);
         } catch (CharacterCodingException e) {
             return EditResult.fail(
                     "Error editing file '" + filePath + "': file is not valid UTF-8");
@@ -723,7 +741,9 @@ public abstract class BaseSandboxFilesystem implements AbstractSandboxFilesystem
         AbstractFilesystem.validatePath(toPath);
         String escapedFrom = FilesystemUtils.shellQuote(fromPath);
         String escapedTo = FilesystemUtils.shellQuote(toPath);
-        String cmd = "mkdir -p $(dirname " + escapedTo + ") && mv " + escapedFrom + " " + escapedTo;
+        String parent = quotedParentDir(toPath);
+        String mkdirPrefix = parent != null ? "mkdir -p " + parent + " 2>&1 && " : "";
+        String cmd = mkdirPrefix + "mv " + escapedFrom + " " + escapedTo;
         ExecuteResponse result = execute(runtimeContext, cmd, null);
         if (result.exitCode() != 0) {
             return WriteResult.fail(
@@ -755,6 +775,32 @@ public abstract class BaseSandboxFilesystem implements AbstractSandboxFilesystem
                         ? result.output()
                         : "exit code " + result.exitCode();
         return "Error " + operation + " '" + target + "': " + detail;
+    }
+
+    /**
+     * Builds the {@code mkdir -p} segment for the parent directory of {@code filePath}, or an
+     * empty string when the file sits at the filesystem root or in the current directory and
+     * needs no parent creation.
+     */
+    private static String parentDirMkdir(String filePath) {
+        String parent = quotedParentDir(filePath);
+        if (parent == null) {
+            return "";
+        }
+        return "; mkdir -p " + parent + " 2>&1";
+    }
+
+    /**
+     * Returns the shell-quoted parent directory of {@code filePath}, or {@code null} when the
+     * path sits at the filesystem root or in the current directory and no parent creation is
+     * needed.
+     */
+    private static String quotedParentDir(String filePath) {
+        int slash = filePath.lastIndexOf('/');
+        if (slash <= 0) {
+            return null;
+        }
+        return FilesystemUtils.shellQuote(filePath.substring(0, slash));
     }
 
     /**

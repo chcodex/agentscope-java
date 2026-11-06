@@ -95,13 +95,13 @@ public final class WorkspaceMountSupport {
                 || absoluteMountPaths.isEmpty()) {
             return List.of();
         }
-        String root = normalizeAbsolutePath(workspaceRoot);
+        String root = normalizeVirtualPath(workspaceRoot);
         List<String> args = new ArrayList<>();
         for (String raw : absoluteMountPaths) {
             if (raw == null || raw.isBlank()) {
                 continue;
             }
-            String mount = normalizeAbsolutePath(raw);
+            String mount = normalizeVirtualPath(raw);
             if (!mount.startsWith("/") || mount.equals(root) || !isBeneath(root, mount)) {
                 continue;
             }
@@ -117,10 +117,21 @@ public final class WorkspaceMountSupport {
         return mount.startsWith(root + "/");
     }
 
-    private static String normalizeAbsolutePath(String s) {
+    /**
+     * Shared normalizer for absolute POSIX paths used as sandbox workspace roots or mount paths:
+     * trims surrounding whitespace, converts backslashes to slashes, collapses repeated slashes
+     * and strips a trailing slash (except for the root {@code /} itself). Blank or empty input
+     * yields {@code /}.
+     *
+     * @param raw raw path (may be null or blank)
+     * @return normalized absolute path
+     */
+    public static String normalizeVirtualPath(String raw) {
         // Collapse repeated slashes first, then drop the (single) trailing slash: the other
         // order leaves a trailing slash behind for inputs like "//mnt//data//".
-        String normalized = stripTrailingSlash(s.replace('\\', '/').replaceAll("/+", "/"));
+        String normalized =
+                stripTrailingSlash(
+                        raw == null ? "" : raw.strip().replace('\\', '/').replaceAll("/+", "/"));
         return normalized.isEmpty() ? "/" : normalized;
     }
 

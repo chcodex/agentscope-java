@@ -29,6 +29,7 @@ import io.agentscope.harness.agent.filesystem.model.GlobResult;
 import io.agentscope.harness.agent.filesystem.model.GrepResult;
 import io.agentscope.harness.agent.filesystem.model.LsResult;
 import io.agentscope.harness.agent.filesystem.model.ReadResult;
+import io.agentscope.harness.agent.filesystem.model.WriteResult;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -67,12 +68,6 @@ class BaseSandboxFilesystemTest {
 
     @Nested
     class CannedResponseTests {
-
-        @Test
-        void getWorkspaceRoot_defaultsToWorkspace() {
-            FakeSandboxFilesystem filesystem = new FakeSandboxFilesystem();
-            assertEquals("/workspace", filesystem.getWorkspaceRoot());
-        }
 
         @Test
         void glob_recursivePattern_stripsDoubleStarPrefixBeforeFindName() {
@@ -290,15 +285,53 @@ class BaseSandboxFilesystemTest {
             assertEquals(1, result.occurrences());
             // no staging directory and no file transfer at all
             assertTrue(fs.uploadedFiles.isEmpty());
-            assertTrue(fs.lastCommand.contains("python3 - "));
+            assertTrue(fs.lastCommand.contains("python3 -c "));
             assertTrue(fs.lastCommand.contains("'/workspace/f.txt'"));
             assertTrue(fs.lastCommand.contains("'" + base64("World") + "'"));
             assertTrue(fs.lastCommand.contains("'" + base64("Java") + "'"));
-            assertTrue(fs.lastCommand.contains("__AGENTSCOPE_EDIT_PY__"));
-            // python's exit status must reach Java (else 127 never surfaces as a fallback)
+        }
+
+        // ==================== Command format: base64-encoded script avoids heredoc
+        // ====================
+
+        @Test
+        void edit_commandIsSingleLine_noHeredoc() {
+            FakeSandboxFilesystem filesystem = new FakeSandboxFilesystem();
+
+            filesystem.edit(RT, "/workspace/file.txt", "old", "new", false);
+
+            String cmd = filesystem.lastCommand;
             assertTrue(
-                    fs.lastCommand.contains("exit $__ec"),
-                    "exit code passthrough required: " + fs.lastCommand);
+                    cmd.startsWith("python3 -c "),
+                    "edit should use python3 -c with base64-encoded script");
+            assertFalse(cmd.contains("<<"), "command must not use heredoc syntax");
+            // The script travels as base64 inside the -c argument; the command string itself
+            // must be a single line so transport layers that mangle newlines cannot break it.
+            assertFalse(cmd.contains("\n"), "command must be a single line (no embedded newlines)");
+        }
+
+        @Test
+        void edit_executeFailure_shouldFallBackToTransfer() {
+            EditResult result =
+                    new FixedResponseFilesystem(sandboxRequestFailed())
+                            .edit(RT, "/workspace/file.txt", "old", "new", false);
+
+            assertFalse(result.isSuccess(), "edit should fail when transfer also fails");
+            assertTrue(
+                    result.error().contains("Could not read file"),
+                    "error should come from the transfer fallback, not the execute layer");
+        }
+
+        @Test
+        void edit_executeFailure_nullOutput_shouldFallBackToTransfer() {
+            EditResult result =
+                    new FixedResponseFilesystem(new ExecuteResponse(null, -1, false))
+                            .edit(RT, "/workspace/file.txt", "old", "new", false);
+
+            assertFalse(result.isSuccess(), "edit should fail when transfer also fails");
+            assertTrue(
+                    result.error().contains("Could not read file"),
+                    "error should come from the transfer fallback, not the execute layer");
         }
 
         @Test
@@ -464,7 +497,7 @@ class BaseSandboxFilesystemTest {
         }
 
         @Test
-        void edit_pythonMissing_transferDownloadFails_returnsFileNotFound() {
+        void edit_pythonMissing_transferDownloadFails_reportsReadFailureNotMissingFile() {
             EditSpyFilesystem fs = new EditSpyFilesystem();
             fs.withExecuteResult(new ExecuteResponse("python3: command not found", 127, false));
             fs.withDownloadResult(List.of());
@@ -472,7 +505,47 @@ class BaseSandboxFilesystemTest {
             EditResult result = fs.edit(RT, "/workspace/missing.txt", "old", "new", false);
 
             assertFalse(result.isSuccess());
-            assertTrue(result.error().contains("not found"));
+            // a failed download is not evidence that the file is absent
+            assertFalse(result.error().contains("not found"));
+            assertTrue(result.error().contains("Could not read file"));
+        }
+
+        @Test
+        void edit_pythonMissing_transferDownloadError_carriesCause() {
+            EditSpyFilesystem fs = new EditSpyFilesystem();
+            fs.withExecuteResult(new ExecuteResponse("python3: command not found", 127, false));
+            fs.withDownloadResult(
+                    List.of(FileDownloadResponse.fail("/workspace/f.txt", "permission denied")));
+
+            EditResult result = fs.edit(RT, "/workspace/f.txt", "old", "new", false);
+
+            assertFalse(result.isSuccess());
+            assertTrue(result.error().contains("Could not read file"));
+            assertTrue(
+                    result.error().contains("permission denied"), "underlying cause must survive");
+        }
+
+        @Test
+        void edit_native_statFailure_mapsToWriteFailedNotRawTraceback() {
+            // A target that vanishes between the script's read and its stat used to raise an
+            // uncaught OSError, so no __RESULT__ line was printed and Java reported
+            // "unexpected server response" instead of a mapped error.
+            EditSpyFilesystem fs = new EditSpyFilesystem();
+            fs.withExecuteResult(
+                    new ExecuteResponse(
+                            "Traceback (most recent call last):\n  FileNotFoundError: '/gone.txt'"
+                                    + "\n__RESULT__{\"error\": \"write_failed\", \"detail\":"
+                                    + " \"[Errno 2] No such file or directory\"}\n",
+                            0,
+                            false));
+            fs.withDownloadResult(
+                    List.of(FileDownloadResponse.success("/gone.txt", "Hello".getBytes())));
+
+            EditResult result = fs.edit(RT, "/gone.txt", "Hello", "Hi", false);
+
+            // write_failed is treated as "target untouched", so the transfer path retries
+            assertTrue(result.isSuccess(), "write_failed should degrade: " + result.error());
+            assertEquals(1, result.occurrences());
         }
 
         @Test
@@ -644,6 +717,89 @@ class BaseSandboxFilesystemTest {
 
             assertFalse(result.isSuccess());
             assertTrue(result.error().contains("not-json{{"));
+        }
+
+        // ==================== Bug reproduction: double-quoted "$(dirname ...)" breaks docker
+        // exec on Windows hosts (#3850) ====================
+
+        @Test
+        void write_checkCommand_containsNoDoubleQuotesOrSubstitution() {
+            EditSpyFilesystem fs = new EditSpyFilesystem();
+
+            fs.write(RT, "/workspace/docs/new/notes.txt", "hello");
+
+            // The docker CLI on Windows hosts mangles arguments carrying double-quoted
+            // command substitution, so the check command must avoid the construct entirely.
+            assertFalse(
+                    fs.lastCommand.contains("\""),
+                    "double quotes break docker exec on Windows hosts: " + fs.lastCommand);
+            assertFalse(
+                    fs.lastCommand.contains("dirname"),
+                    "command substitution must not be used for the parent dir: " + fs.lastCommand);
+        }
+
+        @Test
+        void write_newNestedPath_mkdirsParentAsSingleQuotedLiteral() {
+            EditSpyFilesystem fs = new EditSpyFilesystem();
+
+            WriteResult result = fs.write(RT, "/workspace/my docs/new file.txt", "hello");
+
+            assertTrue(result.isSuccess(), "write should succeed: " + result.error());
+            assertTrue(
+                    fs.lastCommand.contains("mkdir -p '/workspace/my docs' 2>&1"),
+                    "parent with spaces must be created via a single-quoted literal: "
+                            + fs.lastCommand);
+        }
+
+        @Test
+        void write_rootLevelFile_needsNoParentMkdir() {
+            EditSpyFilesystem fs = new EditSpyFilesystem();
+
+            WriteResult result = fs.write(RT, "/notes.txt", "hello");
+
+            assertTrue(result.isSuccess(), "write should succeed: " + result.error());
+            assertFalse(
+                    fs.lastCommand.contains("mkdir"),
+                    "a root-level file needs no parent creation: " + fs.lastCommand);
+        }
+
+        @Test
+        void move_checkCommand_containsNoSubstitutionOrDoubleQuotes() {
+            EditSpyFilesystem fs = new EditSpyFilesystem();
+
+            fs.move(RT, "/workspace/docs/old.txt", "/workspace/docs/new/notes.txt");
+
+            assertFalse(
+                    fs.lastCommand.contains("dirname"),
+                    "command substitution must not be used for the parent dir: " + fs.lastCommand);
+            assertFalse(
+                    fs.lastCommand.contains("\""),
+                    "double quotes break docker exec on Windows hosts: " + fs.lastCommand);
+        }
+
+        @Test
+        void move_newNestedPath_mkdirsParentAsSingleQuotedLiteral() {
+            EditSpyFilesystem fs = new EditSpyFilesystem();
+
+            WriteResult result = fs.move(RT, "/tmp/src.txt", "/workspace/my docs/new file.txt");
+
+            assertTrue(result.isSuccess(), "move should succeed: " + result.error());
+            assertTrue(
+                    fs.lastCommand.startsWith("mkdir -p '/workspace/my docs' 2>&1 && mv "),
+                    "parent with spaces must be created via a single-quoted literal before mv: "
+                            + fs.lastCommand);
+        }
+
+        @Test
+        void move_rootLevelFile_needsNoParentMkdir() {
+            EditSpyFilesystem fs = new EditSpyFilesystem();
+
+            WriteResult result = fs.move(RT, "/tmp/src.txt", "/dst.txt");
+
+            assertTrue(result.isSuccess(), "move should succeed: " + result.error());
+            assertTrue(
+                    fs.lastCommand.startsWith("mv "),
+                    "a root-level target needs no parent creation: " + fs.lastCommand);
         }
     }
 
@@ -817,13 +973,13 @@ class BaseSandboxFilesystemTest {
 
             assertFalse(result.isSuccess());
             assertTrue(result.error().contains("appears"));
+            // an ambiguous replacement must leave the file untouched
+            assertEquals("foo bar foo baz foo", Files.readString(file));
         }
 
         @Test
-        void edit_pathContainingHeredocDelimiter_doesNotTruncateCommand() throws IOException {
-            // A newline inside the single-quoted target argument stays part of the argument: it
-            // does not terminate the command line, and the heredoc body is only read afterwards.
-            // So a path whose own line equals the delimiter cannot close the heredoc early.
+        void edit_pathContainingDelimiterString_stillWorks() throws IOException {
+            // The old heredoc delimiter appearing in a path must not break the command.
             Path dir = Files.createDirectory(tmpDir.resolve("dir__AGENTSCOPE_EDIT_PY__"));
             Path file = dir.resolve("f.txt");
             Files.writeString(file, "Hello World");
@@ -835,6 +991,104 @@ class BaseSandboxFilesystemTest {
                     result.isSuccess(),
                     "delimiter-shaped path should still edit: " + result.error());
             assertEquals("Hello Java", Files.readString(file));
+        }
+
+        // ==================== shell quoting edges — the file path is the last piece of
+        // user input that still passes through shell quoting ====================
+
+        @Test
+        void edit_pathContainingSingleQuote_editsTheRightFile() throws IOException {
+            Path file = tmpDir.resolve("it's a file.txt");
+            Files.writeString(file, "Hello World");
+            // A sibling whose name is one substitution away: if quoting broke, the edit could
+            // land here instead.
+            Path decoy = tmpDir.resolve("its a file.txt");
+            Files.writeString(decoy, "Hello World");
+
+            LocalShellSandboxFilesystem fs = new LocalShellSandboxFilesystem();
+            EditResult result = fs.edit(RT, file.toString(), "World", "Java", false);
+
+            assertTrue(result.isSuccess(), "single-quoted path should edit: " + result.error());
+            assertEquals("Hello Java", Files.readString(file));
+            assertEquals("Hello World", Files.readString(decoy), "decoy must be untouched");
+        }
+
+        @Test
+        void edit_pathContainingBacktick_doesNotTriggerCommandSubstitution() throws IOException {
+            Path file = tmpDir.resolve("`id`.txt");
+            Files.writeString(file, "Hello World");
+
+            LocalShellSandboxFilesystem fs = new LocalShellSandboxFilesystem();
+            EditResult result = fs.edit(RT, file.toString(), "World", "Java", false);
+
+            assertTrue(result.isSuccess(), "backtick path should edit: " + result.error());
+            assertEquals("Hello Java", Files.readString(file));
+        }
+
+        @Test
+        void edit_paramsEndingWithNewline_surviveEncodingAndHeredoc() throws IOException {
+            Path file = tmpDir.resolve("trailing.txt");
+            Files.writeString(file, "keep\nreplace me\n");
+
+            LocalShellSandboxFilesystem fs = new LocalShellSandboxFilesystem();
+            // old carries a trailing newline: a newline in a command argument would split the
+            // command into extra lines, so this pins the encoding end-to-end.
+            EditResult result = fs.edit(RT, file.toString(), "replace me\n", "done\n", false);
+
+            assertTrue(
+                    result.isSuccess(), "trailing-newline params should edit: " + result.error());
+            assertEquals(1, result.occurrences());
+            assertEquals("keep\ndone\n", Files.readString(file));
+        }
+
+        @Test
+        void edit_crlfFile_matchesLfPattern() throws IOException {
+            Path file = tmpDir.resolve("crlf.txt");
+            Files.writeString(file, "alpha\r\nbeta\r\ngamma\r\n");
+
+            LocalShellSandboxFilesystem fs = new LocalShellSandboxFilesystem();
+            EditResult result = fs.edit(RT, file.toString(), "beta", "BETA", false);
+
+            assertTrue(result.isSuccess(), "CRLF file must match an LF pattern: " + result.error());
+            assertEquals(1, result.occurrences());
+            assertEquals("alpha\nBETA\ngamma\n", Files.readString(file));
+        }
+
+        @Test
+        void edit_crlf_parityBetweenNativeAndFallback() throws IOException {
+            // The native path and the transfer fallback must accept and reject the same edits;
+            // otherwise an edit succeeds only when python3 happens to be present.
+            Path nativeFile = tmpDir.resolve("crlf-native.txt");
+            Files.writeString(nativeFile, "one\r\ntwo\r\n");
+            EditResult nativeResult =
+                    new LocalShellSandboxFilesystem()
+                            .edit(RT, nativeFile.toString(), "two", "2", false);
+
+            Path fallbackFile = tmpDir.resolve("crlf-fallback.txt");
+            Files.writeString(fallbackFile, "one\r\ntwo\r\n");
+            EditResult fallbackResult =
+                    new LocalShellFallbackFilesystem(false)
+                            .edit(RT, fallbackFile.toString(), "two", "2", false);
+
+            assertTrue(nativeResult.isSuccess(), "native: " + nativeResult.error());
+            assertTrue(fallbackResult.isSuccess(), "fallback: " + fallbackResult.error());
+            assertEquals(nativeResult.occurrences(), fallbackResult.occurrences());
+            assertEquals(Files.readString(nativeFile), Files.readString(fallbackFile));
+        }
+
+        @Test
+        void edit_crlf_ambiguousOccurrenceStillRejected() throws IOException {
+            // The >1 guard must fire on CRLF content on the native path too, matching the
+            // shared replacement semantics.
+            Path file = tmpDir.resolve("crlf-multi.txt");
+            Files.writeString(file, "a\r\na\r\n");
+
+            LocalShellSandboxFilesystem fs = new LocalShellSandboxFilesystem();
+            EditResult result = fs.edit(RT, file.toString(), "a", "x", false);
+
+            assertFalse(result.isSuccess());
+            assertTrue(result.error().contains("2 times"));
+            assertEquals("a\r\na\r\n", Files.readString(file), "file must be untouched");
         }
 
         @Test
@@ -888,6 +1142,48 @@ class BaseSandboxFilesystemTest {
             assertFalse(Files.isSymbolicLink(link), "replacing upload replaces the link");
             assertEquals("Hello Java", Files.readString(link));
             assertEquals("Hello World", Files.readString(real), "original target untouched");
+        }
+
+        @Test
+        void write_pathWithSpaces_createsParentDirsAndWritesFile() throws IOException {
+            // Regression for #3850: the parent dir used to be created via double-quoted
+            // command substitution, which the docker CLI corrupts on Windows hosts. The
+            // single-quoted literal must survive real shell semantics, spaces included.
+            Path target = tmpDir.resolve("my docs/new file.txt");
+
+            WriteResult result =
+                    new LocalShellSandboxFilesystem().write(RT, target.toString(), "hello");
+
+            assertTrue(result.isSuccess(), "write with spaces should succeed: " + result.error());
+            assertEquals("hello", Files.readString(target));
+        }
+
+        @Test
+        void write_existingFile_failsWithExistsSignal() throws IOException {
+            Path target = tmpDir.resolve("exists.txt");
+            Files.writeString(target, "original");
+
+            WriteResult result =
+                    new LocalShellSandboxFilesystem().write(RT, target.toString(), "hello");
+
+            assertFalse(result.isSuccess());
+            assertTrue(result.error().contains("already exists"));
+            assertEquals("original", Files.readString(target), "existing file must be untouched");
+        }
+
+        @Test
+        void move_pathWithSpaces_createsParentDirsAndMovesFile() throws IOException {
+            Path source = tmpDir.resolve("source.txt");
+            Files.writeString(source, "hello");
+            Path target = tmpDir.resolve("my docs/new file.txt");
+
+            WriteResult result =
+                    new LocalShellSandboxFilesystem()
+                            .move(RT, source.toString(), target.toString());
+
+            assertTrue(result.isSuccess(), "move with spaces should succeed: " + result.error());
+            assertEquals("hello", Files.readString(target));
+            assertFalse(Files.exists(source), "source must be moved, not copied");
         }
 
         @Test

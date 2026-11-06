@@ -89,6 +89,100 @@ public final class JournalSessionLog implements SessionLog {
         return path("writer-seals/" + hash(owner.getBytes(StandardCharsets.UTF_8)) + ".json");
     }
 
+    private record Anchors(long lastCheckpointSeq, long lastRunStartSeq) {}
+
+    @Override
+    public long lastCheckpointSeq() {
+        return readAnchors().lastCheckpointSeq();
+    }
+
+    @Override
+    public long lastRunStartSeq() {
+        return readAnchors().lastRunStartSeq();
+    }
+
+    private Anchors readAnchors() {
+        var anchors = parseAnchors(storage.read(path("anchors.json")));
+        return anchors == null ? new Anchors(0, 0) : anchors;
+    }
+
+    /** Returns {@code null} when the anchor file is missing, unreadable, or not parseable. */
+    private static Anchors parseAnchors(AtomicSessionStorage.Value value) {
+        if (value == null) return null;
+        try {
+            return parse(value.bytes(), Anchors.class);
+        } catch (RuntimeException ignored) {
+            return null;
+        }
+    }
+
+    /**
+     * Rebuilds both anchors from the committed chain. Used only when {@code anchors.json} is
+     * missing or invalid, for example after upgrading an existing session: writing only the
+     * anchor from the current batch would drop the checkpoint that the batch does not mention.
+     */
+    private Anchors rebuildAnchors() {
+        long checkpoint = 0;
+        long runStart = 0;
+        var seen = new HashSet<String>();
+        for (String id = head().commitId(); id != null; ) {
+            if (!seen.add(id)) throw new SessionLogException("Commit chain cycle");
+            var stored = storage.read(path("commits/" + id + ".json"));
+            if (stored == null) throw new SessionLogException("Missing committed segment");
+            var commit = parse(stored.bytes(), Commit.class);
+            var events = commit.events();
+            for (int i = events.size() - 1; i >= 0; i--) {
+                var event = events.get(i);
+                if (checkpoint == 0
+                        && (event.type().equals("state/checkpoint")
+                                || event.type().equals("migration/baseline")
+                                || event.type().equals("state/restored"))) checkpoint = event.seq();
+                if (runStart == 0 && event.type().equals("run/start")) runStart = event.seq();
+                if (checkpoint > 0 && runStart > 0) return new Anchors(checkpoint, runStart);
+            }
+            id = commit.parent();
+        }
+        return new Anchors(checkpoint, runStart);
+    }
+
+    /**
+     * Advances the recovery anchors after a successful commit. Anchors are hints, so a failed
+     * update only makes the next recovery replay from an older point; it must never fail the
+     * commit itself.
+     */
+    private void updateAnchors(List<SessionEvent> events) {
+        long checkpoint = 0;
+        long runStart = 0;
+        for (var event : events) {
+            switch (event.type()) {
+                case "state/checkpoint", "migration/baseline", "state/restored" ->
+                        checkpoint = Math.max(checkpoint, event.seq());
+                case "run/start" -> runStart = Math.max(runStart, event.seq());
+                default -> {}
+            }
+        }
+        if (checkpoint == 0 && runStart == 0) return;
+        try {
+            for (int i = 0; i < 8; i++) {
+                var value = storage.read(path("anchors.json"));
+                var current = parseAnchors(value);
+                boolean valid = current != null;
+                if (!valid) current = rebuildAnchors();
+                long nextCheckpoint = Math.max(current.lastCheckpointSeq(), checkpoint);
+                long nextRunStart = Math.max(current.lastRunStartSeq(), runStart);
+                if (valid
+                        && nextCheckpoint == current.lastCheckpointSeq()
+                        && nextRunStart == current.lastRunStartSeq()) return;
+                var next = new Anchors(nextCheckpoint, nextRunStart);
+                if (storage.compareAndSet(
+                        path("anchors.json"), value == null ? 0 : value.version(), bytes(next)))
+                    return;
+            }
+        } catch (RuntimeException ignored) {
+            // Best-effort hint; recovery safely falls back to the previous anchor.
+        }
+    }
+
     private boolean sealed(String owner) {
         return storage.read(sealPath(owner)) != null;
     }
@@ -206,11 +300,12 @@ public final class JournalSessionLog implements SessionLog {
             // Resolve a lost commit ACK even when a later batch has committed.
             if (h.seq() >= seq) {
                 for (String cursor = h.commitId(); cursor != null; ) {
-                    var c = readCommit(cursor);
+                    var c = readCommit(cursor, null);
                     if (c.batchId().equals(batchId)) {
                         if (!c.hash().equals(hash) || c.firstSeq() != expectedSeq + 1)
                             throw new SessionLogException("Batch ID reused with different content");
                         owned(h, writer);
+                        updateAnchors(frozen);
                         return h;
                     }
                     if (c.lastSeq() < expectedSeq + 1) break;
@@ -253,13 +348,16 @@ public final class JournalSessionLog implements SessionLog {
             owned(h, writer);
             var next = new Head(seq, h.epoch(), h.owner(), h.leaseUntil(), id);
             try {
-                if (storage.compareAndSet(path("head.json"), value.version(), bytes(next)))
+                if (storage.compareAndSet(path("head.json"), value.version(), bytes(next))) {
+                    updateAnchors(frozen);
                     return next;
+                }
             } catch (RuntimeException error) {
                 try {
                     var observed = head();
                     if (id.equals(observed.commitId()) && observed.seq() == seq) {
                         owned(observed, writer);
+                        updateAnchors(frozen);
                         return observed;
                     }
                 } catch (RuntimeException inspection) {
@@ -271,8 +369,8 @@ public final class JournalSessionLog implements SessionLog {
         throw new SessionLogException("Commit contention");
     }
 
-    private Commit readCommit(String id) {
-        var value = storage.read(path("commits/" + id + ".json"));
+    private Commit readCommit(String id, Map<String, AtomicSessionStorage.Value> batch) {
+        var value = committedSegment(id, batch);
         if (value == null) throw new SessionLogException("Missing committed segment: " + id);
         var c = parse(value.bytes(), Commit.class);
         if (c.payloadBlobs() != null && !c.payloadBlobs().isEmpty()) {
@@ -317,17 +415,44 @@ public final class JournalSessionLog implements SessionLog {
                 json);
     }
 
-    @Override
+    /** Bulk-load every committed segment under this journal, or {@code null} when the backend
+     * cannot list paths — callers then fall back to per-segment reads. */
+    private Map<String, AtomicSessionStorage.Value> loadCommitSegments() {
+        try {
+            var paths = storage.listPaths(path("commits") + "/");
+            // An empty listing cannot be distinguished from a snapshot taken while a writer was
+            // renaming segments into place, so fall back to per-segment reads rather than
+            // treating the journal as having no committed data.
+            if (paths.isEmpty()) return null;
+            return storage.readAll(paths);
+        } catch (UnsupportedOperationException | SessionLogException ignored) {
+            // The listing also surfaces rows a concurrent writer has not yet referenced
+            // from head (possibly half-written on file backends); a bulk read that trips
+            // over one must degrade rather than fail the scan.
+            return null;
+        }
+    }
+
+    private AtomicSessionStorage.Value committedSegment(
+            String id, Map<String, AtomicSessionStorage.Value> batch) {
+        if (batch != null) return batch.get(path("commits/" + id + ".json"));
+        return storage.read(path("commits/" + id + ".json"));
+    }
+
     public Iterable<SessionEvent> scan(long after, long through) {
         var head = head();
         if (after < 0 || through < after || through > head.seq())
             throw new IllegalArgumentException("Invalid committed prefix");
+        // One round-trip per journal instead of one per segment: bulk-load the committed
+        // segments up front when the backend can list and batch-read, and walk the commit
+        // chain in memory. Backends without discovery fall back to per-segment reads.
+        Map<String, AtomicSessionStorage.Value> loadedSegments = loadCommitSegments();
         var ids = new ArrayDeque<String>();
         var seen = new HashSet<String>();
         long expected = head.seq();
         for (String id = head.commitId(); id != null && expected > after; ) {
             if (!seen.add(id)) throw new SessionLogException("Commit chain cycle");
-            var stored = storage.read(path("commits/" + id + ".json"));
+            var stored = committedSegment(id, loadedSegments);
             if (stored == null) throw new SessionLogException("Missing committed segment");
             var commit = parse(stored.bytes(), Commit.class);
             if (commit.lastSeq() != expected
@@ -360,7 +485,7 @@ public final class JournalSessionLog implements SessionLog {
                             }
                             if (!segments.hasNext())
                                 throw new SessionLogException("Missing committed events");
-                            batch = readCommit(segments.next()).events().iterator();
+                            batch = readCommit(segments.next(), loadedSegments).events().iterator();
                         }
                     }
 

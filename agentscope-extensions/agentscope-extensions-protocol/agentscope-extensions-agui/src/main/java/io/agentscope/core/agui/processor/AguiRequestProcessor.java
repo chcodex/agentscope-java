@@ -138,6 +138,10 @@ public class AguiRequestProcessor {
      * and enriched by {@link AguiAgentAdapter}, so callers can provide custom attributes without
      * replacing the standard AG-UI metadata.
      *
+     * <p>The user id comes from the resolver (deployer decision) when it provides one, otherwise
+     * from {@link AguiRuntimeContextRequest#getUserId()} (caller assertion); see {@link
+     * #resolveRuntimeContext(AguiRuntimeContextRequest)}.
+     *
      * @param request The AG-UI request context carrying input, agent IDs, transport details and the
      *     native request
      * @return A ProcessResult containing the agent and event stream
@@ -149,10 +153,7 @@ public class AguiRequestProcessor {
         String threadId = input.getThreadId();
         String runId = input.getRunId();
 
-        RuntimeContext resolved =
-                runtimeContextResolver != null ? runtimeContextResolver.resolve(request) : null;
-        RuntimeContext runtimeContext =
-                RuntimeContext.builder(resolved).sessionId(threadId).build();
+        RuntimeContext runtimeContext = resolveRuntimeContext(request);
 
         // Resolve agent ID
         String agentId = resolveAgentId(input, headerAgentId, pathAgentId);
@@ -229,7 +230,7 @@ public class AguiRequestProcessor {
                                                                 threadId, runId));
                             } catch (Throwable error) {
                                 resumeCoordinator.finishRun(threadId, runId);
-                                return Flux.fromIterable(processorErrorEvents(input, error));
+                                return processorErrorEvents(input, error);
                             }
                         });
         return new ProcessResult(agent, events, runtimeContext);
@@ -251,10 +252,7 @@ public class AguiRequestProcessor {
     public Flux<AguiFramedEvent> attach(
             AguiRuntimeContextRequest<?> request, long after, String executionRunId) {
         RunAgentInput input = request.getInput();
-        RuntimeContext resolved =
-                runtimeContextResolver != null ? runtimeContextResolver.resolve(request) : null;
-        RuntimeContext runtimeContext =
-                RuntimeContext.builder(resolved).sessionId(input.getThreadId()).build();
+        RuntimeContext runtimeContext = resolveRuntimeContext(request);
         String agentId =
                 resolveAgentId(input, request.getHeaderAgentId(), request.getPathAgentId());
         Agent agent =
@@ -264,17 +262,16 @@ public class AguiRequestProcessor {
         try {
             sessionLog = AguiUtil.sessionLog(agent, runtimeContext);
         } catch (RuntimeException error) {
-            return Flux.fromIterable(framed(processorErrorEvents(input, error), -1));
+            return framed(processorErrorEvents(input, error), -1);
         }
         if (sessionLog == null) {
-            return Flux.fromIterable(
-                    framed(
-                            processorErrorEvents(
-                                    input,
-                                    new IllegalStateException(
-                                            "Session log attach requires a HarnessAgent with"
-                                                    + " SessionHistoryMode.EVENT_LOG")),
-                            -1));
+            return framed(
+                    processorErrorEvents(
+                            input,
+                            new IllegalStateException(
+                                    "Session log attach requires a HarnessAgent with"
+                                            + " SessionHistoryMode.EVENT_LOG")),
+                    -1);
         }
         return AguiSessionLogAttach.attach(input, sessionLog, after, executionRunId, config);
     }
@@ -295,30 +292,60 @@ public class AguiRequestProcessor {
         try {
             after = AguiSessionCursor.resolve(request, input);
         } catch (IllegalArgumentException error) {
-            return Flux.fromIterable(framed(processorErrorEvents(input, error), -1));
+            return framed(processorErrorEvents(input, error), -1);
         }
         if (after == null) {
-            return Flux.fromIterable(
-                    framed(
-                            processorErrorEvents(
-                                    input,
-                                    new IllegalArgumentException(
-                                            "An attach cursor is required: Last-Event-ID or"
-                                                    + " forwardedProps.agentscope.afterSequence")),
-                            -1));
+            return framed(
+                    processorErrorEvents(
+                            input,
+                            new IllegalArgumentException(
+                                    "An attach cursor is required: Last-Event-ID or"
+                                            + " forwardedProps.agentscope.afterSequence")),
+                    -1);
         }
         return attach(request, after, AguiSessionCursor.resolveRunId(input));
     }
 
-    private static List<AguiFramedEvent> framed(List<AguiEvent> events, long seq) {
-        List<AguiFramedEvent> framed = new ArrayList<>(events.size());
-        for (AguiEvent event : events) {
-            framed.add(new AguiFramedEvent(seq, event));
-        }
-        return framed;
+    private static Flux<AguiFramedEvent> framed(Flux<AguiEvent> events, long seq) {
+        return events.map(event -> new AguiFramedEvent(seq, event));
     }
 
-    private List<AguiEvent> processorErrorEvents(RunAgentInput input, Throwable error) {
+    /**
+     * Builds the {@link RuntimeContext} for a request, merging the two user-id sources.
+     *
+     * <p>Priority: {@link AguiRuntimeContextResolver} (deployer decision) &gt; {@code
+     * AguiRuntimeContextRequest.getUserId()} (caller assertion) &gt; none. The resolver is
+     * assembled by the deployer and receives this very request, so it can validate or override
+     * the caller-asserted id; an assertion must never silently override a server-verified
+     * identity. When both provide an id and they differ, a WARN is logged to expose the drift.
+     *
+     * @param request The AG-UI request context
+     * @return The runtime context for this request
+     */
+    private RuntimeContext resolveRuntimeContext(AguiRuntimeContextRequest<?> request) {
+        RuntimeContext resolved =
+                runtimeContextResolver != null ? runtimeContextResolver.resolve(request) : null;
+        RuntimeContext.Builder contextBuilder =
+                RuntimeContext.builder(resolved).sessionId(request.getInput().getThreadId());
+        String requestUserId = request.getUserId();
+        String resolvedUserId = resolved != null ? resolved.getUserId() : null;
+        boolean hasRequestUserId = requestUserId != null && !requestUserId.isBlank();
+        boolean hasResolvedUserId = resolvedUserId != null && !resolvedUserId.isBlank();
+        if (hasResolvedUserId && hasRequestUserId && !resolvedUserId.equals(requestUserId)) {
+            logger.warn(
+                    "AG-UI user identity conflict: resolver={} vs request={}; resolver wins",
+                    resolvedUserId,
+                    requestUserId);
+        }
+        if (!hasResolvedUserId && hasRequestUserId) {
+            // Adopt the caller-asserted id only when the resolver made no decision; setting it
+            // unconditionally would overwrite the resolver value copied by Builder#from.
+            contextBuilder.userId(requestUserId);
+        }
+        return contextBuilder.build();
+    }
+
+    private Flux<AguiEvent> processorErrorEvents(RunAgentInput input, Throwable error) {
         String errorMessage =
                 error.getMessage() != null ? error.getMessage() : error.getClass().getSimpleName();
         List<AguiEvent> events = new ArrayList<>();
@@ -334,7 +361,7 @@ public class AguiRequestProcessor {
         if (config.isEmitRunFinishedAfterError()) {
             events.add(new AguiEvent.RunFinished(input.getThreadId(), input.getRunId()));
         }
-        return List.copyOf(events);
+        return Flux.fromIterable(events);
     }
 
     private static String mapErrorCode(Throwable error) {
