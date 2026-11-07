@@ -82,8 +82,9 @@ class WorkspaceContextMiddlewareBranchTest {
         assertNotNull(prompt);
         assertTrue(prompt.contains("Distributed workspace template root"));
         assertTrue(prompt.contains(workspace.toAbsolutePath().toString()));
-        assertTrue(prompt.contains("My operating system is:"));
-        assertTrue(prompt.contains("Temporary files directory:"));
+        assertTrue(prompt.contains("lives in a shared remote store"));
+        assertTrue(prompt.contains("The host operating system is:"));
+        assertTrue(prompt.contains("The host JVM temporary directory is:"));
     }
 
     @Test
@@ -95,9 +96,9 @@ class WorkspaceContextMiddlewareBranchTest {
 
         String prompt = collectMaterials(mw);
         assertNotNull(prompt);
-        assertTrue(prompt.contains("Your working directory is:"));
+        assertTrue(prompt.contains("Workspace root for file operations:"));
         assertTrue(prompt.contains(workspace.toAbsolutePath().toString()));
-        assertTrue(prompt.contains("My operating system is:"));
-        assertTrue(prompt.contains("Temporary files directory:"));
+        assertTrue(prompt.contains("The host operating system is:"));
+        assertTrue(prompt.contains("The host JVM temporary directory is:"));
     }
 }

@@ -15,6 +15,7 @@
  */
 package io.agentscope.harness.agent.middleware;
 
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -68,32 +69,31 @@ class WorkspaceContextMiddlewareSandboxTest {
     }
 
     @Test
-    void sandboxBranch_includesSandboxRootAndId(@TempDir Path workspace) {
+    void sandboxBranch_describesExecutionBackend(@TempDir Path workspace) {
         FakeSandboxFilesystem fs = new FakeSandboxFilesystem("sbox-1", "/custom/root");
         WorkspaceManager wm = track(new WorkspaceManager(workspace, fs));
         WorkspaceContextMiddleware mw = new WorkspaceContextMiddleware(wm);
 
         String prompt = collectMaterials(mw);
         assertNotNull(prompt);
-        assertTrue(prompt.contains("Sandbox root: /custom/root"));
-        assertTrue(prompt.contains("container id: sbox-1"));
-        assertTrue(prompt.contains("no mechanism for moving files across the boundary"));
-        assertTrue(prompt.contains("AGENTS.md defines persona"));
+        assertTrue(prompt.contains("File and shell paths follow the configured execution backend"));
+        assertTrue(prompt.contains("No artifact delivery tool is configured"));
     }
 
     @Test
-    void sandboxBranch_defaultWorkspaceRoot(@TempDir Path workspace) {
+    void sandboxBranch_doesNotAdvertiseHostWorkspaceRoot(@TempDir Path workspace) {
         FakeSandboxFilesystem fs = new FakeSandboxFilesystem("sbox-2", null);
         WorkspaceManager wm = track(new WorkspaceManager(workspace, fs));
         WorkspaceContextMiddleware mw = new WorkspaceContextMiddleware(wm);
 
         String prompt = collectMaterials(mw);
         assertNotNull(prompt);
-        assertTrue(prompt.contains("Sandbox root: /workspace"));
+        assertTrue(prompt.contains("File and shell paths follow the configured execution backend"));
+        assertFalse(prompt.contains("Workspace root for file operations:"));
     }
 
     @Test
-    void sessionContext_queriesOsFromSandbox(@TempDir Path workspace) {
+    void sessionContext_usesHostPlatform(@TempDir Path workspace) {
         FakeSandboxFilesystem fs = new FakeSandboxFilesystem("sbox-8", "/workspace");
         fs.osReleaseResponse = new ExecuteResponse("Ubuntu 22.04", 0, false);
         fs.tempdirResponse = new ExecuteResponse("/sandbox-tmp", 0, false);
@@ -102,8 +102,11 @@ class WorkspaceContextMiddlewareSandboxTest {
 
         String prompt = collectMaterials(mw);
         assertNotNull(prompt);
-        assertTrue(prompt.contains("Ubuntu 22.04"));
-        assertTrue(prompt.contains("/sandbox-tmp"));
+        // The prompt describes the host JVM, not the execution backend's os-release/tmpdir.
+        assertTrue(prompt.contains(System.getProperty("os.name")));
+        assertTrue(prompt.contains(System.getProperty("java.io.tmpdir")));
+        assertFalse(prompt.contains("Ubuntu 22.04"));
+        assertFalse(prompt.contains("/sandbox-tmp"));
     }
 
     @Test
@@ -130,7 +133,7 @@ class WorkspaceContextMiddlewareSandboxTest {
         String prompt = collectMaterials(mw);
         assertNotNull(prompt);
         assertTrue(prompt.contains("## Runtime Environment"));
-        assertTrue(prompt.contains("AgentStateStore ID: test-session"));
+        assertTrue(prompt.contains("AgentStateStore session id: test-session"));
     }
 
     private static final class FakeSandboxFilesystem extends BaseSandboxFilesystem {

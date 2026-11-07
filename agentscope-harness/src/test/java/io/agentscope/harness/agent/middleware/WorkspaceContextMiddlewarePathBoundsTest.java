@@ -80,8 +80,8 @@ class WorkspaceContextMiddlewarePathBoundsTest {
         // No additionalRoots configured → no "Additional roots:" line
         assertFalse(prompt.contains("Additional roots:"));
         // Host platform info advertised
-        assertTrue(prompt.contains("My operating system is:"));
-        assertTrue(prompt.contains("Temporary files directory:"));
+        assertTrue(prompt.contains("The host operating system is:"));
+        assertTrue(prompt.contains("The host JVM temporary directory is:"));
     }
 
     @Test
