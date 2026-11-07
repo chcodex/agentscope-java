@@ -160,12 +160,59 @@ class StoreSessionStorageTest {
                 () -> storage.readAll(List.of("commits/first.json", "commits/second.json")));
     }
 
+    @Test
+    void listPathsDelegatesToStoresKeyListing() {
+        var store = new KeyListingStore();
+        var storage = new StoreSessionStorage(store, List.of("tenant"));
+
+        var paths = storage.listPaths("commits/");
+
+        assertEquals(List.of("commits/a.json", "commits/b.json"), paths);
+        assertEquals(1, store.listKeysCalls);
+        assertEquals(0, store.searches);
+    }
+
+    @Test
+    void listPathsFallsBackToPagedSearchWhenStoreHasNoKeyListing() {
+        var store = new InMemoryStore();
+        var storage = new StoreSessionStorage(store, List.of("tenant"));
+        var expected = new ArrayList<String>();
+        for (int i = 0; i < 300; i++) {
+            String path = String.format("commits/%03d.json", i);
+            put(store, path, new byte[] {(byte) i});
+            expected.add(path);
+        }
+        put(store, "other/ignored.json", new byte[] {9});
+
+        assertEquals(expected, storage.listPaths("commits/"));
+        var all = new ArrayList<>(expected);
+        all.add("other/ignored.json");
+        assertEquals(all, storage.listPaths(""));
+    }
+
     private static void put(BaseStore store, String path, byte[] bytes) {
         store.put(SESSION_NAMESPACE, path, Map.of("bytes", encode(bytes)));
     }
 
     private static String encode(byte[] bytes) {
         return Base64.getEncoder().encodeToString(bytes);
+    }
+
+    private static final class KeyListingStore extends InMemoryStore {
+        int listKeysCalls;
+        int searches;
+
+        @Override
+        public List<String> listKeys(List<String> namespace, String keyPrefix) {
+            listKeysCalls++;
+            return List.of("commits/a.json", "commits/b.json");
+        }
+
+        @Override
+        public List<StoreItem> search(List<String> namespace, int limit, int offset) {
+            searches++;
+            return super.search(namespace, limit, offset);
+        }
     }
 
     private static final class CountingStore extends InMemoryStore {
