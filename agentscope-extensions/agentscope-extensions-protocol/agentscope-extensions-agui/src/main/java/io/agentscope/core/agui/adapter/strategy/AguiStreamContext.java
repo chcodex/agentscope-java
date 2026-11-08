@@ -132,13 +132,10 @@ public class AguiStreamContext {
     }
 
     public void startTextMessage(String messageId) {
+        // A closed id is reopened with a new START; an id that is still open is not started
+        // twice, so every text segment keeps its own START/END boundary.
         boolean reopening = endedTextMessages.remove(messageId);
         if (reopening || startedTextMessages.add(messageId)) {
-            emit(new AguiEvent.TextMessageStart(threadId, runId, messageId, "assistant"));
-        } else if (endedTextMessages.remove(messageId)) {
-            // A stable messageId reused for a later text segment (text -> tool -> text).
-            // Re-emit START: per AG-UI #1580 clients treat a repeated START with the same id
-            // as a no-op, while the segment still gets its own START/END boundary.
             emit(new AguiEvent.TextMessageStart(threadId, runId, messageId, "assistant"));
         }
         currentTextMessageId = messageId;
