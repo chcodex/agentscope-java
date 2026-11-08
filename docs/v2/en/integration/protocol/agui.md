@@ -168,6 +168,8 @@ A status query is useful for choosing between history-only and attach, but attac
 - The cursor must belong to the same session and must not exceed the current head.
 - Partial model output is recovered by replaying `model/chunk` events, not by a snapshot.
 
+Within one assistant turn, every text segment shares one text `messageId` derived from the stable session turn id (`ExecutionIdentity.turnId`, the same id recorded by the session log). Text before and after a tool call is appended to the same AG-UI assistant message. Each segment still emits its own `TEXT_MESSAGE_START` / `TEXT_MESSAGE_END` pair, and a closed id is reopened with a new `TEXT_MESSAGE_START` when text resumes. Forwarded subagent text uses the child event's own execution turn id when present; a forwarded event without execution falls back to its reply/block id and never reuses the parent text id. Reasoning messages keep a separate id namespace and never reuse the bare text id.
+
 ## Subagent events
 
 By default (`emitSubagentEventsAsNative=false`), AgentEvents with a non-null `source` (child / remote subagent events) are **not** mapped to native `TEXT_MESSAGE_*` / `RUN_*` / tool-call events. They become AG-UI `CUSTOM` events under the `subagent.*` namespace so they do not pollute the parent run lifecycle or text stream:

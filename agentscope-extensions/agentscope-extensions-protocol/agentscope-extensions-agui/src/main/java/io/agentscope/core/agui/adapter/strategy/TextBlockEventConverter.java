@@ -15,6 +15,7 @@
  */
 package io.agentscope.core.agui.adapter.strategy;
 
+import io.agentscope.core.agent.ExecutionIdentity;
 import io.agentscope.core.event.AgentEvent;
 import io.agentscope.core.event.TextBlockDeltaEvent;
 import io.agentscope.core.event.TextBlockEndEvent;

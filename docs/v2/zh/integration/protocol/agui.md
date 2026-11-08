@@ -168,6 +168,8 @@ attach 是已有 run 的重连路径。它是只读观察者：不启动、不�
 - 游标必须属于同一会话，且不能超过当前 head。
 - 部分模型输出通过重放 `model/chunk` 恢复，而不是通过快照。
 
+同一次 assistant turn 内的所有文本段共享一个文本 `messageId`，其来源是稳定的 session turn id（`ExecutionIdentity.turnId`，与 session log 记录的 turn id 相同）。工具调用前后的文本会追加到同一条 AG-UI assistant 消息中。每个文本段仍会发出各自的 `TEXT_MESSAGE_START` / `TEXT_MESSAGE_END`，文本恢复时通过新的 `TEXT_MESSAGE_START` 重新打开已关闭的 id。转发的子 agent 文本在带自身 execution 时使用子事件的 turn id；没有 execution 的转发事件回退到自身的 reply/block id，且不会复用父级文本 id。推理消息使用独立的 id 命名空间，不会复用裸文本 id。
+
 ## 子 agent 事件
 
 默认（`emitSubagentEventsAsNative=false`）下，带非空 `source` 的 AgentEvent（子 / 远程子 agent 事件）**不会**映射为原生的 `TEXT_MESSAGE_*` / `RUN_*` / 工具调用事件，而是变成 `subagent.*` 命名空间下的 AG-UI `CUSTOM` 事件，避免污染父 run 的生命周期与文本流：
