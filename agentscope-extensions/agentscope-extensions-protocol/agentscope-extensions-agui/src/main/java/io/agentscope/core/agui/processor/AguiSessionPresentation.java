@@ -46,7 +46,6 @@ import java.util.Set;
  */
 final class AguiSessionPresentation {
 
-    private static final String ASSISTANT_MESSAGE_PREFIX = "agui:";
     private static final String TOOL_RESULT_PREFIX = "agui:tool-result:";
     private static final String ROLE_ASSISTANT = "assistant";
     private static final String ROLE_REASONING = "reasoning";
@@ -147,9 +146,9 @@ final class AguiSessionPresentation {
                                 .build();
             }
             if ("confirmation".equalsIgnoreCase(interaction.kind)) {
-                out.add(AguiInterrupts.permissionConfirm(null, call));
+                out.add(AguiInterrupts.permissionConfirm(interaction.turnId, null, call));
             } else {
-                out.add(AguiInterrupts.externalExecution(null, call, null));
+                out.add(AguiInterrupts.externalExecution(interaction.turnId, null, call, null));
             }
         }
         return List.copyOf(out);
@@ -177,6 +176,7 @@ final class AguiSessionPresentation {
         if (!(content instanceof List<?> blocks)) {
             return;
         }
+        String turnId = event.turnId();
         for (Object blockValue : blocks) {
             if (!(blockValue instanceof Map<?, ?>)) {
                 continue;
@@ -184,31 +184,31 @@ final class AguiSessionPresentation {
             ContentBlock block =
                     JsonUtils.getJsonCodec().convertValue(blockValue, ContentBlock.class);
             if (block instanceof TextBlock textBlock) {
-                appendText(modelCallId, textBlock.getText(), out);
+                appendText(turnId, textBlock.getText(), out);
             } else if (block instanceof ThinkingBlock thinkingBlock) {
-                appendThinking(modelCallId, thinkingBlock.getThinking(), out);
+                appendThinking(turnId, thinkingBlock.getThinking(), out);
             } else if (block instanceof ToolUseBlock toolUse) {
                 appendToolUse(modelCallId, toolUse, out);
             }
         }
     }
 
-    private void appendText(String modelCallId, String delta, List<AguiEvent> out) {
+    private void appendText(String turnId, String delta, List<AguiEvent> out) {
         if (delta == null || delta.isEmpty()) {
             return;
         }
-        String messageId = textMessageId(modelCallId);
+        String messageId = textMessageId(turnId);
         if (startedTextMessages.add(messageId)) {
             out.add(new AguiEvent.TextMessageStart(threadId, runId, messageId, ROLE_ASSISTANT));
         }
         out.add(new AguiEvent.TextMessageContent(threadId, runId, messageId, delta));
     }
 
-    private void appendThinking(String modelCallId, String delta, List<AguiEvent> out) {
+    private void appendThinking(String turnId, String delta, List<AguiEvent> out) {
         if (!enableReasoning || delta == null || delta.isEmpty()) {
             return;
         }
-        String messageId = reasoningMessageId(modelCallId);
+        String messageId = reasoningMessageId(turnId);
         if (startedReasoningMessages.add(messageId)) {
             out.add(
                     new AguiEvent.ReasoningMessageStart(
@@ -262,13 +262,12 @@ final class AguiSessionPresentation {
         if (modelCallId == null) {
             return;
         }
-        if (startedTextMessages.remove(textMessageId(modelCallId))) {
-            out.add(new AguiEvent.TextMessageEnd(threadId, runId, textMessageId(modelCallId)));
+        String turnId = event.turnId();
+        if (startedTextMessages.remove(textMessageId(turnId))) {
+            out.add(new AguiEvent.TextMessageEnd(threadId, runId, textMessageId(turnId)));
         }
-        if (startedReasoningMessages.remove(reasoningMessageId(modelCallId))) {
-            out.add(
-                    new AguiEvent.ReasoningMessageEnd(
-                            threadId, runId, reasoningMessageId(modelCallId)));
+        if (startedReasoningMessages.remove(reasoningMessageId(turnId))) {
+            out.add(new AguiEvent.ReasoningMessageEnd(threadId, runId, reasoningMessageId(turnId)));
         }
         for (ToolCallState state : toolCalls.values()) {
             if (!modelCallId.equals(state.modelCallId)) {
@@ -385,7 +384,7 @@ final class AguiSessionPresentation {
         }
         String kind = string(data.get("kind"));
         ToolUseBlock call = toolUse(data.get("call"));
-        pending.put(requestId, new Interaction(requestId, kind, call));
+        pending.put(requestId, new Interaction(requestId, kind, call, event.turnId()));
     }
 
     private void interactionResolved(SessionEvent event) {
@@ -399,12 +398,12 @@ final class AguiSessionPresentation {
         return emitToolCallArgs || externalToolNames.contains(toolName);
     }
 
-    private static String textMessageId(String modelCallId) {
-        return ASSISTANT_MESSAGE_PREFIX + modelCallId + "-text";
+    private static String textMessageId(String turnId) {
+        return turnId;
     }
 
-    private static String reasoningMessageId(String modelCallId) {
-        return ASSISTANT_MESSAGE_PREFIX + modelCallId + "-thinking";
+    private static String reasoningMessageId(String turnId) {
+        return turnId + ":reasoning";
     }
 
     private static Msg message(SessionEvent event) {
@@ -461,7 +460,7 @@ final class AguiSessionPresentation {
         return isBlank(name) ? UNKNOWN_TOOL : name;
     }
 
-    private record Interaction(String requestId, String kind, ToolUseBlock call) {}
+    private record Interaction(String requestId, String kind, ToolUseBlock call, String turnId) {}
 
     private static final class ToolCallState {
         private final String id;

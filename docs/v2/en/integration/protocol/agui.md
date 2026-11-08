@@ -13,11 +13,13 @@ zh_link: /v2/zh/integration/protocol/agui
 
 Multimodal input supports image/audio/video/document. Document parts are converted to `DocumentBlock`; model providers that cannot consume a document report an error instead of silently dropping the content.
 
-`RUN_STARTED.input` retains the original request, so consumers that log or forward events must redact sensitive input themselves.
+`RUN_STARTED.input` retains the original request, including any document content. Consumers that log or forward events must redact sensitive input themselves.
 
 `AguiMessageConverter.toAguiMessageList()` expands a TOOL `Msg` containing multiple `ToolResultBlock`s into one AG-UI tool message per tool result. `toAguiMessage()` remains for messages with at most one tool result and rejects a multi-result TOOL message; use `toAguiMessages()` for the expanded form.
 
 On the outbound path, URL-backed `ImageBlock` / `AudioBlock` / `VideoBlock` / `DocumentBlock` content is serialized into AG-UI `MessageContent.Blocks` (`image` / `audio` / `video` / `document`); URL-backed `DataBlock` is routed by its resolved MIME type. Base64 media sources are skipped on outbound conversion for now.
+
+When an assistant message contains reasoning and supported URL media without text, `toAguiMessages()` and `toAguiMessageList()` preserve both as a reasoning message followed by an assistant message containing the media.
 
 ## When To Use
 
@@ -103,7 +105,9 @@ The AG-UI recovery path is an AgentScope extension, not part of the AG-UI protoc
 - Execution is owned outside the browser request: retain a `HarnessAgent` and run the task through `AgentSession`, or keep the original run alive with `agentscope.agui.interrupt-on-disconnect=false` and a long-lived agent.
 - The resolved agent is a `HarnessAgent` with `SessionHistoryMode.EVENT_LOG`.
 - The application stores `threadId`, the execution `runId`, and the last applied cursor.
-- History and `SessionLog` share the same message identities, including assistant tool calls.
+- History and `SessionLog` share the same message identities, including assistant tool calls and turn-scoped text/reasoning ids.
+
+Replay and live delivery share one message identity: text messages use the committed execution `turnId`, reasoning messages use `turnId + ":reasoning"`, and tool-bound interrupt ids use `turnId + ":" + toolCallId` (the reply id remains in the interrupt metadata). A live tail therefore appends to the message replay already announced instead of opening a second assistant message.
 
 ### Application history + attach
 
@@ -140,8 +144,9 @@ Attach is the reconnect path of an existing run. It is a read-only observer: it 
 - When no live tail is available — a different instance, a restarted process, or the run already finished — attach follows the session log by polling. This is slower, but always correct.
 - If the run already ended, it drains the remaining events and finishes with `RUN_FINISHED` or `RUN_ERROR`.
 - Text and tool output after the cursor become `TEXT_MESSAGE_*`, `REASONING_MESSAGE_*`, `TOOL_CALL_*`, and `RUN_*` events.
+- Assistant text uses the committed `SessionEvent.turnId()` as `messageId`; reasoning uses `turnId + ":reasoning"`. `modelCallId` is only used to attribute tool calls, not to name text or reasoning messages. Text after a tool call inside one turn reuses the id: a closed id is reopened with a new `TEXT_MESSAGE_START`, while an id that is still open is not started twice.
 - A tool call that is already part of the application history is not restarted: a later result becomes `TOOL_CALL_RESULT` for the existing tool-call id.
-- `RUN_STARTED` is replayed from the committed `run/start` event, so a cursor past it does not announce a new run.
+- `RUN_STARTED` is projected from the committed `run/start` event. When the cursor already passed it, attach emits one synthetic, uncursored `RUN_STARTED` first so official AG-UI clients still accept the stream.
 
 The cursor is a native `SessionEvent.seq()`, not an AG-UI field and not interchangeable with another session or the Service SSE cursor.
 
@@ -376,7 +381,7 @@ Both use the official AG-UI `reason: "tool_call"` because the interrupt is bound
     "type": "interrupt",
     "interrupts": [
       {
-        "id": "reply-1:call-1",
+        "id": "turn-1:call-1",
         "reason": "tool_call",
         "toolCallId": "call-1",
         "message": "Need approval before running this tool",
@@ -417,7 +422,7 @@ The front end can show an approval or external-execution UI. After the user acts
   "messages": [],
   "resume": [
     {
-      "interruptId": "reply-1:call-1",
+      "interruptId": "turn-1:call-1",
       "status": "resolved",
       "payload": {
         "approved": true,

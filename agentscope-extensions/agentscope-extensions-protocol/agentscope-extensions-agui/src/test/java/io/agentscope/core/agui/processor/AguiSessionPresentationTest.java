@@ -15,7 +15,10 @@
  */
 package io.agentscope.core.agui.processor;
 
+import static io.agentscope.core.agui.processor.AguiSessionLogTestSupport.REASONING_MESSAGE_ID;
+import static io.agentscope.core.agui.processor.AguiSessionLogTestSupport.TEXT_MESSAGE_ID;
 import static io.agentscope.core.agui.processor.AguiSessionLogTestSupport.THREAD_ID;
+import static io.agentscope.core.agui.processor.AguiSessionLogTestSupport.TURN_ID;
 import static io.agentscope.core.agui.processor.AguiSessionLogTestSupport.append;
 import static io.agentscope.core.agui.processor.AguiSessionLogTestSupport.message;
 import static io.agentscope.core.agui.processor.AguiSessionLogTestSupport.modelChunk;
@@ -28,6 +31,7 @@ import static io.agentscope.core.agui.processor.AguiSessionLogTestSupport.writer
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.agentscope.core.agui.adapter.AguiAdapterConfig;
@@ -57,13 +61,112 @@ class AguiSessionPresentationTest {
             assertEquals(3, events.size());
             AguiEvent.TextMessageStart start =
                     assertInstanceOf(AguiEvent.TextMessageStart.class, events.get(0));
-            assertEquals("agui:call-1-text", start.messageId());
+            assertEquals(TEXT_MESSAGE_ID, start.messageId());
             AguiEvent.TextMessageContent first =
                     assertInstanceOf(AguiEvent.TextMessageContent.class, events.get(1));
+            assertEquals(TURN_ID, first.messageId());
             assertEquals("Hel", first.delta());
             AguiEvent.TextMessageContent second =
                     assertInstanceOf(AguiEvent.TextMessageContent.class, events.get(2));
+            assertEquals(TURN_ID, second.messageId());
             assertEquals("lo", second.delta());
+        } finally {
+            log.release(writer);
+        }
+    }
+
+    @Test
+    void textSegmentsAroundToolCallKeepOneTurnMessageId() {
+        SessionLog log = AguiSessionLogTestSupport.newLog();
+        SessionLog.Writer writer = writer(log);
+        try {
+            appendTextToolText(log, writer);
+
+            List<AguiEvent> events = replay(log, AguiAdapterConfig.defaultConfig());
+
+            List<String> messageIds = textMessageIds(events);
+            assertEquals(6, messageIds.size());
+            assertTrue(
+                    messageIds.stream().allMatch(TEXT_MESSAGE_ID::equals),
+                    "text before and after a tool call must share one id: " + messageIds);
+            assertEquals(
+                    log.readAfter(0, 1).get(0).turnId(),
+                    messageIds.get(0),
+                    "the text message id is the committed SessionEvent turn id");
+            assertEquals(
+                    2,
+                    events.stream().filter(AguiEvent.TextMessageStart.class::isInstance).count(),
+                    "a closed turn id is reopened for the second text segment");
+            assertEquals(
+                    2, events.stream().filter(AguiEvent.TextMessageEnd.class::isInstance).count());
+        } finally {
+            log.release(writer);
+        }
+    }
+
+    @Test
+    void streamedAndReplayedTextMessagesUseTheSameTurnMessageId() {
+        SessionLog log = AguiSessionLogTestSupport.newLog();
+        SessionLog.Writer writer = writer(log);
+        try {
+            appendTextToolText(log, writer);
+
+            List<AguiEvent> replayed = replay(log, AguiAdapterConfig.defaultConfig());
+            List<AguiEvent> streamed = new ArrayList<>();
+            AguiSessionPresentation presentation =
+                    newPresentation(AguiAdapterConfig.defaultConfig());
+            for (SessionEvent event : log.scan(0, log.head().seq())) {
+                streamed.addAll(presentation.apply(event));
+            }
+
+            assertEquals(
+                    List.of(
+                            TEXT_MESSAGE_ID,
+                            TEXT_MESSAGE_ID,
+                            TEXT_MESSAGE_ID,
+                            TEXT_MESSAGE_ID,
+                            TEXT_MESSAGE_ID,
+                            TEXT_MESSAGE_ID),
+                    textMessageIds(replayed));
+            assertEquals(textMessageIds(replayed), textMessageIds(streamed));
+        } finally {
+            log.release(writer);
+        }
+    }
+
+    @Test
+    void reasoningMessagesUseTheTurnReasoningNamespace() {
+        SessionLog log = AguiSessionLogTestSupport.newLog();
+        SessionLog.Writer writer = writer(log);
+        try {
+            append(
+                    log,
+                    writer,
+                    "model/chunk",
+                    modelChunk("call-1", "chat-1", thinkingBlock("think")));
+            append(
+                    log,
+                    writer,
+                    "model/end",
+                    Map.of("modelCallId", "call-1", "status", "completed"));
+
+            List<AguiEvent> events =
+                    replay(log, AguiAdapterConfig.builder().enableReasoning(true).build());
+
+            assertEquals(3, events.size());
+            AguiEvent.ReasoningMessageStart start =
+                    assertInstanceOf(AguiEvent.ReasoningMessageStart.class, events.get(0));
+            AguiEvent.ReasoningMessageContent content =
+                    assertInstanceOf(AguiEvent.ReasoningMessageContent.class, events.get(1));
+            AguiEvent.ReasoningMessageEnd end =
+                    assertInstanceOf(AguiEvent.ReasoningMessageEnd.class, events.get(2));
+            assertEquals(REASONING_MESSAGE_ID, start.messageId());
+            assertEquals(REASONING_MESSAGE_ID, content.messageId());
+            assertEquals(REASONING_MESSAGE_ID, end.messageId());
+            assertNotEquals(
+                    TEXT_MESSAGE_ID,
+                    start.messageId(),
+                    "reasoning keeps its own namespace instead of sharing the text id");
         } finally {
             log.release(writer);
         }
@@ -208,10 +311,38 @@ class AguiSessionPresentationTest {
 
             AguiSessionPresentation presentation = presentation(log);
             assertEquals(1, presentation.interrupts().size());
-            assertEquals("tool-1", presentation.interrupts().get(0).id());
+            assertEquals(TURN_ID + ":tool-1", presentation.interrupts().get(0).id());
 
             append(log, writer, "interaction/resolved", Map.of("requestId", "tool-1"));
             assertTrue(presentation(log).interrupts().isEmpty());
+        } finally {
+            log.release(writer);
+        }
+    }
+
+    @Test
+    void replaysBothInterruptKindsWithTurnScopedIds() {
+        SessionLog log = AguiSessionLogTestSupport.newLog();
+        SessionLog.Writer writer = writer(log);
+        try {
+            Map<String, Object> confirm = new LinkedHashMap<>();
+            confirm.put("requestId", "tool-1");
+            confirm.put("kind", "confirmation");
+            confirm.put(
+                    "call", toolUseBlock("tool-1", "search", Map.of("q", "x"), "{\"q\":\"x\"}"));
+            append(log, writer, "interaction/requested", confirm);
+
+            Map<String, Object> external = new LinkedHashMap<>();
+            external.put("requestId", "tool-2");
+            external.put("kind", "external");
+            external.put(
+                    "call", toolUseBlock("tool-2", "lookup", Map.of("q", "y"), "{\"q\":\"y\"}"));
+            append(log, writer, "interaction/requested", external);
+
+            List<String> ids =
+                    presentation(log).interrupts().stream().map(AguiEvent.Interrupt::id).toList();
+
+            assertEquals(List.of(TURN_ID + ":tool-1", TURN_ID + ":tool-2"), ids);
         } finally {
             log.release(writer);
         }
@@ -233,9 +364,12 @@ class AguiSessionPresentationTest {
             List<AguiEvent> events =
                     replay(log, AguiAdapterConfig.builder().enableReasoning(true).build());
             assertEquals(2, events.size());
-            assertInstanceOf(AguiEvent.ReasoningMessageStart.class, events.get(0));
+            AguiEvent.ReasoningMessageStart start =
+                    assertInstanceOf(AguiEvent.ReasoningMessageStart.class, events.get(0));
+            assertEquals(TURN_ID + ":reasoning", start.messageId());
             AguiEvent.ReasoningMessageContent content =
                     assertInstanceOf(AguiEvent.ReasoningMessageContent.class, events.get(1));
+            assertEquals(TURN_ID + ":reasoning", content.messageId());
             assertEquals("think", content.delta());
         } finally {
             log.release(writer);
@@ -275,6 +409,41 @@ class AguiSessionPresentationTest {
         } finally {
             log.release(writer);
         }
+    }
+
+    private static void appendTextToolText(SessionLog log, SessionLog.Writer writer) {
+        append(log, writer, "model/chunk", modelChunk("call-1", "chat-1", textBlock("before")));
+        append(
+                log,
+                writer,
+                "model/chunk",
+                modelChunk(
+                        "call-1",
+                        "chat-1",
+                        toolUseBlock("tool-1", "search", Map.of("q", "x"), "{\"q\":\"x\"}")));
+        append(log, writer, "model/end", Map.of("modelCallId", "call-1", "status", "completed"));
+        append(log, writer, "model/chunk", modelChunk("call-2", "chat-2", textBlock("after")));
+        append(log, writer, "model/end", Map.of("modelCallId", "call-2", "status", "completed"));
+    }
+
+    private static List<String> textMessageIds(List<AguiEvent> events) {
+        return events.stream()
+                .filter(
+                        event ->
+                                event instanceof AguiEvent.TextMessageStart
+                                        || event instanceof AguiEvent.TextMessageContent
+                                        || event instanceof AguiEvent.TextMessageEnd)
+                .map(
+                        event -> {
+                            if (event instanceof AguiEvent.TextMessageStart start) {
+                                return start.messageId();
+                            }
+                            if (event instanceof AguiEvent.TextMessageContent content) {
+                                return content.messageId();
+                            }
+                            return ((AguiEvent.TextMessageEnd) event).messageId();
+                        })
+                .toList();
     }
 
     private static List<AguiEvent> replay(SessionLog log, AguiAdapterConfig config) {
