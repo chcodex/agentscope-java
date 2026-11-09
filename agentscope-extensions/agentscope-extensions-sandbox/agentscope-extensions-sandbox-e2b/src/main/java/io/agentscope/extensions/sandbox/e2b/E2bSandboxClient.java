@@ -22,6 +22,8 @@ import io.agentscope.harness.agent.sandbox.SandboxException;
 import io.agentscope.harness.agent.sandbox.SandboxState;
 import io.agentscope.harness.agent.sandbox.WorkspaceSpec;
 import io.agentscope.harness.agent.sandbox.json.HarnessSandboxJacksonModule;
+import io.agentscope.harness.agent.sandbox.snapshot.RemoteSandboxSnapshot;
+import io.agentscope.harness.agent.sandbox.snapshot.RemoteSnapshotSpec;
 import io.agentscope.harness.agent.sandbox.snapshot.SandboxSnapshotSpec;
 import java.util.List;
 import java.util.UUID;
@@ -93,6 +95,7 @@ public class E2bSandboxClient implements SandboxClient<E2bSandboxClientOptions> 
         String workspaceRoot = resolveWorkspaceRoot(e2b.getWorkspaceSpec(), e2b.getWorkspaceRoot());
         requireAbsoluteWorkspaceRoot(workspaceRoot);
         e2b.setWorkspaceRoot(workspaceRoot);
+        e2b.setWorkspaceOnVolume(isWorkspaceOnVolume(workspaceRoot, e2b.getVolumeMounts()));
         E2bSandboxClientOptions resumed = copy(defaultOptions);
         resumed.setCodec(e2b.getCodec());
         resumed.setEnvdSandboxUrl(e2b.getEnvdSandboxUrl());
@@ -120,6 +123,20 @@ public class E2bSandboxClient implements SandboxClient<E2bSandboxClientOptions> 
             throw new SandboxException.SandboxConfigurationException(
                     "Failed to deserialize E2B sandbox state", e);
         }
+    }
+
+    /**
+     * Restores the runtime storage client omitted from remote snapshot JSON while keeping the
+     * persisted archive id, matching {@code DockerSandboxClient}.
+     */
+    @Override
+    public SandboxState deserializeState(String json, SandboxSnapshotSpec snapshotSpec) {
+        SandboxState state = deserializeState(json);
+        if (snapshotSpec instanceof RemoteSnapshotSpec remoteSpec
+                && state.getSnapshot() instanceof RemoteSandboxSnapshot snapshot) {
+            state.setSnapshot(new RemoteSandboxSnapshot(remoteSpec.getClient(), snapshot.getId()));
+        }
+        return state;
     }
 
     private E2bSandboxClientOptions merge(E2bSandboxClientOptions call) {
@@ -196,10 +213,12 @@ public class E2bSandboxClient implements SandboxClient<E2bSandboxClientOptions> 
     }
 
     /**
-     * Returns whether the workspace root lives on one of the configured volume mounts.
+     * Resolves the effective in-sandbox workspace root, preferring an explicit {@link
+     * WorkspaceSpec} root over the options value.
      *
-     * @param opt merged client options
-     * @return true when a mount covers the workspace root
+     * @param spec workspace spec supplied by the caller, may be {@code null}
+     * @param fallback root from the merged client options or persisted state
+     * @return the root to use for this sandbox
      */
     private static String resolveWorkspaceRoot(WorkspaceSpec spec, String fallback) {
         if (spec != null && spec.getRoot() != null && !spec.getRoot().isBlank()) {
