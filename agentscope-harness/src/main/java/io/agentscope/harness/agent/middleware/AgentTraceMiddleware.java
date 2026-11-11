@@ -39,7 +39,6 @@ import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.CancellationException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Function;
 import org.slf4j.Logger;
@@ -92,9 +91,8 @@ public class AgentTraceMiddleware implements HarnessRuntimeMiddleware {
                 .doOnError(
                         e ->
                                 log.info(
-                                        "[{}] {} | {}: {}",
+                                        "[{}] ERROR | {}: {}",
                                         name,
-                                        e instanceof CancellationException ? "CANCELLED" : "ERROR",
                                         e.getClass().getSimpleName(),
                                         e.getMessage()));
     }
