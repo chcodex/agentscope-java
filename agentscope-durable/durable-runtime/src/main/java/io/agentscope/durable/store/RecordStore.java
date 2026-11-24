@@ -18,7 +18,9 @@ package io.agentscope.durable.store;
 import com.fasterxml.jackson.databind.JsonNode;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.Predicate;
 
 /**
  * Atomic record transactions. Implementations serialize updates across processes and supply
@@ -63,6 +65,15 @@ public interface RecordStore extends AutoCloseable {
 
         void put(String part, JsonNode value);
 
+        /**
+         * Reads the latest committed value for a part after this transaction holds the scope lock.
+         * The default uses {@link #get(String)}; stores with snapshot isolation override it with a
+         * locking read so validation sees rows committed after the snapshot was taken.
+         */
+        default JsonNode getLatest(String part) {
+            return get(part);
+        }
+
         List<String> keys(String prefix, String after, int limit);
 
         /**
@@ -75,6 +86,63 @@ public interface RecordStore extends AutoCloseable {
     record Work(String scope, String workId, long readyAt, JsonNode value) {}
 
     <T> T transaction(String scope, Function<Transaction, T> action);
+
+    /**
+     * Read-only variant of {@link #transaction}: implementations may use a consistent snapshot
+     * without taking the scope's write lock. The action must not write; writes are discarded by
+     * stores that enforce read-only execution.
+     *
+     * <p>The default keeps the transactional contract so existing stores stay correct.
+     */
+    default <T> T readTransaction(String scope, Function<Transaction, T> action) {
+        return transaction(scope, action);
+    }
+
+    /**
+     * Transaction that may publish append-only parts before taking the scope lock. Implementations
+     * that can do so acquire the scope lock only after {@code action} and the early-part flush, then
+     * run {@code afterLock} to revalidate the snapshot and save the remaining state.
+     *
+     * <p>The default keeps the lock-first contract and runs {@code afterLock} inside the same
+     * transaction; existing stores remain correct.
+     */
+    default <T> T transactionDeferredLock(
+            String scope,
+            Function<Transaction, T> action,
+            Predicate<String> earlyPart,
+            Consumer<Transaction> afterLock) {
+        return transaction(
+                scope,
+                tx -> {
+                    T result = action.apply(tx);
+                    afterLock.accept(tx);
+                    return result;
+                });
+    }
+
+    /**
+     * Reads the same part set from several independent scopes in one round trip when the store
+     * supports it. Externalized objects live in their own scope each, so a long replay would
+     * otherwise pay one transaction per object.
+     */
+    default Map<String, Map<String, JsonNode>> readScopes(List<String> scopes, List<String> parts) {
+        var result = new java.util.LinkedHashMap<String, Map<String, JsonNode>>(scopes.size());
+        for (var scope : scopes) {
+            result.put(
+                    scope,
+                    transaction(
+                            scope,
+                            tx -> {
+                                var values = new java.util.LinkedHashMap<String, JsonNode>();
+                                for (var part : parts) {
+                                    var value = tx.get(part);
+                                    if (value != null) values.put(part, value);
+                                }
+                                return values;
+                            }));
+        }
+        return result;
+    }
 
     default <T> T transact(String key, Function<Record, Update<T>> action) {
         return transaction(

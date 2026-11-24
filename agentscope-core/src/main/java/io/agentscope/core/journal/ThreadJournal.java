@@ -42,6 +42,54 @@ public interface ThreadJournal {
 
     record Writer(String owner, long epoch) {}
 
+    /**
+     * Sequence the journal may resume from without losing committed history: everything at or
+     * before it is already folded into the restored state. Exporters start here instead of at 0
+     * so a hosted journal does not replay the whole thread on every drain.
+     */
+    default long replayStart() {
+        return 0;
+    }
+
+    /** Hosted thread identity, or {@code null} when the backend cannot expose one. */
+    default String threadId() {
+        return null;
+    }
+
+    /**
+     * Snapshot a recovery view can resume from instead of replaying the whole journal. Backends
+     * that persist checkpoints can answer this cheaply; {@code null} keeps the full replay.
+     */
+    record ProjectionSeed(
+            long asOfSeq,
+            String stateJson,
+            java.util.Set<String> uncertainToolCalls,
+            java.util.Set<String> activeRuns,
+            String positionTurnId,
+            String positionRunId,
+            io.agentscope.core.agent.AgentExecutionPosition executionPosition) {}
+
+    /** Recovery seed at the latest checkpoint, or {@code null} to replay from the beginning. */
+    default ProjectionSeed projectionSeed() {
+        return projectionSeed(head().seq());
+    }
+
+    /**
+     * Events appended since the latest checkpoint known at open time. The periodic checkpoint
+     * uses it so the checkpoint interval stays bounded across invocations, not just within one.
+     */
+    default long checkpointGap() {
+        return 0;
+    }
+
+    /**
+     * Recovery seed at the newest checkpoint at or before {@code fromSeq}. Callers pass the point
+     * they want to resume from — head for a normal resume, a fork point for a branch.
+     */
+    default ProjectionSeed projectionSeed(long fromSeq) {
+        return null;
+    }
+
     default long exportCursor(String sink) {
         return 0;
     }
@@ -49,6 +97,15 @@ public interface ThreadJournal {
     default void advanceExportCursor(String sink, long expected, long next) {
         throw new UnsupportedOperationException("Export cursor persistence not implemented");
     }
+
+    /**
+     * Best-effort presentation hook, called for every appended event before it is committed.
+     *
+     * <p>Hosted journals use this to forward streaming deltas to clients at the model's own pace
+     * instead of waiting for the next batched commit. Delivery may repeat or be lost and must never
+     * change committed state; implementations should swallow their own failures.
+     */
+    default void live(JournalEvent event) {}
 
     /**
      * Sequence of the most recent committed state baseline, or {@code 0} when the backend cannot

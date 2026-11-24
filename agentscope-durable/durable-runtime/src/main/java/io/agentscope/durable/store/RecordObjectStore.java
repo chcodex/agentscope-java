@@ -15,6 +15,7 @@
  */
 package io.agentscope.durable.store;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import io.agentscope.durable.DurableException;
 import io.agentscope.durable.DurableJson;
 import java.io.ByteArrayOutputStream;
@@ -35,6 +36,9 @@ public final class RecordObjectStore implements ObjectStore {
     }
 
     private static final int CHUNK_BYTES = 1024 * 1024;
+
+    /** Objects per batch; keeps one query well under the default 4 MiB packet limit. */
+    private static final int OBJECT_BATCH = 50;
 
     public Reference put(String scope, byte[] bytes) {
         var reference = ObjectStore.reference(id(), scope, bytes);
@@ -65,31 +69,82 @@ public final class RecordObjectStore implements ObjectStore {
     }
 
     public byte[] read(Reference reference) {
-        if (!id().equals(reference.store()))
-            throw new DurableException(DurableException.Code.INVALID, "Object store differs");
-        return records.transaction(
+        checkStore(reference);
+        return records.readTransaction(
                 "object:" + reference.key(),
                 tx -> {
                     var existing = tx.get("");
                     if (existing == null)
                         throw new DurableException(
                                 DurableException.Code.NOT_FOUND, "Object not found");
-                    if (!reference.equals(DurableJson.convert(existing, Reference.class)))
-                        throw new DurableException(
-                                DurableException.Code.INVALID, "Object header differs");
-                    var bytes = new ByteArrayOutputStream();
-                    for (long offset = 0; offset < reference.size(); offset += CHUNK_BYTES) {
-                        var chunk = tx.get("chunk:" + offset / CHUNK_BYTES);
-                        if (chunk == null)
-                            throw new DurableException(
-                                    DurableException.Code.INVALID, "Object chunk missing");
-                        byte[] decoded = Base64.getDecoder().decode(chunk.asText());
-                        if (decoded.length != Math.min(CHUNK_BYTES, reference.size() - offset))
-                            throw new DurableException(
-                                    DurableException.Code.INVALID, "Object chunk size differs");
-                        bytes.writeBytes(decoded);
-                    }
-                    return ObjectStore.verify(id(), reference, bytes.toByteArray());
+                    return decode(reference, existing, offset -> tx.get("chunk:" + offset));
                 });
+    }
+
+    /**
+     * Batch form of {@link #read}: objects live in one scope each, so the plain path costs one
+     * transaction per object. {@link RecordStore#readScopes} collapses a page into one query.
+     */
+    @Override
+    public java.util.Map<Reference, byte[]> readAll(
+            String scope, java.util.List<Reference> references) {
+        if (references.isEmpty()) return java.util.Map.of();
+        var result = new java.util.LinkedHashMap<Reference, byte[]>(references.size());
+        for (int from = 0; from < references.size(); from += OBJECT_BATCH) {
+            var slice = references.subList(from, Math.min(references.size(), from + OBJECT_BATCH));
+            int maxChunks = 1;
+            var keys = new java.util.ArrayList<String>(slice.size());
+            for (var reference : slice) {
+                checkStore(reference);
+                if (!scope.equals(reference.scope()))
+                    throw new DurableException(
+                            DurableException.Code.INVALID, "Object belongs to another scope");
+                keys.add("object:" + reference.key());
+                maxChunks =
+                        Math.max(
+                                maxChunks,
+                                (int) ((reference.size() + CHUNK_BYTES - 1) / CHUNK_BYTES));
+            }
+            var parts = new java.util.ArrayList<String>(maxChunks + 1);
+            parts.add("");
+            for (int i = 0; i < maxChunks; i++) parts.add("chunk:" + i);
+            var loaded = records.readScopes(keys, parts);
+            for (var reference : slice) {
+                var values = loaded.get("object:" + reference.key());
+                if (values == null || !values.containsKey(""))
+                    throw new DurableException(DurableException.Code.NOT_FOUND, "Object not found");
+                result.put(
+                        reference,
+                        decode(reference, values.get(""), offset -> values.get("chunk:" + offset)));
+            }
+        }
+        return result;
+    }
+
+    private void checkStore(Reference reference) {
+        if (!id().equals(reference.store()))
+            throw new DurableException(DurableException.Code.INVALID, "Object store differs");
+    }
+
+    private byte[] decode(Reference reference, JsonNode header, ChunkReader chunks) {
+        if (!reference.equals(DurableJson.convert(header, Reference.class)))
+            throw new DurableException(DurableException.Code.INVALID, "Object header differs");
+        var bytes = new ByteArrayOutputStream();
+        for (long offset = 0; offset < reference.size(); offset += CHUNK_BYTES) {
+            var chunk = chunks.get(offset / CHUNK_BYTES);
+            if (chunk == null)
+                throw new DurableException(DurableException.Code.INVALID, "Object chunk missing");
+            byte[] decoded = Base64.getDecoder().decode(chunk.asText());
+            if (decoded.length != Math.min(CHUNK_BYTES, reference.size() - offset))
+                throw new DurableException(
+                        DurableException.Code.INVALID, "Object chunk size differs");
+            bytes.writeBytes(decoded);
+        }
+        return ObjectStore.verify(id(), reference, bytes.toByteArray());
+    }
+
+    @FunctionalInterface
+    private interface ChunkReader {
+        JsonNode get(long index);
     }
 }

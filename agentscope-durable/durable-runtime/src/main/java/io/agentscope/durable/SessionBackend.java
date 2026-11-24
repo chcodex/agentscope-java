@@ -179,6 +179,15 @@ public interface SessionBackend extends AutoCloseable {
 
     Frame frame(Lease lease);
 
+    /**
+     * Frame read with an explicit checkpoint-content choice. Lean frames omit the checkpoint body
+     * (and its object-store read) for callers that only inspect the Turn, tools or signals; the
+     * default keeps the full historical contract for existing backends.
+     */
+    default Frame frame(Lease lease, boolean withCheckpoint) {
+        return frame(lease);
+    }
+
     CommitReceipt commit(Lease lease, Commit commit);
 
     /** Native journal entries after an exclusive position; reading requires current ownership. */

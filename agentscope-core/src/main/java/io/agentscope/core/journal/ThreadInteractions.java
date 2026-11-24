@@ -51,7 +51,8 @@ public final class ThreadInteractions {
     public static Map<String, JournalEvent> pending(ThreadJournal log) {
         long upper = log.head().seq();
         var result = new LinkedHashMap<String, JournalEvent>();
-        for (var event : log.scanMetadata(0, upper)) {
+        // History before the journal's replay start is already folded into restored state.
+        for (var event : log.scanMetadata(log.replayStart(), upper)) {
             if (event.type().equals("interaction/requested"))
                 result.put(String.valueOf(event.data().get("requestId")), event);
             if (event.type().equals("interaction/resolved"))

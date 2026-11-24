@@ -44,19 +44,35 @@ public record JournalProjection(
 
     /** Builds one projection while allowing startup readers to inspect that same metadata prefix. */
     public static JournalProjection read(ThreadJournal log, Consumer<JournalEvent> observer) {
-        long cursor = 0;
-        String state = null;
+        return read(log, null, observer);
+    }
+
+    /**
+     * Incremental form: starts at {@code seed.asOfSeq()} with the seeded state instead of
+     * replaying the whole committed prefix. With a null seed it is exactly {@link #read(ThreadJournal,
+     * Consumer)}.
+     */
+    public static JournalProjection read(
+            ThreadJournal log, ThreadJournal.ProjectionSeed seed, Consumer<JournalEvent> observer) {
+        long cursor = seed == null ? 0 : seed.asOfSeq();
+        String state = seed == null ? null : seed.stateJson();
         JournalEvent checkpoint = null;
-        var uncertain = new LinkedHashSet<String>();
-        var runs = new LinkedHashSet<String>();
+        String positionTurnId = seed == null ? null : seed.positionTurnId();
+        String positionRunId = seed == null ? null : seed.positionRunId();
+        var uncertain =
+                seed == null
+                        ? new LinkedHashSet<String>()
+                        : new LinkedHashSet<>(seed.uncertainToolCalls());
+        var runs =
+                seed == null ? new LinkedHashSet<String>() : new LinkedHashSet<>(seed.activeRuns());
         var results = new LinkedHashMap<String, ToolResultBlock>();
         var verifications = new ArrayList<io.agentscope.core.state.TaskVerification>();
         var extensions = new ArrayList<JournalEvent>();
         long upper = log.head().seq();
-        // A projection is a recovery view, not an incremental read: it must see every historical
-        // message identity and every unresolved dispatch, so it scans the committed prefix once.
-        // Backends optimize this by returning metadata and requiring materialize only for state.
-        for (var event : log.scanMetadata(0, upper)) {
+        // A full replay must see every historical message identity and every unresolved dispatch,
+        // so it scans the committed prefix once. With a seed, only the suffix after the checkpoint
+        // matters: the rest is already folded into the seeded state.
+        for (var event : log.scanMetadata(cursor, upper)) {
             JournalEventTypes.validate(event);
             observer.accept(event);
             var data = event.data();
@@ -66,6 +82,9 @@ public record JournalProjection(
                         "migration/baseline",
                         "state/restored" -> {
                     checkpoint = event;
+                    // A periodic checkpoint carries no run identity; keep the last known one.
+                    if (event.turnId() != null) positionTurnId = event.turnId();
+                    if (event.executionRunId() != null) positionRunId = event.executionRunId();
                     verifications.clear();
                     extensions.clear();
                 }
@@ -102,7 +121,7 @@ public record JournalProjection(
             }
             cursor = event.seq();
         }
-        AgentExecutionPosition position = null;
+        AgentExecutionPosition position = seed == null ? null : seed.executionPosition();
         if (checkpoint != null) {
             var data = log.materialize(checkpoint).data();
             state = (String) data.get("stateJson");
@@ -145,8 +164,8 @@ public record JournalProjection(
                 state,
                 Set.copyOf(uncertain),
                 Set.copyOf(runs),
-                checkpoint == null ? null : checkpoint.turnId(),
-                checkpoint == null ? null : checkpoint.executionRunId(),
+                positionTurnId,
+                positionRunId,
                 position);
     }
 

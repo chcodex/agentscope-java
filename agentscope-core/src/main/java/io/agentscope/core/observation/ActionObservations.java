@@ -73,15 +73,20 @@ public final class ActionObservations {
                                     payload.put("observation", observation);
                                     payload.put("toolCallId", observation.toolCallId());
                                     payload.put("result", result);
-                                    Mono<Void> recorded =
-                                            recorder.record(
-                                                    observation.status()
-                                                                    == ActionObservation.Status
-                                                                            .STARTED
-                                                            ? "action/start"
-                                                            : "action/end",
-                                                    payload);
-                                    return recorded;
+                                    // action/start shares the next commit (tool/dispatch) instead
+                                    // of paying its own transaction.
+                                    if (observation.status() == ActionObservation.Status.STARTED) {
+                                        recorder.append("action/start", payload);
+                                        return Mono.empty();
+                                    }
+                                    // action/end joins the tool-result commit that always follows
+                                    // in
+                                    // the same turn. A crash in between leaves dispatch without
+                                    // end,
+                                    // which is exactly the pre-existing crash-during-tool window
+                                    // that uncertain-tool reconciliation already handles.
+                                    recorder.append("action/end", payload);
+                                    return Mono.empty();
                                 };
                     } else if (configured instanceof ActionObserver value) observer = value;
                     else return Mono.defer(execution);

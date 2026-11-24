@@ -26,6 +26,7 @@ public final class DurableEventSchemas {
     public static final String START = "durable/finalization_started";
     public static final String END = "durable/finalization_completed";
     public static final String MODEL = "durable/finalization_model";
+    public static final String RESULT_METADATA = "durable/result_metadata";
 
     public static void register(JournalEventCodecRegistry registry) {
         registry.register(
@@ -68,6 +69,10 @@ public final class DurableEventSchemas {
                                         "Invalid finalization model identity");
                         },
                         (state, data) -> {}));
+        // Marker-only fact: the metadata itself rides on the public event this commit publishes.
+        registry.register(
+                RESULT_METADATA,
+                new JournalEventCodecRegistry.Codec(data -> {}, (state, data) -> {}));
     }
 
     private DurableEventSchemas() {}

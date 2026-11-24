@@ -48,6 +48,20 @@ public interface ObjectStore {
 
     byte[] read(Reference reference);
 
+    /**
+     * Reads several immutable objects in as few round trips as the store allows. The default keeps
+     * per-object semantics; a store that can batch should override it, because replaying a long
+     * journal otherwise costs one transaction per externalized entry.
+     */
+    default java.util.Map<Reference, byte[]> readAll(
+            String scope, java.util.List<Reference> references) {
+        var result = new java.util.LinkedHashMap<Reference, byte[]>(references.size());
+        for (var reference : references) {
+            result.put(reference, read(reference));
+        }
+        return result;
+    }
+
     static String digest(byte[] bytes) {
         try {
             return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes));

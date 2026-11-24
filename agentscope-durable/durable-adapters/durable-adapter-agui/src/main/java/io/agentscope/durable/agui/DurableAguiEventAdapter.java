@@ -16,6 +16,7 @@
 package io.agentscope.durable.agui;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import io.agentscope.core.agui.AguiInterruptConstants;
 import io.agentscope.core.agui.event.AguiEvent;
 import io.agentscope.durable.DurableJson;
 import io.agentscope.durable.DurableTypes.LiveEvent;
@@ -23,8 +24,10 @@ import io.agentscope.durable.DurableTypes.PublicEvent;
 import io.agentscope.durable.EventStreamOptions.EventDeltaType;
 import io.agentscope.durable.SessionStreamEvent;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -33,11 +36,50 @@ import java.util.Set;
 /**
  * Stateful Durable-to-AG-UI 1.0 mapping. One adapter belongs to one stream and reconciles live
  * message previews with their authoritative committed message.
+ *
+ * <p>A Run that parks for human input reports {@code run.ended} with {@code STOPPED} before the
+ * committed {@code turn.waiting} event, so that end is not terminal. Only {@code turn.waiting}
+ * closes the stream and carries the pending interactions: it maps to one {@link
+ * AguiEvent.RunFinished} with a {@link AguiEvent.RunFinishedInterruptOutcome}, after closing the
+ * steps, messages and tool calls the Run opened. Individual {@code interaction.requested} events
+ * are not terminal and are not mapped on their own. Each interrupt id is the Durable interaction
+ * id, and its {@code toolCallId} is the interaction request id (the tool call id), which the client
+ * echoes as {@code interruptId} to resume.
+ *
+ * <p>A waiting Turn without pending interactions (for example waiting on a signal) has no AG-UI
+ * interrupt to deliver; its stream follows the Run's own terminal event, if any.
  */
 public final class DurableAguiEventAdapter {
+    /** Run reasons that park the Run for human input instead of ending it. */
+    private static final Set<String> PARKED_RUN_REASONS =
+            Set.of("suspended", "PERMISSION_ASKING", "TOOL_SUSPENDED");
+
+    private static final Map<String, Object> CONFIRM_RESPONSE_SCHEMA = Map.of("type", "boolean");
+
     private final Set<String> messages = new HashSet<>();
     private final Map<String, StringBuilder> messageText = new HashMap<>();
+    private final Set<String> reasoningMessages = new HashSet<>();
+    private String openReasoning;
     private final Set<String> tools = new HashSet<>();
+    private final Set<String> openToolCalls = new HashSet<>();
+    private final Set<String> steps = new HashSet<>();
+    private final Set<String> finishedSteps = new HashSet<>();
+    private final Set<String> finishedRuns = new HashSet<>();
+    private final Set<String> failedRuns = new HashSet<>();
+
+    /**
+     * Native journal event ids already delivered as text deltas. The same delta travels twice —
+     * once live, once committed — and a reconnected stream replays committed deltas the previous
+     * connection may have previewed live. Either arrival wins; the twin is dropped.
+     */
+    private final Set<String> deliveredDeltas = new HashSet<>();
+
+    /**
+     * Terminal tool results already delivered, per call id; the value says whether the delivered
+     * result carried real content. One tool call can report several terminal updates (an observed
+     * result and a later native placeholder), and a placeholder must not replace the real output.
+     */
+    private final Map<String, Boolean> toolResults = new HashMap<>();
 
     public List<AguiEvent> map(SessionStreamEvent event) {
         Objects.requireNonNull(event);
@@ -49,6 +91,8 @@ public final class DurableAguiEventAdapter {
                     preview.threadId(), require(preview.runId(), "runId"), preview.data());
         }
         if (event instanceof SessionStreamEvent.EventDelta delta) {
+            if (delta.sourceEventId() != null && !deliveredDeltas.add(delta.sourceEventId()))
+                return List.of();
             String runId = require(delta.runId(), "runId");
             if (delta.deltaType() == EventDeltaType.MESSAGE)
                 return messageDelta(delta.threadId(), runId, delta.data());
@@ -60,28 +104,32 @@ public final class DurableAguiEventAdapter {
 
     List<AguiEvent> committed(PublicEvent event) {
         Objects.requireNonNull(event);
-        String threadId = event.threadId();
-        String runId = event.runId();
         return switch (event.type()) {
-            case "run.started" ->
-                    List.of(new AguiEvent.RunStarted(threadId, require(runId, "runId")));
-            case "run.ended" -> runEnded(event);
-            case "step.started" ->
-                    List.of(
-                            new AguiEvent.StepStarted(
-                                    threadId,
-                                    require(runId, "runId"),
-                                    require(event.stepId(), "stepId")));
-            case "step.ended" ->
-                    List.of(
-                            new AguiEvent.StepFinished(
-                                    threadId,
-                                    require(runId, "runId"),
-                                    require(event.stepId(), "stepId")));
+            case "run.started" -> runStarted(event);
+            case "run.ended", "run.lost" -> runEnded(event);
+            case "step.started" -> stepStarted(event);
+            case "step.ended" -> stepEnded(event);
+            case "message.delta" -> messageDelta(event);
             case "message.completed" -> message(event);
             case "tool.call.updated" -> tool(event);
-            default -> List.of();
+            case "turn.waiting" -> waiting(event);
+            default -> extension(event);
         };
+    }
+
+    /**
+     * Application-owned extension events ({@code x.*}) carry no framework state to reconcile.
+     * Forward them unchanged as CUSTOM frames so a client reads the same value live and from a
+     * replay; the framework stays unaware of their payload.
+     */
+    private List<AguiEvent> extension(PublicEvent event) {
+        if (!event.type().startsWith("x.") || event.runId() == null) return List.of();
+        return List.of(
+                new AguiEvent.Custom(
+                        event.threadId(),
+                        event.runId(),
+                        event.type(),
+                        DurableJson.convert(event.data(), Object.class)));
     }
 
     List<AguiEvent> live(LiveEvent event) {
@@ -97,31 +145,197 @@ public final class DurableAguiEventAdapter {
         };
     }
 
+    private List<AguiEvent> runStarted(PublicEvent event) {
+        clear();
+        return List.of(new AguiEvent.RunStarted(event.threadId(), require(event.runId(), "runId")));
+    }
+
     private List<AguiEvent> runEnded(PublicEvent event) {
         String status = event.data().path("status").asText();
-        if ("FAILED".equals(status) || "LOST".equals(status))
-            return List.of(
+        if ("STOPPED".equals(status)
+                && PARKED_RUN_REASONS.contains(event.data().path("reason").asText()))
+            return List.of();
+        String runId = require(event.runId(), "runId");
+        if ("FAILED".equals(status) || "LOST".equals(status)) {
+            if (!failedRuns.add(runId)) return List.of();
+            finishedRuns.add(runId);
+            var result = new ArrayList<>(closeOpen(event.threadId(), runId));
+            result.add(
                     new AguiEvent.RunError(
                             event.threadId(),
-                            require(event.runId(), "runId"),
+                            runId,
                             event.data().path("reason").asText("Durable Run failed"),
                             status));
+            return List.copyOf(result);
+        }
+        if (!finishedRuns.add(runId)) return List.of();
+        var result = new ArrayList<>(closeOpen(event.threadId(), runId));
+        result.add(
+                new AguiEvent.RunFinished(
+                        event.threadId(),
+                        runId,
+                        null,
+                        "STOPPED".equals(status)
+                                ? new AguiEvent.RunFinishedCancelledOutcome()
+                                : new AguiEvent.RunFinishedSuccessOutcome()));
+        return List.copyOf(result);
+    }
+
+    private List<AguiEvent> stepStarted(PublicEvent event) {
+        String stepId = require(event.stepId(), "stepId");
+        steps.add(stepId);
         return List.of(
-                new AguiEvent.RunFinished(event.threadId(), require(event.runId(), "runId")));
+                new AguiEvent.StepStarted(
+                        event.threadId(), require(event.runId(), "runId"), stepId));
+    }
+
+    private List<AguiEvent> stepEnded(PublicEvent event) {
+        String stepId = require(event.stepId(), "stepId");
+        String runId = require(event.runId(), "runId");
+        if (!finishedSteps.add(stepId)) return List.of();
+        var result = new ArrayList<AguiEvent>();
+        closeReasoning(event.threadId(), runId, result);
+        if (!steps.remove(stepId)) {
+            // Reconnected mid-step: this stream never saw the step's start, but AG-UI requires
+            // every STEP_FINISHED to follow a STEP_STARTED on the same connection.
+            result.add(new AguiEvent.StepStarted(event.threadId(), runId, stepId));
+        }
+        result.add(new AguiEvent.StepFinished(event.threadId(), runId, stepId));
+        return List.copyOf(result);
+    }
+
+    /**
+     * A Turn entered WAITING: the Run ends with every pending interaction, because a later {@code
+     * run.ended} never arrives while the Turn is parked. Everything the Run opened is closed first.
+     */
+    private List<AguiEvent> waiting(PublicEvent event) {
+        var interactions = event.data().path("interactions");
+        String runId = event.runId();
+        if (runId == null || !interactions.isArray() || interactions.isEmpty()) return List.of();
+        if (!finishedRuns.add(runId)) return List.of();
+        var result = new ArrayList<>(closeOpen(event.threadId(), runId));
+        var interrupts = new ArrayList<AguiEvent.Interrupt>();
+        for (var interaction : interactions) interrupts.add(interrupt(interaction));
+        result.add(
+                new AguiEvent.RunFinished(
+                        event.threadId(),
+                        runId,
+                        null,
+                        new AguiEvent.RunFinishedInterruptOutcome(List.copyOf(interrupts))));
+        return List.copyOf(result);
+    }
+
+    /** AG-UI requires every step, message and tool call a Run opened to be closed first. */
+    private List<AguiEvent> closeOpen(String threadId, String runId) {
+        var result = new ArrayList<AguiEvent>();
+        closeReasoning(threadId, runId, result);
+        for (String stepId : List.copyOf(steps))
+            result.add(new AguiEvent.StepFinished(threadId, runId, stepId));
+        for (String messageId : List.copyOf(messages))
+            result.add(new AguiEvent.TextMessageEnd(threadId, runId, messageId));
+        for (String callId : List.copyOf(openToolCalls))
+            result.add(new AguiEvent.ToolCallEnd(threadId, runId, callId));
+        messages.clear();
+        messageText.clear();
+        reasoningMessages.clear();
+        openReasoning = null;
+        tools.clear();
+        openToolCalls.clear();
+        steps.clear();
+        return List.copyOf(result);
+    }
+
+    private void clear() {
+        messages.clear();
+        messageText.clear();
+        reasoningMessages.clear();
+        openReasoning = null;
+        tools.clear();
+        openToolCalls.clear();
+        steps.clear();
+        finishedSteps.clear();
+        finishedRuns.clear();
+        failedRuns.clear();
+        deliveredDeltas.clear();
+        toolResults.clear();
+    }
+
+    private static AguiEvent.Interrupt interrupt(JsonNode interaction) {
+        String interruptId = interaction.required("id").asText();
+        String requestId = interaction.path("requestId").asText(null);
+        String kind = interaction.path("kind").asText();
+        var call = interaction.path("call");
+        String toolName = call.path("name").asText("tool");
+        boolean confirmation = "confirmation".equals(kind);
+        Map<String, Object> metadata = new LinkedHashMap<>();
+        metadata.put(
+                AguiInterruptConstants.METADATA_AGENTSCOPE_INTERRUPT_KIND,
+                confirmation ? AguiInterruptConstants.INTERRUPT_KIND_PERMISSION_CONFIRM : kind);
+        metadata.put(AguiInterruptConstants.METADATA_TOOL_NAME, toolName);
+        metadata.put("automatic", interaction.path("automatic").asBoolean());
+        if (requestId != null) metadata.put("requestId", requestId);
+        if (call.hasNonNull("arguments"))
+            metadata.put(
+                    AguiInterruptConstants.METADATA_TOOL_INPUT,
+                    DurableJson.convert(call.get("arguments"), Object.class));
+        return new AguiEvent.Interrupt(
+                interruptId,
+                AguiInterruptConstants.TOOL_CALL_INTERRUPT_REASON,
+                confirmation
+                        ? "Tool '" + toolName + "' requires user confirmation before execution"
+                        : "Tool '" + toolName + "' requires external execution",
+                requestId,
+                confirmation ? CONFIRM_RESPONSE_SCHEMA : null,
+                null,
+                Collections.unmodifiableMap(metadata));
     }
 
     private List<AguiEvent> startMessage(String threadId, String runId, JsonNode data) {
         String messageId = data.required("messageId").asText();
+        if (data.path("reasoning").asBoolean(false)) {
+            if (!reasoningMessages.add(messageId)) return List.of();
+            var result = new ArrayList<AguiEvent>();
+            closeReasoning(threadId, runId, result);
+            openReasoning = messageId;
+            result.add(
+                    new AguiEvent.ReasoningMessageStart(threadId, runId, messageId, "reasoning"));
+            return List.copyOf(result);
+        }
         if (!messages.add(messageId)) return List.of();
         messageText.put(messageId, new StringBuilder());
         return List.of(new AguiEvent.TextMessageStart(threadId, runId, messageId, "assistant"));
     }
 
+    /** Closes the open reasoning message; AG-UI requires it before the next visible output. */
+    private void closeReasoning(String threadId, String runId, List<AguiEvent> result) {
+        if (openReasoning == null) return;
+        result.add(new AguiEvent.ReasoningMessageEnd(threadId, runId, openReasoning));
+        // Forget the id once it is closed: a model can keep thinking under the same message id
+        // after a tool call, and the next content must open a fresh reasoning message instead of
+        // arriving without a start frame.
+        reasoningMessages.remove(openReasoning);
+        openReasoning = null;
+    }
+
+    private List<AguiEvent> messageDelta(PublicEvent event) {
+        // Same native event may arrive live first (or be replayed after): deliver once.
+        if (!deliveredDeltas.add(event.eventId())) return List.of();
+        return messageDelta(event.threadId(), require(event.runId(), "runId"), event.data());
+    }
+
     private List<AguiEvent> messageDelta(String threadId, String runId, JsonNode data) {
         String messageId = data.required("messageId").asText();
-        var result = new ArrayList<AguiEvent>();
-        if (!messages.contains(messageId)) result.addAll(startMessage(threadId, runId, data));
         String text = data.path("text").asText();
+        if (data.path("reasoning").asBoolean(false)) {
+            var result = new ArrayList<AguiEvent>();
+            if (!reasoningMessages.contains(messageId))
+                result.addAll(startMessage(threadId, runId, data));
+            result.add(new AguiEvent.ReasoningMessageContent(threadId, runId, messageId, text));
+            return List.copyOf(result);
+        }
+        var result = new ArrayList<AguiEvent>();
+        closeReasoning(threadId, runId, result);
+        if (!messages.contains(messageId)) result.addAll(startMessage(threadId, runId, data));
         messageText.get(messageId).append(text);
         result.add(new AguiEvent.TextMessageContent(threadId, runId, messageId, text));
         return List.copyOf(result);
@@ -134,6 +348,7 @@ public final class DurableAguiEventAdapter {
         String messageId = event.data().required("messageId").asText();
         String text = text(message.required("content"));
         var result = new ArrayList<AguiEvent>();
+        closeReasoning(event.threadId(), event.runId(), result);
         if (!messages.contains(messageId))
             result.addAll(startMessage(event.threadId(), event.runId(), event.data()));
         String preview = messageText.get(messageId).toString();
@@ -159,11 +374,15 @@ public final class DurableAguiEventAdapter {
 
     private List<AguiEvent> toolArguments(String threadId, String runId, JsonNode data) {
         String callId = data.required("toolCallId").asText();
+        String name = data.path("name").asText("");
+        // Streamed fragments often carry a placeholder name (__fragment__) until the model emits
+        // the real tool name. Starting the card here would pin that placeholder: the committed
+        // tool.call.updated cannot rename an already-open tool call. Wait for REQUESTED instead.
+        if (name.isBlank() || name.startsWith("__")) return List.of();
         var result = new ArrayList<AguiEvent>();
         if (tools.add(callId))
-            result.add(
-                    new AguiEvent.ToolCallStart(
-                            threadId, runId, callId, data.path("name").asText("tool")));
+            result.add(new AguiEvent.ToolCallStart(threadId, runId, callId, name));
+        openToolCalls.add(callId);
         result.add(new AguiEvent.ToolCallArgs(threadId, runId, callId, data.path("text").asText()));
         return List.copyOf(result);
     }
@@ -182,7 +401,12 @@ public final class DurableAguiEventAdapter {
                                 event.runId(),
                                 callId,
                                 data.path("name").asText("tool")));
-            if (data.has("arguments"))
+            // Live preview already streamed these arguments fragment by fragment. Sending the
+            // complete JSON again makes an append-style client concatenate both copies into
+            // invalid JSON. After a reconnect there is no live preview (the call is not open),
+            // so this committed value is the only source and must be sent.
+            boolean alreadyStreamed = openToolCalls.contains(callId);
+            if (data.has("arguments") && !alreadyStreamed)
                 result.add(
                         new AguiEvent.ToolCallArgs(
                                 event.threadId(),
@@ -190,15 +414,40 @@ public final class DurableAguiEventAdapter {
                                 callId,
                                 data.get("arguments").toString()));
             result.add(new AguiEvent.ToolCallEnd(event.threadId(), event.runId(), callId));
+            openToolCalls.remove(callId);
         } else if (Set.of("SUCCEEDED", "FAILED", "CANCELLED", "DENIED", "UNKNOWN")
                 .contains(status)) {
-            String content = data.has("content") ? data.get("content").toString() : status;
+            String observed = toolContent(data);
+            Boolean delivered = toolResults.get(callId);
+            // Deliver one terminal result per call. A second update may only replace a placeholder
+            // that carried no content; it must never overwrite a real output.
+            if (delivered != null && (delivered || observed == null)) return List.of();
+            toolResults.put(callId, observed != null);
+            String content = observed != null ? observed : data.path("reason").asText(status);
             result.add(
                     new AguiEvent.ToolCallResult(
-                            event.threadId(), event.runId(), callId, content, "tool", null));
+                            event.threadId(),
+                            event.runId(),
+                            callId,
+                            content,
+                            "tool",
+                            callId + ":result"));
             tools.remove(callId);
+            openToolCalls.remove(callId);
         }
         return List.copyOf(result);
+    }
+
+    /**
+     * Real output carried by a terminal tool update, or {@code null} when the update only reports
+     * a status. An empty array is what a placeholder result serializes to, so it counts as absent.
+     */
+    private static String toolContent(JsonNode data) {
+        JsonNode content = data.get("content");
+        if (content == null || content.isNull()) return null;
+        if (content.isArray() && content.isEmpty()) return null;
+        String value = content.toString();
+        return value.isBlank() || "[]".equals(value) || "null".equals(value) ? null : value;
     }
 
     private static String text(JsonNode content) {

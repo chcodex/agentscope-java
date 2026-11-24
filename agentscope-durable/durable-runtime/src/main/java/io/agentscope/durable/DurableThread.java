@@ -100,6 +100,14 @@ public final class DurableThread {
         return new DurableTurn(this, turnId);
     }
 
+    /**
+     * Wraps an existing Turn without reading its record; the first state read validates it. Used
+     * when the Turn was just returned by {@link #listTurns} and its metadata is already known.
+     */
+    public DurableTurn turn(String turnId) {
+        return new DurableTurn(this, turnId);
+    }
+
     private EventFilter filter() {
         return new EventFilter(key.threadId(), null, null);
     }

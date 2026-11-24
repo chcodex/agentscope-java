@@ -61,6 +61,9 @@ final class AgentScopeMessageEvents {
     private final Map<String, Reference> nativeMessages = new HashMap<>();
     private final Map<String, Version> versions = new HashMap<>();
 
+    /** Real tool names seen on a model chunk, keyed by tool call id. */
+    private final Map<String, String> toolNames = new HashMap<>();
+
     AgentScopeMessageEvents() {}
 
     AgentScopeMessageEvents(AgentScopeMessageEvents source) {
@@ -68,6 +71,7 @@ final class AgentScopeMessageEvents {
         calls.putAll(source.calls);
         nativeMessages.putAll(source.nativeMessages);
         versions.putAll(source.versions);
+        toolNames.putAll(source.toolNames);
     }
 
     String messageId(String turnId, Msg message) {
@@ -104,7 +108,23 @@ final class AgentScopeMessageEvents {
             long attempt = previous == null ? 1 : Math.addExact(previous.attempt(), 1);
             versions.put(id, new Version(attempt, 0, null, null));
             calls.put(data.path("modelCallId").asText(), new Reference(id, attempt));
+        } else if ("model/response".equals(event.type())) {
+            var reference = calls.get(data.path("modelCallId").asText());
+            String responseId = data.path("responseId").asText("");
+            if (reference != null && !responseId.isEmpty())
+                nativeMessages.put(nativeKey(event.turnId(), responseId), reference);
         } else if ("model/chunk".equals(event.type())) {
+            var chunk = data.path("chunk");
+            // The first tool-call chunk carries the real name; later chunks are argument
+            // fragments with a blank name. Keep the real name so presentation deltas can use it
+            // instead of the accumulator's __fragment__ placeholder.
+            for (var block : chunk.path("content")) {
+                String callId = block.path("id").asText("");
+                String toolName = block.path("name").asText("");
+                if (!callId.isBlank() && !toolName.isBlank() && !toolName.startsWith("__")) {
+                    toolNames.put(callId, toolName);
+                }
+            }
             var reference = calls.get(data.path("modelCallId").asText());
             if (reference != null && data.path("chunk").hasNonNull("id"))
                 nativeMessages.put(
@@ -127,17 +147,37 @@ final class AgentScopeMessageEvents {
             versions.put(step.messageId(), version);
             if ("presentation/tool_arguments".equals(event.type())) {
                 var output = payload(step.messageId(), version, data.path("text").asText());
-                if (data.hasNonNull("toolCallId")) output.set("toolCallId", data.get("toolCallId"));
-                if (data.hasNonNull("name")) output.set("name", data.get("name"));
+                String callId = data.path("toolCallId").asText("");
+                if (!callId.isBlank()) output.put("toolCallId", callId);
+                String toolName = data.path("name").asText("");
+                if (toolName.isBlank() || toolName.startsWith("__")) {
+                    // Argument fragments carry __fragment__; use the name captured from the
+                    // first model chunk so live frames open the card with the real tool name.
+                    toolName = toolNames.getOrDefault(callId, "");
+                }
+                if (!toolName.isBlank()) output.put("name", toolName);
                 return Output.live(live(event, "tool.arguments.delta", output));
             }
             var output = payload(step.messageId(), version, data.path("text").asText());
             if (data.hasNonNull("blockId")) output.set("blockId", data.get("blockId"));
             var delta = live(event, "message.delta", output);
+            // Streaming deltas stay live-only: the committed message.completed carries the full
+            // text, and a reconnect resumes the current Step from the in-process live buffer
+            // instead of every token being written to durable history.
             if (!started) return Output.live(delta);
             var start = payload(step.messageId(), version, "");
             start.remove("text");
             return Output.live(live(event, ":start", "message.started", start), delta);
+        } else if ("presentation/thinking".equals(event.type())) {
+            var step = steps.get(stepId);
+            if (step == null) return Output.none();
+            // A real ThinkingBlock delta. It uses its own message id so the reasoning stream and
+            // the visible reply never share a message id. Reasoning is a preview too, so it stays
+            // live-only until a committed message carries it.
+            String id = "thinking:" + DurableJson.hash(List.of(event.turnId(), "thinking", stepId));
+            var output = payload(id, new Version(1, 0, null, null), data.path("text").asText());
+            output.put("reasoning", true);
+            return Output.live(live(event, "message.delta", output));
         } else if ("message/assistant".equals(event.type()) || "run/output".equals(event.type())) {
             Msg message =
                     JsonUtils.getJsonCodec().convertValue(event.data().get("message"), Msg.class);

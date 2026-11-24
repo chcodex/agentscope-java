@@ -63,7 +63,8 @@ public sealed interface SessionStreamEvent
             String turnId,
             String runId,
             String stepId,
-            JsonNode data)
+            JsonNode data,
+            String sourceEventId)
             implements SessionStreamEvent {
         public EventDelta {
             DurableJson.text(eventId, "delta eventId");
@@ -74,6 +75,23 @@ public sealed interface SessionStreamEvent
             if (runId != null) DurableJson.text(runId, "runId");
             if (stepId != null) DurableJson.text(stepId, "stepId");
             data = DurableJson.copy(data);
+        }
+
+        /**
+         * Creates a delta without a source event id, for callers that cannot name the native
+         * event (tests, synthetic previews). Such frames never participate in live/committed
+         * twin deduplication.
+         */
+        public EventDelta(
+                String eventId,
+                EventDeltaType deltaType,
+                String blockId,
+                String threadId,
+                String turnId,
+                String runId,
+                String stepId,
+                JsonNode data) {
+            this(eventId, deltaType, blockId, threadId, turnId, runId, stepId, data, null);
         }
     }
 
@@ -105,7 +123,8 @@ public sealed interface SessionStreamEvent
                             event.turnId(),
                             event.runId(),
                             event.stepId(),
-                            data);
+                            data,
+                            event.eventId());
             case "tool.arguments.delta" ->
                     new EventDelta(
                             data.required("toolCallId").asText(),
@@ -115,7 +134,8 @@ public sealed interface SessionStreamEvent
                             event.turnId(),
                             event.runId(),
                             event.stepId(),
-                            data);
+                            data,
+                            event.eventId());
             default ->
                     throw new IllegalArgumentException(
                             "Unsupported live stream event: " + event.type());

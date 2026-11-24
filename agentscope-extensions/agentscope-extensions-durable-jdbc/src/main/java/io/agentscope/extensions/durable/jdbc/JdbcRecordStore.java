@@ -26,9 +26,14 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Properties;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
 
@@ -209,6 +214,15 @@ public final class JdbcRecordStore implements RecordStore {
         private final String scope;
         private final long now;
 
+        /**
+         * Read-through cache for this transaction: part key to its committed value, plus parts
+         * proven absent. The transaction snapshot is stable and locking reads bypass it, so
+         * sharing the parsed nodes is safe: no caller mutates a node from {@link #get} in place.
+         */
+        private final Map<String, JsonNode> cached = new HashMap<>();
+
+        private final Set<String> absent = new HashSet<>();
+
         Parts(Connection connection, String scope, long now) {
             this.connection = connection;
             this.scope = scope;
@@ -220,6 +234,12 @@ public final class JdbcRecordStore implements RecordStore {
         }
 
         public JsonNode get(String part) {
+            if (cached.containsKey(part)) {
+                return cached.get(part);
+            }
+            if (absent.contains(part)) {
+                return null;
+            }
             try (var s =
                     connection.prepareStatement(
                             part.isEmpty()
@@ -229,39 +249,121 @@ public final class JdbcRecordStore implements RecordStore {
                 s.setString(1, scope);
                 if (!part.isEmpty()) s.setString(2, part);
                 try (var rs = s.executeQuery()) {
-                    if (!rs.next()) return null;
+                    if (!rs.next()) {
+                        absent.add(part);
+                        return null;
+                    }
                     String value = rs.getString(1);
-                    return value == null ? null : DurableJson.parse(value);
+                    if (value == null) {
+                        absent.add(part);
+                        return null;
+                    }
+                    JsonNode parsed = DurableJson.parse(value);
+                    cached.put(part, parsed);
+                    return parsed;
                 }
             } catch (SQLException e) {
                 throw unavailable(e);
             }
         }
 
+        /**
+         * One round trip per batch instead of one per part; also warms the transaction cache so
+         * the follow-up point reads that prompted the prefetch are free.
+         */
+        @Override
+        public Map<String, JsonNode> getAll(List<String> parts) {
+            if (parts == null || parts.isEmpty()) {
+                return Map.of();
+            }
+            var result = new LinkedHashMap<String, JsonNode>(parts.size());
+            var missing = new ArrayList<String>(parts.size());
+            for (String part : parts) {
+                if (part == null) {
+                    continue;
+                }
+                if (part.isEmpty()) {
+                    JsonNode root = get("");
+                    if (root != null) {
+                        result.put("", root);
+                    }
+                } else if (cached.containsKey(part)) {
+                    result.put(part, cached.get(part));
+                } else if (!absent.contains(part)) {
+                    missing.add(part);
+                }
+            }
+            for (int from = 0; from < missing.size(); from += 500) {
+                var slice = missing.subList(from, Math.min(missing.size(), from + 500));
+                var sql =
+                        new StringBuilder(
+                                "SELECT part_key,payload FROM durable_parts WHERE record_key=?"
+                                        + " AND part_key IN (");
+                for (int i = 0; i < slice.size(); i++) {
+                    sql.append(i == 0 ? "?" : ",?");
+                }
+                sql.append(')');
+                try (var s = connection.prepareStatement(sql.toString())) {
+                    s.setString(1, scope);
+                    int index = 2;
+                    for (String key : slice) {
+                        s.setString(index++, key);
+                    }
+                    try (var rs = s.executeQuery()) {
+                        while (rs.next()) {
+                            String payload = rs.getString(2);
+                            if (payload != null) {
+                                JsonNode parsed = DurableJson.parse(payload);
+                                cached.put(rs.getString(1), parsed);
+                                result.put(rs.getString(1), parsed);
+                            }
+                        }
+                    }
+                } catch (SQLException e) {
+                    throw unavailable(e);
+                }
+            }
+            for (String key : missing) {
+                if (!cached.containsKey(key)) {
+                    absent.add(key);
+                }
+            }
+            return result;
+        }
+
         public void put(String part, JsonNode value) {
             if (part.length() > 512)
                 throw new IllegalArgumentException("Part key exceeds 512 characters");
-            boolean absent = value == null || value.isNull();
+            boolean deleted = value == null || value.isNull();
             String sql =
                     part.isEmpty()
                             ? "UPDATE durable_records SET payload=? WHERE record_key=?"
-                            : absent
+                            : deleted
                                     ? "DELETE FROM durable_parts WHERE record_key=? AND part_key=?"
                                     : "INSERT INTO durable_parts(record_key,part_key,payload)"
                                             + " VALUES (?,?,?) ON CONFLICT(record_key,part_key) DO"
                                             + " UPDATE SET payload=excluded.payload";
             try (var s = connection.prepareStatement(sql)) {
                 if (part.isEmpty()) {
-                    s.setString(1, absent ? null : value.toString());
+                    s.setString(1, deleted ? null : value.toString());
                     s.setString(2, scope);
                 } else {
                     s.setString(1, scope);
                     s.setString(2, part);
-                    if (!absent) s.setString(3, value.toString());
+                    if (!deleted) s.setString(3, value.toString());
                 }
                 s.executeUpdate();
             } catch (SQLException e) {
                 throw unavailable(e);
+            }
+            // The write is applied immediately (no buffer); mirror it so later reads in this
+            // transaction see it.
+            if (deleted) {
+                cached.remove(part);
+                absent.add(part);
+            } else {
+                absent.remove(part);
+                cached.put(part, value);
             }
         }
 

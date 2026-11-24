@@ -44,4 +44,13 @@ public interface LiveEvents {
     void publish(LiveEvent event);
 
     AutoCloseable subscribe(Consumer<LiveEvent> listener);
+
+    /**
+     * Subscribes for one Thread and first replays the recent live events still held in memory, so
+     * a reconnect can resume the current partial message without committing every delta. The
+     * replay is best effort and process-local, exactly like {@link #publish}.
+     */
+    default AutoCloseable subscribe(String threadId, Consumer<LiveEvent> listener) {
+        return subscribe(listener);
+    }
 }

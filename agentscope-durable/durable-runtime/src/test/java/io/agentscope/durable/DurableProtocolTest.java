@@ -74,6 +74,29 @@ class DurableProtocolTest {
     }
 
     @Test
+    void reasoningMessageDeltaConformsToCommitSchema() {
+        var event =
+                new DurableTypes.EventInput(
+                        "reasoning-1",
+                        "message.delta",
+                        DurableJson.value(
+                                Map.of(
+                                        "messageId",
+                                        "thinking:abc",
+                                        "attempt",
+                                        1,
+                                        "revision",
+                                        0,
+                                        "text",
+                                        "why",
+                                        "reasoning",
+                                        true)),
+                        "run-1",
+                        null);
+        DurableProtocol.validate("eventInput", event);
+    }
+
+    @Test
     void resourceLifecycleVectorsRequireStatusAndScopeWithoutInventedExecutionIds()
             throws Exception {
         try (var input = getClass().getResourceAsStream("/durable-protocol/vectors.json")) {

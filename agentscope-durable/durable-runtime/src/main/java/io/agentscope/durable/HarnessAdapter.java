@@ -56,7 +56,8 @@ public interface HarnessAdapter extends AutoCloseable {
     default void settle(HarnessContext context, TurnStatus status, String error) throws Exception {
         if (status != TurnStatus.CANCELLED && status != TurnStatus.FAILED)
             throw new IllegalArgumentException("Settlement requires FAILED or CANCELLED");
-        var frame = context.frame();
+        context.refreshFrame();
+        var frame = context.frameWithCheckpoint();
         context.commit(
                 new Commit(
                         "settled:" + frame.turn().revision(),

@@ -140,7 +140,8 @@ final class AgentScopeExecutionHost implements AgentExecutionHost, ModelInvocati
     AgentScopeExecutionHost(HarnessContext durable, BackendThreadJournal log) {
         this.durable = durable;
         this.log = log;
-        for (var event : log.scan(0, log.head().seq())) {
+        // The journal before the anchor is already folded into the restored state.
+        for (var event : log.scan(log.baseSeq(), log.head().seq())) {
             if ("state/checkpoint".equals(event.type())) replayAfter = event.seq();
             if (!durable.lease().turnId().equals(event.turnId())) continue;
             var data = event.data();
@@ -202,6 +203,7 @@ final class AgentScopeExecutionHost implements AgentExecutionHost, ModelInvocati
                             if (completed) return Mono.empty();
                             // Preserve an already generated reply before the continuation checks
                             // pause. Replaying this frame must not invoke the primary model again.
+                            durable.refreshFrame();
                             if (durable.frame().turn().cancellationRequested())
                                 throw new DurableException(
                                         DurableException.Code.FENCED,
@@ -282,7 +284,7 @@ final class AgentScopeExecutionHost implements AgentExecutionHost, ModelInvocati
                             String hash = requestHash(model, purpose, messages, tools, options);
                             String id = null;
                             long checkpoint = 0;
-                            var history = log.scan(0, log.head().seq());
+                            var history = log.scan(log.baseSeq(), log.head().seq());
                             if (active) {
                                 int index = slot.getAndIncrement();
                                 for (var event : history) {

@@ -21,10 +21,8 @@ import io.agentscope.core.agent.Event;
 import io.agentscope.core.agent.RuntimeContext;
 import io.agentscope.core.agent.StreamOptions;
 import io.agentscope.core.event.AgentEvent;
-import io.agentscope.core.journal.ThreadJournal;
 import io.agentscope.core.message.Msg;
 import java.util.List;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
@@ -34,23 +32,9 @@ public class HarnessAgent implements Agent {
     private Flux<AgentEvent> events = Flux.empty();
     private final AtomicReference<List<Msg>> seenMessages = new AtomicReference<>();
     private final AtomicReference<RuntimeContext> seenContext = new AtomicReference<>();
-    private final AtomicInteger streamCalls = new AtomicInteger();
-    private ThreadJournal sessionLog;
 
     public void setEvents(Flux<AgentEvent> events) {
         this.events = events;
-    }
-
-    public void setThreadJournal(ThreadJournal sessionLog) {
-        this.sessionLog = sessionLog;
-    }
-
-    public ThreadJournal threadJournal(RuntimeContext context) {
-        return sessionLog;
-    }
-
-    public int getStreamCalls() {
-        return streamCalls.get();
     }
 
     public List<Msg> getSeenMessages() {
@@ -62,7 +46,6 @@ public class HarnessAgent implements Agent {
     }
 
     public Flux<AgentEvent> streamEvents(List<Msg> msgs, RuntimeContext context) {
-        streamCalls.incrementAndGet();
         seenMessages.set(msgs);
         seenContext.set(context);
         return events;

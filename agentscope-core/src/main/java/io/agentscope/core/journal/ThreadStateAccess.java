@@ -41,7 +41,8 @@ public final class ThreadStateAccess {
 
     /** Reads one committed prefix without acquiring a writer or changing session history. */
     public static Snapshot read(ThreadJournal log, Supplier<AgentState> initialState) {
-        JournalProjection projection = JournalProjection.read(log);
+        JournalProjection projection =
+                JournalProjection.read(log, log.projectionSeed(log.head().seq()), ignored -> {});
         AgentState state = projection.restore();
         return new Snapshot(projection.asOfSeq(), state == null ? initialState.get() : state);
     }
@@ -83,6 +84,7 @@ public final class ThreadStateAccess {
             throw new IllegalArgumentException("A state change reason is required");
         ThreadJournal.Writer writer = log.acquire(UUID.randomUUID().toString(), LEASE);
         try {
+            // The write path compares the caller's asOfSeq and must see the full projection.
             JournalProjection projection = JournalProjection.read(log);
             if (!projection.uncertainToolCalls().isEmpty())
                 throw new JournalException(

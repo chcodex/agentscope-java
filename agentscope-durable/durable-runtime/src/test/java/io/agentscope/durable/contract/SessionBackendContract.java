@@ -1349,7 +1349,11 @@ public abstract class SessionBackendContract {
                 });
         code(
                 DurableException.Code.INVALID,
-                () -> new HarnessContext(backend, lease, new AtomicBoolean()).frame());
+                // frame() is the lightweight path without the checkpoint body; body validation
+                // lives on frameWithCheckpoint(), still before any native execution.
+                () ->
+                        new HarnessContext(backend, lease, new AtomicBoolean())
+                                .frameWithCheckpoint());
         assertFalse(backend.snapshot(key).projection().toString().contains("corrupted"));
     }
 

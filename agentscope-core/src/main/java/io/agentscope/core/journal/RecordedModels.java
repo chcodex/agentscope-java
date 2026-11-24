@@ -89,6 +89,7 @@ public final class RecordedModels {
                         var recorder = InvocationRecorder.from(context);
                         var last = new AtomicReference<ChatResponse>();
                         var usage = new AtomicReference<ChatUsage>();
+                        var responseRecorded = new java.util.concurrent.atomic.AtomicBoolean(false);
                         var requests = new RecordedModelRequests(recorder, callId, purpose);
                         return Flux.usingWhen(
                                 before(callId)
@@ -107,7 +108,23 @@ public final class RecordedModels {
                                                             last.set(chunk);
                                                             if (chunk.getUsage() != null)
                                                                 usage.set(chunk.getUsage());
-                                                            recorder.append(
+                                                            // Record the response identity once per
+                                                            // model call; the chunks themselves
+                                                            // stay live-only previews.
+                                                            if (chunk.getId() != null
+                                                                    && responseRecorded
+                                                                            .compareAndSet(
+                                                                                    false, true))
+                                                                recorder.append(
+                                                                        "model/response",
+                                                                        Map.of(
+                                                                                "modelCallId",
+                                                                                id,
+                                                                                "responseId",
+                                                                                chunk.getId(),
+                                                                                "purpose",
+                                                                                purpose));
+                                                            recorder.liveOnly(
                                                                     "model/chunk",
                                                                     Map.of(
                                                                             "modelCallId",

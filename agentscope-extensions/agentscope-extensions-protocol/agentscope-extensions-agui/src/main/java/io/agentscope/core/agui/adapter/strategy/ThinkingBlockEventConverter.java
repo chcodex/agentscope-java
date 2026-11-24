@@ -41,11 +41,13 @@ final class ThinkingBlockEventConverter implements AgentEventConverter {
         if (event instanceof ThinkingBlockDeltaEvent delta) {
             // AguiEvent.ReasoningMessageStart delays sending when content arrives
             context.appendReasoningDelta(
-                    AgentEventIds.reasoningMessageId(event, delta.getReplyId(), delta.getBlockId()),
-                    delta.getDelta());
+                    messageId(delta.getReplyId(), delta.getBlockId()), delta.getDelta());
         } else if (event instanceof ThinkingBlockEndEvent end) {
-            context.closeReasoningMessage(
-                    AgentEventIds.reasoningMessageId(event, end.getReplyId(), end.getBlockId()));
+            context.closeReasoningMessage(messageId(end.getReplyId(), end.getBlockId()));
         }
+    }
+
+    private String messageId(String replyId, String blockId) {
+        return replyId + "-" + blockId;
     }
 }

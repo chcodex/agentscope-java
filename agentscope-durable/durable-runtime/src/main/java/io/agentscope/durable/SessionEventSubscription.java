@@ -21,6 +21,7 @@ import io.agentscope.durable.DurableTypes.LiveEvent;
 import io.agentscope.durable.DurableTypes.PublicEvent;
 import io.agentscope.durable.DurableTypes.Snapshot;
 import java.time.Duration;
+import java.util.List;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -60,6 +61,9 @@ public final class SessionEventSubscription implements AutoCloseable {
     private long retryAfter;
     private ScheduledFuture<?> scheduled;
     private final ConcurrentLinkedQueue<LiveEvent> live = new ConcurrentLinkedQueue<>();
+
+    private final Object liveLock = new Object();
+
     private final Set<String> completedMessages = ConcurrentHashMap.newKeySet();
     private final Set<String> completedToolCalls = ConcurrentHashMap.newKeySet();
     private AutoCloseable liveSubscription;
@@ -97,11 +101,13 @@ public final class SessionEventSubscription implements AutoCloseable {
                     liveSubscription =
                             session.liveEvents()
                                     .subscribe(
+                                            filter.threadId(),
                                             event -> {
-                                                if (filter.matches(event)) {
-                                                    live.add(event);
-                                                    changed();
+                                                if (!filter.matches(event)) {
+                                                    return;
                                                 }
+                                                live.add(event);
+                                                changed();
                                             });
                 } catch (RuntimeException error) {
                     logLiveFailure(error);
@@ -129,6 +135,9 @@ public final class SessionEventSubscription implements AutoCloseable {
                 signalled = true;
                 return;
             }
+            // A queued immediate delivery polls after this signal, so it observes the committed
+            // event; dropping the duplicate signal avoids an extra poll per live delta while a
+            // stream is running. Only a failed poll backs off to the interval below.
             if (immediate || (retryAfter != 0 && retryAfter - System.nanoTime() > 0)) return;
             if (scheduled != null) scheduled.cancel(false);
             schedule(0);
@@ -166,6 +175,8 @@ public final class SessionEventSubscription implements AutoCloseable {
             }
             if (closed) return;
             if (reader.poll() > 0) delay = 0;
+            // Previews follow the committed feed. Draining them before the replay catches up
+            // would let a live delta overtake older committed events on a resumed subscription.
             if (reader.replayCaughtUp() && drainLive() > 0) delay = 0;
             lastFailure = null;
         } catch (RuntimeException error) {
@@ -189,16 +200,25 @@ public final class SessionEventSubscription implements AutoCloseable {
     }
 
     private int drainLive() {
-        int delivered = 0;
-        for (LiveEvent event; (event = live.poll()) != null; ) {
-            String messageId = event.data().path("messageId").asText(null);
-            if (messageId != null && completedMessages.contains(messageId)) continue;
-            String toolCallId = event.data().path("toolCallId").asText(null);
-            if (toolCallId != null && completedToolCalls.contains(toolCallId)) continue;
-            liveEvents.accept(event);
-            delivered++;
+        List<LiveEvent> batch;
+        synchronized (liveLock) {
+            batch = new java.util.ArrayList<>();
+            for (LiveEvent event; (event = live.poll()) != null; ) {
+                if (deliverable(event)) batch.add(event);
+            }
         }
-        return delivered;
+        // Never call the subscriber's callback while holding the lock that the publishing
+        // thread also needs to enqueue previews.
+        for (var event : batch) liveEvents.accept(event);
+        return batch.size();
+    }
+
+    private boolean deliverable(LiveEvent event) {
+        String messageId = event.data().path("messageId").asText(null);
+        if (messageId != null && completedMessages.contains(messageId)) return false;
+        String toolCallId = event.data().path("toolCallId").asText(null);
+        if (toolCallId != null && completedToolCalls.contains(toolCallId)) return false;
+        return true;
     }
 
     private void durable(PublicEvent event) {

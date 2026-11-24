@@ -80,6 +80,7 @@ public final class SessionEventStream implements AutoCloseable {
                 subscription =
                         session.liveEvents()
                                 .subscribe(
+                                        filter.threadId(),
                                         event -> {
                                             if (!closed.get()
                                                     && filter.matches(event)

@@ -78,11 +78,18 @@ public final class TransactionMap<V> extends AbstractMap<String, V> {
         String cursor = null;
         while (true) {
             var page = tx.keys(prefix, cursor, 1000);
+            // One range/batch read for the whole page instead of one round trip per part.
+            var records = tx.getAll(page);
             for (var part : page) {
-                var record = tx.get(part);
-                String key = record.path("key").asText();
-                get(key);
+                var record = records.get(part);
                 cursor = part;
+                if (record == null) continue;
+                String key = record.path("key").asText();
+                // Preserve values already written in this transaction (read-your-writes).
+                if (cache.containsKey(key)) continue;
+                JsonNode value = record.get("value");
+                originals.put(key, value);
+                cache.put(key, value == null ? null : DurableJson.convert(value, type));
             }
             if (page.size() < 1000) break;
         }

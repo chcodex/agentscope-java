@@ -21,6 +21,7 @@ import io.agentscope.core.journal.JournalEvent;
 import io.agentscope.core.message.Msg;
 import io.agentscope.core.message.ToolResultBlock;
 import io.agentscope.core.message.ToolResultState;
+import io.agentscope.core.message.ToolResultStates;
 import io.agentscope.core.message.ToolUseBlock;
 import io.agentscope.core.util.JsonUtils;
 import io.agentscope.durable.DurableJson;
@@ -153,7 +154,9 @@ final class AgentScopeToolEvents {
     }
 
     private static ObjectNode outcome(ToolResultBlock result) {
-        String status = status(result.getState());
+        // A tool that finished without marking its state leaves the default RUNNING; resolve it the
+        // same way execution does so the event carries the real outcome instead of "still running".
+        String status = status(ToolResultStates.resolve(result));
         if (result.getExecutionDetails() != null
                 && "UNKNOWN".equals(result.getExecutionDetails().outcome().name()))
             status = "UNKNOWN";

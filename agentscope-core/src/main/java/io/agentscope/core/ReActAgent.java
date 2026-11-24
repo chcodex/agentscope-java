@@ -97,6 +97,7 @@ import io.agentscope.core.message.ThinkingBlock;
 import io.agentscope.core.message.ToolCallState;
 import io.agentscope.core.message.ToolResultBlock;
 import io.agentscope.core.message.ToolResultState;
+import io.agentscope.core.message.ToolResultStates;
 import io.agentscope.core.message.ToolUseBlock;
 import io.agentscope.core.message.UserMessage;
 import io.agentscope.core.middleware.ActingInput;
@@ -4693,22 +4694,8 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
         }
 
         private ToolResultState determineToolResultState(ToolResultBlock result) {
-            if (result.isSuspended()) {
-                return ToolResultState.SUSPENDED;
-            }
-            if (result.getState() != null && result.getState() != ToolResultState.RUNNING) {
-                return result.getState();
-            }
-            if (result.getOutput() != null
-                    && result.getOutput().stream()
-                            .anyMatch(
-                                    b ->
-                                            b instanceof TextBlock tb
-                                                    && tb.getText() != null
-                                                    && tb.getText().startsWith("[ERROR]"))) {
-                return ToolResultState.ERROR;
-            }
-            return ToolResultState.SUCCESS;
+            // Shared with the durable event layer so both report the same state.
+            return ToolResultStates.resolve(result);
         }
 
         /**

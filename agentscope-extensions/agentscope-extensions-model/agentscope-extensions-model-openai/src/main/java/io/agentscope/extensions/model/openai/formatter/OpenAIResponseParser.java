@@ -526,10 +526,9 @@ public class OpenAIResponseParser {
                                             thoughtSignature != null ? "present" : "null");
 
                                     // For streaming, we get partial tool calls that need to be
-                                    // accumulated
-                                    if (toolName != null
-                                            && ToolValidator.requireNonBlank(
-                                                    "OpenAI", toolName, toolCallId)) {
+                                    // accumulated. A blank name is the normal shape of argument
+                                    // fragments; do not warn and do not drop them.
+                                    if (toolName != null && !toolName.isBlank()) {
                                         // First chunk with complete metadata (has tool name)
                                         Map<String, Object> argsMap = new HashMap<>();
 

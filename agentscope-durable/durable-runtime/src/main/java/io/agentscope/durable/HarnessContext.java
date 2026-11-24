@@ -36,6 +36,11 @@ public final class HarnessContext {
     private final LiveEvents liveEvents;
     private final String invocationRequest = UUID.randomUUID().toString();
     private RunView invocation;
+    private Frame cachedFrame;
+    private boolean cachedFrameHasCheckpoint;
+
+    /** Bumped whenever the cache is invalidated so a concurrent reader cannot restore an old frame. */
+    private long frameGeneration;
 
     public HarnessContext(SessionBackend backend, Lease lease, AtomicBoolean stopped) {
         this(backend, lease, stopped, LiveEvents.none());
@@ -68,21 +73,69 @@ public final class HarnessContext {
                 throw unresolved;
             }
         }
+        refreshFrame();
         return invocation;
     }
 
     public Frame frame() {
         check();
-        var frame = backend.frame(lease);
-        if (!frame.checkpoint().isNull()) {
-            if (frame.checkpointMetadata() == null)
+        long generation;
+        synchronized (this) {
+            if (cachedFrame != null) return cachedFrame;
+            generation = frameGeneration;
+        }
+        var frame = readFrame(false);
+        synchronized (this) {
+            if (generation == frameGeneration && cachedFrame == null) {
+                cachedFrame = frame;
+                cachedFrameHasCheckpoint = false;
+            }
+            return cachedFrame != null ? cachedFrame : frame;
+        }
+    }
+
+    /** Full frame including the checkpoint body; use only when the caller needs the snapshot. */
+    public Frame frameWithCheckpoint() {
+        check();
+        long generation;
+        synchronized (this) {
+            if (cachedFrame != null && cachedFrameHasCheckpoint) return cachedFrame;
+            generation = frameGeneration;
+        }
+        var frame = readFrame(true);
+        synchronized (this) {
+            if (generation == frameGeneration) {
+                cachedFrame = frame;
+                cachedFrameHasCheckpoint = true;
+                return cachedFrame;
+            }
+            return cachedFrame != null ? cachedFrame : frame;
+        }
+    }
+
+    /**
+     * Drops the per-invocation frame snapshot. Call before reading state that another host can
+     * change without a local commit (pause/cancel/queued input), and after every commit.
+     */
+    public synchronized void refreshFrame() {
+        cachedFrame = null;
+        cachedFrameHasCheckpoint = false;
+        frameGeneration++;
+    }
+
+    private Frame readFrame(boolean withCheckpoint) {
+        var frame = backend.frame(lease, withCheckpoint);
+        if (withCheckpoint) {
+            if (!frame.checkpoint().isNull()) {
+                if (frame.checkpointMetadata() == null)
+                    throw new DurableException(
+                            DurableException.Code.INCOMPATIBLE,
+                            "Native checkpoint metadata is missing");
+                frame.checkpointMetadata().verify(frame.definition(), frame.checkpoint());
+            } else if (frame.checkpointMetadata() != null) {
                 throw new DurableException(
-                        DurableException.Code.INCOMPATIBLE,
-                        "Native checkpoint metadata is missing");
-            frame.checkpointMetadata().verify(frame.definition(), frame.checkpoint());
-        } else if (frame.checkpointMetadata() != null) {
-            throw new DurableException(
-                    DurableException.Code.INVALID, "Native checkpoint is missing");
+                        DurableException.Code.INVALID, "Native checkpoint is missing");
+            }
         }
         return frame;
     }
@@ -112,6 +165,9 @@ public final class HarnessContext {
                 stopped.set(true);
                 throw unresolved;
             }
+        } finally {
+            // The commit changes Turn revision, signals and possibly the checkpoint.
+            refreshFrame();
         }
     }
 

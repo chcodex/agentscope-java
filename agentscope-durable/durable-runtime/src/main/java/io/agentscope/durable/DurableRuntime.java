@@ -96,6 +96,7 @@ public final class DurableRuntime implements AutoCloseable {
     private final AtomicBoolean accepting = new AtomicBoolean(true);
     private final Map<String, Executor> executors;
     private final Duration pollInterval;
+    private final Duration subscriptionPollInterval;
     private final Duration leaseDuration;
     private final int parallelism;
     private final BiConsumer<SessionKey, Throwable> errors;
@@ -146,6 +147,7 @@ public final class DurableRuntime implements AutoCloseable {
         resolvers = Map.copyOf(b.resolvers);
         capacity = new Semaphore(b.parallelism);
         pollInterval = b.pollInterval;
+        subscriptionPollInterval = b.subscriptionPollInterval;
         leaseDuration = b.leaseDuration;
         parallelism = b.parallelism;
         errors = b.errors;
@@ -153,6 +155,7 @@ public final class DurableRuntime implements AutoCloseable {
         retryableFailure = b.retryableFailure;
         liveEvents = b.liveEvents;
         if (pollInterval.toMillis() < 1
+                || subscriptionPollInterval.toMillis() < 1
                 || leaseDuration.toMillis() < 100
                 || parallelism < 1
                 || b.observerParallelism < 1)
@@ -298,6 +301,15 @@ public final class DurableRuntime implements AutoCloseable {
         return new DurableSession(this, key);
     }
 
+    /**
+     * Wraps an existing Thread without reading the Session or Thread record. The first read made
+     * through the handle validates existence, so a caller that only needs a single read can skip
+     * the two extra round trips.
+     */
+    public DurableThread thread(SessionKey key, String threadId) {
+        return new DurableThread(this, new DurableSession(this, key), threadId);
+    }
+
     public SessionPage listSessions(String namespace, String cursor, int limit) {
         return DurableJson.convert(
                 call("listSessions", "namespace", namespace, "cursor", cursor, "limit", limit),
@@ -432,7 +444,7 @@ public final class DurableRuntime implements AutoCloseable {
                             liveEvents,
                             error -> reportError(session.key(), error),
                             observers,
-                            pollInterval,
+                            subscriptionPollInterval,
                             subscriptions::remove);
             subscriptions.add(subscription);
             try {
@@ -598,20 +610,38 @@ public final class DurableRuntime implements AutoCloseable {
         }
         if (claimed.isEmpty()) return;
         Lease lease = claimed.get();
+        var renewFailures = new java.util.concurrent.atomic.AtomicInteger();
         var heartbeat =
                 timer.scheduleWithFixedDelay(
                         () -> {
                             try {
                                 backend.renew(lease, leaseDuration);
+                                renewFailures.set(0);
                                 if (activeCall.invoking
                                         && backend.turn(key, lease.turnId())
                                                 .cancellationRequested()) {
                                     activeCall.stopped.set(true);
                                     activeCall.thread.interrupt();
                                 }
-                            } catch (RuntimeException e) {
-                                activeCall.stopped.set(true);
-                                activeCall.thread.interrupt();
+                            } catch (DurableException fenced) {
+                                if (fenced.code() == DurableException.Code.FENCED
+                                        || fenced.code() == DurableException.Code.NOT_FOUND) {
+                                    // Another host owns the Turn; retrying cannot succeed.
+                                    activeCall.stopped.set(true);
+                                    activeCall.thread.interrupt();
+                                    return;
+                                }
+                                reportError(key.session(), fenced);
+                                if (renewFailures.incrementAndGet() >= 2) {
+                                    activeCall.stopped.set(true);
+                                    activeCall.thread.interrupt();
+                                }
+                            } catch (RuntimeException transientFailure) {
+                                reportError(key.session(), transientFailure);
+                                if (renewFailures.incrementAndGet() >= 2) {
+                                    activeCall.stopped.set(true);
+                                    activeCall.thread.interrupt();
+                                }
                             }
                         },
                         Math.max(25, leaseDuration.toMillis() / 3),
@@ -620,6 +650,7 @@ public final class DurableRuntime implements AutoCloseable {
         try {
             Frame frame = backend.frame(lease);
             if (frame.turn().status() == TurnStatus.PAUSING) return;
+            boolean resolved = false;
             for (ToolExecution tool : frame.tools()) {
                 if (tool.result().state().terminal()) continue;
                 if (backend.turn(key, lease.turnId()).status() == TurnStatus.PAUSING) return;
@@ -627,9 +658,14 @@ public final class DurableRuntime implements AutoCloseable {
                         lease,
                         tool,
                         frame.turn().cancellationRequested() || recoveryStopped(frame));
+                resolved = true;
             }
-            frame = backend.frame(lease);
-            if (frame.turn().status() == TurnStatus.PAUSING) return;
+            // A fresh Turn has no unsettled tools, so the frame above is still current. Reload
+            // only after a resolve changed tool state; otherwise this repeats a full read.
+            if (resolved) {
+                frame = backend.frame(lease);
+                if (frame.turn().status() == TurnStatus.PAUSING) return;
+            }
             if (frame.turn().cancellationRequested()) {
                 if (frame.tools().stream().allMatch(t -> t.result().state().terminal()))
                     adapter(frame.definition())
@@ -880,6 +916,13 @@ public final class DurableRuntime implements AutoCloseable {
                 new LinkedHashMap<>();
         private final Map<String, Executor> executors = new LinkedHashMap<>();
         private Duration pollInterval = Duration.ofMillis(100);
+
+        /**
+         * Idle fallback for event subscriptions only. Writes wake subscriptions immediately via
+         * {@link Wakeups}, so this interval only bounds the no-event poll.
+         */
+        private Duration subscriptionPollInterval = Duration.ofMillis(500);
+
         private Duration leaseDuration = Duration.ofSeconds(30);
         private RecoveryPolicy recoveryPolicy = RecoveryPolicy.defaults();
         private Predicate<Throwable> retryableFailure = DurableRuntime::transientFailure;
@@ -918,6 +961,15 @@ public final class DurableRuntime implements AutoCloseable {
 
         public Builder pollInterval(Duration value) {
             pollInterval = Objects.requireNonNull(value);
+            return this;
+        }
+
+        /**
+         * Idle fallback for event subscriptions; wakeups still deliver committed events
+         * immediately, so this only bounds the empty poll.
+         */
+        public Builder subscriptionPollInterval(Duration value) {
+            subscriptionPollInterval = Objects.requireNonNull(value);
             return this;
         }
 
