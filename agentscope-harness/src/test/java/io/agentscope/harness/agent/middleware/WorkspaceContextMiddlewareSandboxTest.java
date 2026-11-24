@@ -1,0 +1,196 @@
+/*
+ * Copyright 2024-2026 the original author or authors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package io.agentscope.harness.agent.middleware;
+
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import io.agentscope.core.agent.RuntimeContext;
+import io.agentscope.harness.agent.context.ContextItem;
+import io.agentscope.harness.agent.context.WorkspaceContextMaterials;
+import io.agentscope.harness.agent.filesystem.model.ExecuteResponse;
+import io.agentscope.harness.agent.filesystem.model.FileDownloadResponse;
+import io.agentscope.harness.agent.filesystem.model.FileUploadResponse;
+import io.agentscope.harness.agent.filesystem.sandbox.BaseSandboxFilesystem;
+import io.agentscope.harness.agent.workspace.WorkspaceManager;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+class WorkspaceContextMiddlewareSandboxTest {
+
+    private final List<WorkspaceManager> openManagers = new ArrayList<>();
+
+    @AfterEach
+    void closeOpenManagers() {
+        for (WorkspaceManager wm : openManagers) {
+            wm.close();
+        }
+        openManagers.clear();
+    }
+
+    private WorkspaceManager track(WorkspaceManager wm) {
+        openManagers.add(wm);
+        return wm;
+    }
+
+    /**
+     * Runs the middleware and returns the collected workspace materials as text. Since the
+     * JEV redesign, {@code onSystemPrompt} returns the base prompt unchanged and publishes
+     * materials to the {@link WorkspaceContextMaterials} registry instead.
+     */
+    private static String collectMaterials(WorkspaceContextMiddleware mw) {
+        RuntimeContext rc = RuntimeContext.builder().sessionId("test-session").build();
+        mw.onSystemPrompt(null, rc, "BASE\n").block();
+        WorkspaceContextMaterials materials = rc.get(WorkspaceContextMaterials.class);
+        assertNotNull(materials);
+        return materials.items().stream()
+                .map(ContextItem::content)
+                .collect(Collectors.joining("\n"));
+    }
+
+    @Test
+    void sandboxBranch_describesExecutionBackend(@TempDir Path workspace) {
+        FakeSandboxFilesystem fs = new FakeSandboxFilesystem("sbox-1", "/custom/root");
+        WorkspaceManager wm = track(new WorkspaceManager(workspace, fs));
+        WorkspaceContextMiddleware mw = new WorkspaceContextMiddleware(wm);
+
+        String prompt = collectMaterials(mw);
+        assertNotNull(prompt);
+        assertTrue(prompt.contains("File and shell paths follow the configured execution backend"));
+        assertTrue(prompt.contains("No artifact delivery tool is configured"));
+    }
+
+    @Test
+    void sandboxBranch_doesNotAdvertiseHostWorkspaceRoot(@TempDir Path workspace) {
+        FakeSandboxFilesystem fs = new FakeSandboxFilesystem("sbox-2", null);
+        WorkspaceManager wm = track(new WorkspaceManager(workspace, fs));
+        WorkspaceContextMiddleware mw = new WorkspaceContextMiddleware(wm);
+
+        String prompt = collectMaterials(mw);
+        assertNotNull(prompt);
+        assertTrue(prompt.contains("File and shell paths follow the configured execution backend"));
+        assertFalse(prompt.contains("Workspace root for file operations:"));
+    }
+
+    @Test
+    void sessionContext_usesHostPlatform(@TempDir Path workspace) {
+        FakeSandboxFilesystem fs = new FakeSandboxFilesystem("sbox-8", "/workspace");
+        fs.osReleaseResponse = new ExecuteResponse("Ubuntu 22.04", 0, false);
+        fs.tempdirResponse = new ExecuteResponse("/sandbox-tmp", 0, false);
+        WorkspaceManager wm = track(new WorkspaceManager(workspace, fs));
+        WorkspaceContextMiddleware mw = new WorkspaceContextMiddleware(wm);
+
+        String prompt = collectMaterials(mw);
+        assertNotNull(prompt);
+        // The prompt describes the host JVM, not the execution backend's os-release/tmpdir.
+        assertTrue(prompt.contains(System.getProperty("os.name")));
+        assertTrue(prompt.contains(System.getProperty("java.io.tmpdir")));
+        assertFalse(prompt.contains("Ubuntu 22.04"));
+        assertFalse(prompt.contains("/sandbox-tmp"));
+    }
+
+    @Test
+    void sessionContext_fallsBackToHostOnSandboxFailure(@TempDir Path workspace) {
+        FakeSandboxFilesystem fs = new FakeSandboxFilesystem("sbox-9", "/workspace");
+        fs.osReleaseResponse = new ExecuteResponse("", 1, false);
+        fs.unameResponse = new ExecuteResponse("", 1, false);
+        fs.tempdirResponse = new ExecuteResponse("", 1, false);
+        WorkspaceManager wm = track(new WorkspaceManager(workspace, fs));
+        WorkspaceContextMiddleware mw = new WorkspaceContextMiddleware(wm);
+
+        String prompt = collectMaterials(mw);
+        assertNotNull(prompt);
+        assertTrue(prompt.contains(System.getProperty("os.name")));
+        assertTrue(prompt.contains(System.getProperty("java.io.tmpdir")));
+    }
+
+    @Test
+    void sessionContext_includesSessionInfo(@TempDir Path workspace) {
+        FakeSandboxFilesystem fs = new FakeSandboxFilesystem("sbox-7", "/workspace");
+        WorkspaceManager wm = track(new WorkspaceManager(workspace, fs));
+        WorkspaceContextMiddleware mw = new WorkspaceContextMiddleware(wm);
+
+        String prompt = collectMaterials(mw);
+        assertNotNull(prompt);
+        assertTrue(prompt.contains("## Runtime Environment"));
+        assertTrue(prompt.contains("AgentStateStore session id: test-session"));
+    }
+
+    private static final class FakeSandboxFilesystem extends BaseSandboxFilesystem {
+
+        private final String id;
+        private final String workspaceRoot;
+
+        ExecuteResponse osReleaseResponse;
+        ExecuteResponse unameResponse;
+        ExecuteResponse tempdirResponse;
+
+        FakeSandboxFilesystem(String id, String workspaceRoot) {
+            this.id = id;
+            this.workspaceRoot = workspaceRoot;
+        }
+
+        @Override
+        public String id() {
+            return id;
+        }
+
+        @Override
+        public String getWorkspaceRoot() {
+            return workspaceRoot != null ? workspaceRoot : "/workspace";
+        }
+
+        @Override
+        public ExecuteResponse execute(
+                RuntimeContext runtimeContext, String command, Integer timeoutSeconds) {
+            if (command.contains("/etc/os-release")) {
+                return osReleaseResponse != null
+                        ? osReleaseResponse
+                        : new ExecuteResponse("Linux 6.2", 0, false);
+            }
+            if (command.contains("uname")) {
+                return unameResponse != null
+                        ? unameResponse
+                        : new ExecuteResponse("Linux", 0, false);
+            }
+            if (command.contains("TMPDIR")) {
+                return tempdirResponse != null
+                        ? tempdirResponse
+                        : new ExecuteResponse("/tmp", 0, false);
+            }
+            return new ExecuteResponse("", 0, false);
+        }
+
+        @Override
+        public List<FileUploadResponse> uploadFiles(
+                RuntimeContext runtimeContext, List<Map.Entry<String, byte[]>> files) {
+            return List.of();
+        }
+
+        @Override
+        public List<FileDownloadResponse> downloadFiles(
+                RuntimeContext runtimeContext, List<String> paths) {
+            return List.of();
+        }
+    }
+}

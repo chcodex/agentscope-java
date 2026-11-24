@@ -296,7 +296,8 @@ public abstract class AbstractBaseSandbox implements Sandbox {
      *
      * @return workspace root path string
      */
-    protected abstract String getWorkspaceRoot();
+    @Override
+    public abstract String getWorkspaceRoot();
 
     /**
      * Deletes workspace files that a previous projection put in place and the current one

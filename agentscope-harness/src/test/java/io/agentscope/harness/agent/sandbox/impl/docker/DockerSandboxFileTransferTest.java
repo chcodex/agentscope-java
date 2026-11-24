@@ -38,8 +38,9 @@ class DockerSandboxFileTransferTest {
     void setUp() {
         DockerSandboxState state = new DockerSandboxState();
         state.setContainerId("container-1");
-        state.setWorkspaceRoot("/workspace");
-        state.setWorkspaceSpec(new WorkspaceSpec());
+        WorkspaceSpec workspaceSpec = new WorkspaceSpec();
+        workspaceSpec.setRoot("/workspace");
+        state.setWorkspaceSpec(workspaceSpec);
         sandbox = new DockerSandbox(state);
     }
 
@@ -58,8 +59,9 @@ class DockerSandboxFileTransferTest {
         assertFalse(sandbox.supportsFileTransfer("/workspace/../."));
 
         DockerSandboxState state = new DockerSandboxState();
-        state.setWorkspaceRoot("/workspace");
-        state.setWorkspaceSpec(new WorkspaceSpec());
+        WorkspaceSpec workspaceSpec = new WorkspaceSpec();
+        workspaceSpec.setRoot("/workspace");
+        state.setWorkspaceSpec(workspaceSpec);
         assertFalse(new DockerSandbox(state).supportsFileTransfer("/workspace/a.txt"));
     }
 
@@ -207,9 +209,10 @@ class DockerSandboxFileTransferTest {
 
     private static DockerSandboxState stateWithWorkspace(String root, String containerId) {
         DockerSandboxState state = new DockerSandboxState();
-        state.setWorkspaceRoot(root);
+        WorkspaceSpec workspaceSpec = new WorkspaceSpec();
+        workspaceSpec.setRoot(root);
+        state.setWorkspaceSpec(workspaceSpec);
         state.setContainerId(containerId);
-        state.setWorkspaceSpec(new WorkspaceSpec());
         return state;
     }
 

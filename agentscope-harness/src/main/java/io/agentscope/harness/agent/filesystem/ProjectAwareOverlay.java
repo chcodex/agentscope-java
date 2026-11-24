@@ -122,6 +122,12 @@ public class ProjectAwareOverlay extends OverlayFilesystem implements AbstractSa
         return shellBackend.id();
     }
 
+    /** Returns the workspace root this overlay was built with (not the shell cwd). */
+    @Override
+    public String getWorkspaceRoot() {
+        return workspaceRoot.toString();
+    }
+
     @Override
     public ExecuteResponse execute(
             RuntimeContext runtimeContext, String command, Integer timeoutSeconds) {

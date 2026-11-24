@@ -83,6 +83,104 @@ public final class AtomicThreadJournal implements ThreadJournal {
         return head(storage.read(path("head.json")));
     }
 
+    private record Anchors(long lastCheckpointSeq, long lastRunStartSeq) {}
+
+    @Override
+    public long lastCheckpointSeq() {
+        return readAnchors().lastCheckpointSeq();
+    }
+
+    @Override
+    public long lastRunStartSeq() {
+        return readAnchors().lastRunStartSeq();
+    }
+
+    private Anchors readAnchors() {
+        var anchors = parseAnchors(storage.read(path("anchors.json")));
+        return anchors == null ? new Anchors(0, 0) : anchors;
+    }
+
+    /** Returns {@code null} when the anchor file is missing, unreadable, or not parseable. */
+    private static Anchors parseAnchors(AtomicJournalStorage.Value value) {
+        if (value == null) return null;
+        try {
+            return parse(value.bytes(), Anchors.class);
+        } catch (RuntimeException ignored) {
+            return null;
+        }
+    }
+
+    /**
+     * Rebuilds both anchors from the committed chain. Used only when {@code anchors.json} is
+     * missing or invalid, for example after upgrading an existing Thread: writing only the anchor
+     * from the current batch would drop the checkpoint that the batch does not mention.
+     */
+    private Anchors rebuildAnchors() {
+        long checkpoint = 0;
+        long runStart = 0;
+        var seen = new HashSet<String>();
+        for (String id = head().commitId(); id != null; ) {
+            if (!seen.add(id)) throw new JournalException("Commit chain cycle");
+            var stored = storage.read(path("commits/" + id + ".json"));
+            if (stored == null) throw new JournalException("Missing committed segment");
+            var commit = parse(stored.bytes(), Commit.class);
+            var events = commit.events();
+            for (int i = events.size() - 1; i >= 0; i--) {
+                var event = events.get(i);
+                if (checkpoint == 0
+                        && (event.type().equals("state/checkpoint")
+                                || event.type().equals("migration/baseline")
+                                || event.type().equals("state/initialized")
+                                || event.type().equals("state/restored"))) checkpoint = event.seq();
+                if (runStart == 0 && event.type().equals("run/start")) runStart = event.seq();
+                if (checkpoint > 0 && runStart > 0) return new Anchors(checkpoint, runStart);
+            }
+            id = commit.parent();
+        }
+        return new Anchors(checkpoint, runStart);
+    }
+
+    /**
+     * Advances the recovery anchors after a successful commit. Anchors are hints, so a failed
+     * update only makes the next recovery replay from an older point; it must never fail the
+     * commit itself.
+     */
+    private void updateAnchors(List<JournalEvent> events) {
+        long checkpoint = 0;
+        long runStart = 0;
+        for (var event : events) {
+            switch (event.type()) {
+                case "state/checkpoint",
+                        "migration/baseline",
+                        "state/initialized",
+                        "state/restored" ->
+                        checkpoint = Math.max(checkpoint, event.seq());
+                case "run/start" -> runStart = Math.max(runStart, event.seq());
+                default -> {}
+            }
+        }
+        if (checkpoint == 0 && runStart == 0) return;
+        try {
+            for (int i = 0; i < 8; i++) {
+                var value = storage.read(path("anchors.json"));
+                var current = parseAnchors(value);
+                boolean valid = current != null;
+                if (!valid) current = rebuildAnchors();
+                long nextCheckpoint = Math.max(current.lastCheckpointSeq(), checkpoint);
+                long nextRunStart = Math.max(current.lastRunStartSeq(), runStart);
+                if (valid
+                        && nextCheckpoint == current.lastCheckpointSeq()
+                        && nextRunStart == current.lastRunStartSeq()) return;
+                var next = new Anchors(nextCheckpoint, nextRunStart);
+                if (storage.compareAndSet(
+                        path("anchors.json"), value == null ? 0 : value.version(), bytes(next)))
+                    return;
+            }
+        } catch (RuntimeException ignored) {
+            // Best-effort hint; recovery safely falls back to the previous anchor.
+        }
+    }
+
     private String sealPath(String owner) {
         return path("writer-seals/" + hash(owner.getBytes(StandardCharsets.UTF_8)) + ".json");
     }
@@ -204,6 +302,7 @@ public final class AtomicThreadJournal implements ThreadJournal {
                         if (!c.hash().equals(hash) || c.firstSeq() != expectedSeq + 1)
                             throw new JournalException("Batch ID reused with different content");
                         owned(h, writer);
+                        updateAnchors(frozen);
                         return h;
                     }
                     if (c.lastSeq() < expectedSeq + 1) break;
@@ -246,13 +345,16 @@ public final class AtomicThreadJournal implements ThreadJournal {
             owned(h, writer);
             var next = new Head(FORMAT_VERSION, seq, h.epoch(), h.owner(), h.leaseUntil(), id);
             try {
-                if (storage.compareAndSet(path("head.json"), value.version(), bytes(next)))
+                if (storage.compareAndSet(path("head.json"), value.version(), bytes(next))) {
+                    updateAnchors(frozen);
                     return next;
+                }
             } catch (RuntimeException error) {
                 try {
                     var observed = head();
                     if (id.equals(observed.commitId()) && observed.seq() == seq) {
                         owned(observed, writer);
+                        updateAnchors(frozen);
                         return observed;
                     }
                 } catch (RuntimeException inspection) {

@@ -29,18 +29,47 @@ public final class JournalExporter {
         drain(sink.maxEventsPerDrain());
     }
 
-    /** Drains a bounded committed prefix, retaining the same durable acknowledgement rules. */
+    /**
+     * Drains a bounded committed prefix, retaining the same durable acknowledgement rules.
+     *
+     * <p>The export watermark is advanced in batches instead of once per event: a cursor write is
+     * a CAS round-trip on most backends, and a long journal would otherwise pay one write per
+     * exported event. A lost ACK still re-delivers the whole unacknowledged tail, so sinks remain
+     * idempotent by event id.
+     */
     public synchronized long drain(long maxEvents) {
         if (maxEvents < 1) throw new IllegalArgumentException("Export limit must be positive");
         long cursor = log.exportCursor(sink.name());
-        long through = cursor + Math.min(maxEvents, log.head().seq() - cursor);
+        long remaining = Math.max(0L, log.head().seq() - cursor);
+        long through = cursor + Math.min(maxEvents, remaining);
+        long last = cursor;
+        int pending = 0;
         long count = 0;
-        for (var event : log.scan(cursor, through)) {
-            sink.accept(event);
-            log.advanceExportCursor(sink.name(), cursor, event.seq());
-            cursor = event.seq();
-            count++;
+        try {
+            for (var event : log.scan(cursor, through)) {
+                sink.accept(event);
+                last = event.seq();
+                count++;
+                if (++pending >= 200) {
+                    log.advanceExportCursor(sink.name(), cursor, last);
+                    cursor = last;
+                    pending = 0;
+                }
+            }
+            if (pending > 0) log.advanceExportCursor(sink.name(), cursor, last);
+            return count;
+        } catch (RuntimeException error) {
+            // A failed delivery must not acknowledge the failed event, but the prefix that was
+            // already accepted is safe to record. Without this, a slow or failing sink would
+            // replay the whole batch (up to 200 events) on every retry.
+            if (last > cursor) {
+                try {
+                    log.advanceExportCursor(sink.name(), cursor, last);
+                } catch (RuntimeException advance) {
+                    error.addSuppressed(advance);
+                }
+            }
+            throw error;
         }
-        return count;
     }
 }

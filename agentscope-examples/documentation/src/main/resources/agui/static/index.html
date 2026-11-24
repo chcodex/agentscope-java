@@ -340,6 +340,7 @@
 
         <div class="demo-actions">
             <button id="approval-demo-btn">HITL 审批演示（点击测试）</button>
+            <button id="new-chat-btn">新会话（重置 threadId）</button>
         </div>
 
         <div id="messages"></div>
@@ -364,11 +365,18 @@
         const sendBtn = document.getElementById('send-btn');
         const stopBtn = document.getElementById('stop-btn');
         const approvalDemoBtn = document.getElementById('approval-demo-btn');
+        const newChatBtn = document.getElementById('new-chat-btn');
         const messages = document.getElementById('messages');
         const statusDot = document.getElementById('status-dot');
         const statusText = document.getElementById('status-text');
 
-        let threadId = 'thread-' + Date.now();
+        const THREAD_ID_STORAGE_KEY = 'agui-thread-id';
+        const HYDRATE_FLAG_KEY = 'agui-thread-hydrate';
+        let threadId = localStorage.getItem(THREAD_ID_STORAGE_KEY);
+        if (!threadId) {
+            threadId = 'thread-' + Date.now();
+            localStorage.setItem(THREAD_ID_STORAGE_KEY, threadId);
+        }
         let messageHistory = [];
         let isRunning = false;
         let activeToolCalls = new Map();
@@ -561,6 +569,48 @@
             setStatus('ready', 'Ready');
         }
 
+        // Rebuild the chat UI and message history from a hydrate MESSAGES_SNAPSHOT.
+        function restoreMessagesSnapshot(snapshotMessages) {
+            if (!Array.isArray(snapshotMessages)) return;
+
+            messageHistory.length = 0;
+            messages.innerHTML = '';
+            currentAssistantDiv = null;
+            currentReasoningDiv = null;
+
+            for (const message of snapshotMessages) {
+                if (!message || !message.role) continue;
+                if (message.role === 'tool') {
+                    appendMessage(
+                        'tool',
+                        `Tool result for ${message.toolCallId || message.id}\n${message.content || ''}`);
+                } else {
+                    appendMessage(message.role, message.content || '');
+                }
+                const historyEntry = { id: message.id, role: message.role };
+                if (message.content != null) historyEntry.content = message.content;
+                if (message.toolCallId != null) historyEntry.toolCallId = message.toolCallId;
+                messageHistory.push(historyEntry);
+            }
+
+            if (messageHistory.length > 0) {
+                // The thread is now materialized on the server, so a future reload is hydratable.
+                localStorage.setItem(HYDRATE_FLAG_KEY, threadId);
+            }
+        }
+
+        function newChat() {
+            if (isRunning) return;
+            threadId = 'thread-' + Date.now();
+            localStorage.setItem(THREAD_ID_STORAGE_KEY, threadId);
+            localStorage.removeItem(HYDRATE_FLAG_KEY);
+            messageHistory = [];
+            messages.innerHTML = '';
+            currentAssistantDiv = null;
+            currentReasoningDiv = null;
+            setStatus('ready', 'New chat started');
+        }
+
         async function runAgent(messagesForServer) {
             isRunning = true;
             sendBtn.style.display = 'none';
@@ -587,6 +637,16 @@
                         currentAssistantDiv = null;
                         currentReasoningDiv = null;
                         reasoningContent = '';
+                    },
+                    onMessagesSnapshot: (snapshotMessages) => {
+                        hideTypingIndicator();
+                        restoreMessagesSnapshot(snapshotMessages);
+                    },
+                    onActivitySnapshot: (event) => {
+                        hideTypingIndicator();
+                        appendMessage(
+                            'custom',
+                            `Activity snapshot (${event.activityType})\n${JSON.stringify(event.content ?? {})}`);
                     },
                     onReasoningMessageStart: (messageId, role) => {
                         console.log('Reasoning message start:', messageId, role);
@@ -745,6 +805,13 @@
         sendBtn.addEventListener('click', sendMessage);
         stopBtn.addEventListener('click', stopGeneration);
         approvalDemoBtn.addEventListener('click', startApprovalDemo);
+        newChatBtn.addEventListener('click', newChat);
+
+        // Hydrate on load: with a materialized thread and an empty transcript, an empty run
+        // input makes the server replay the stored presentation snapshot (MESSAGES_SNAPSHOT).
+        if (localStorage.getItem(HYDRATE_FLAG_KEY) === threadId) {
+            runAgent([]);
+        }
 
         // Focus input on load
         input.focus();

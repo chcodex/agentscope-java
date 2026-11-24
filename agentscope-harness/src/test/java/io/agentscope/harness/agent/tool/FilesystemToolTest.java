@@ -33,6 +33,7 @@ import io.agentscope.core.tool.AgentTool;
 import io.agentscope.core.tool.Toolkit;
 import io.agentscope.harness.agent.IsolationScope;
 import io.agentscope.harness.agent.filesystem.AbstractFilesystem;
+import io.agentscope.harness.agent.filesystem.local.LocalFilesystem;
 import io.agentscope.harness.agent.filesystem.model.EditResult;
 import io.agentscope.harness.agent.filesystem.model.FileData;
 import io.agentscope.harness.agent.filesystem.model.FileInfo;
@@ -194,6 +195,8 @@ class FilesystemToolTest {
         assertEquals("Empty directory: /empty/dir", textOf(result));
     }
 
+    // ==================== Bug reproduction: listFiles ambiguous error message ====================
+
     @Test
     void readFile_omittedOffsetAndLimit_defaultToZero() {
         when(filesystem.read(eq(RT), eq("f.txt"), eq(0), eq(0)))
@@ -216,6 +219,101 @@ class FilesystemToolTest {
 
         assertEquals("world", textOf(result));
         verify(filesystem).read(RT, "f.txt", 2, 5);
+    }
+
+    // ---------------------------------------------------------------
+    // listFiles 集成测试 — 使用真实 LocalFilesystem 后端
+    // ---------------------------------------------------------------
+
+    @Test
+    void listFiles_withLocalFilesystem_directoryWithOnlySubdirs_succeeds(@TempDir Path tempDir)
+            throws Exception {
+        // 模拟用户场景: office-tools-ppt/office-tools-ppt 两级嵌套，最内层仅有目录
+        Path outer = tempDir.resolve("office-tools-ppt");
+        Path inner = outer.resolve("office-tools-ppt");
+        Files.createDirectories(inner.resolve("references"));
+        Files.createDirectories(inner.resolve("scripts"));
+        Files.createDirectories(inner.resolve("tests"));
+
+        LocalFilesystem fs = new LocalFilesystem(tempDir);
+        FilesystemTool tool = new FilesystemTool(fs);
+
+        // 测试: 外层 office-tools-ppt 下只有 office-tools-ppt/ 一个子目录（无文件）
+        ToolResultBlock outerResultBlock = tool.listFiles(RT, "office-tools-ppt");
+        assertEquals(ToolResultState.SUCCESS, outerResultBlock.getState());
+        String outerResult = textOf(outerResultBlock);
+        // 先直接断言完整输出，方便看清实际返回
+        assertTrue(outerResult.contains("[DIR]"), "外层仅有子目录时应正常列出，但实际返回: [" + outerResult + "]");
+
+        // 测试: 内层 office-tools-ppt/office-tools-ppt 下仅有 references, scripts, tests（无文件）
+        ToolResultBlock innerResultBlock = tool.listFiles(RT, "office-tools-ppt/office-tools-ppt");
+        assertEquals(ToolResultState.SUCCESS, innerResultBlock.getState());
+        String innerResult = textOf(innerResultBlock);
+        assertTrue(innerResult.contains("[DIR]"), "内层仅有子目录时应正常列出，但实际返回: [" + innerResult + "]");
+    }
+
+    @Test
+    void listFiles_withLocalFilesystem_nestedDotDirectory_onlyDirs(@TempDir Path tempDir)
+            throws Exception {
+        Path deep =
+                tempDir.resolve(".agentscope")
+                        .resolve("workspace")
+                        .resolve("TEST-ID")
+                        .resolve(".skills-cache")
+                        .resolve("git-copilot-plugins")
+                        .resolve("skills")
+                        .resolve("default")
+                        .resolve("office-tools-ppt")
+                        .resolve("office-tools-ppt");
+        Files.createDirectories(deep.resolve("references"));
+        Files.createDirectories(deep.resolve("scripts"));
+        Files.createDirectories(deep.resolve("tests"));
+
+        LocalFilesystem fs = new LocalFilesystem(tempDir);
+        FilesystemTool tool = new FilesystemTool(fs);
+
+        ToolResultBlock resultBlock =
+                tool.listFiles(
+                        RT,
+                        ".agentscope/workspace/TEST-ID/.skills-cache/git-copilot-plugins/skills/default/office-tools-ppt/office-tools-ppt");
+        assertEquals(ToolResultState.SUCCESS, resultBlock.getState());
+        String result = textOf(resultBlock);
+
+        assertTrue(result.contains("[DIR]"), "隐藏路径 + 仅有目录时应正常列出，但实际返回: [" + result + "]");
+    }
+
+    @Test
+    void listFiles_withLocalFilesystem_andPathNormalizer_onlyDirs(@TempDir Path tempDir)
+            throws Exception {
+        Path workspaceRoot = tempDir.resolve(".agentscope").resolve("workspace").resolve("TEST-ID");
+        Path deep =
+                workspaceRoot
+                        .resolve(".skills-cache")
+                        .resolve("git-copilot-plugins")
+                        .resolve("skills")
+                        .resolve("default")
+                        .resolve("office-tools-ppt")
+                        .resolve("office-tools-ppt");
+        Files.createDirectories(deep.resolve("references"));
+        Files.createDirectories(deep.resolve("scripts"));
+        Files.createDirectories(deep.resolve("tests"));
+
+        // 实际 HarnessAgent: cwd = 工作区根目录, normalizer 前缀 = 同一目录
+        LocalFilesystem fs = new LocalFilesystem(workspaceRoot);
+        WorkspacePathNormalizer normalizer = WorkspacePathNormalizer.of(workspaceRoot.toString());
+        FilesystemTool tool = new FilesystemTool(fs, normalizer);
+
+        String agentPath =
+                workspaceRoot
+                        .resolve(
+                                ".skills-cache/git-copilot-plugins/skills/default/office-tools-ppt/office-tools-ppt")
+                        .toString();
+
+        ToolResultBlock resultBlock = tool.listFiles(RT, agentPath);
+        assertEquals(ToolResultState.SUCCESS, resultBlock.getState());
+        String result = textOf(resultBlock);
+
+        assertTrue(result.contains("[DIR]"), "normalizer 剥离前缀后应正常列出，但实际返回: [" + result + "]");
     }
 
     @Test

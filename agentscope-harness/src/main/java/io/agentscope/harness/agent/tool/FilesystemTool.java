@@ -131,7 +131,10 @@ public class FilesystemTool {
     }
 
     private String norm(String path, RuntimeContext runtimeContext) {
-        return pathNormalizer != null ? pathNormalizer.normalize(path, runtimeContext) : path;
+        if (pathNormalizer == null || path == null) {
+            return path;
+        }
+        return pathNormalizer.normalize(path, runtimeContext);
     }
 
     @Tool(

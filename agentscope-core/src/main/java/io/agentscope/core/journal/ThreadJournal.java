@@ -50,6 +50,22 @@ public interface ThreadJournal {
         throw new UnsupportedOperationException("Export cursor persistence not implemented");
     }
 
+    /**
+     * Sequence of the most recent committed state baseline, or {@code 0} when the backend cannot
+     * expose one. Recovery may start replaying here instead of at the beginning of the journal.
+     */
+    default long lastCheckpointSeq() {
+        return 0;
+    }
+
+    /**
+     * Sequence of the most recent {@code run/start}, or {@code 0} when unknown. Recovery must
+     * include it so active runs and uncertain tool calls stay visible.
+     */
+    default long lastRunStartSeq() {
+        return 0;
+    }
+
     /** Stable-prefix scan. Implementations can avoid repeatedly traversing a commit chain. */
     default Iterable<JournalEvent> scan(long after, long through) {
         return scanRange(after, through, this::readAfter);

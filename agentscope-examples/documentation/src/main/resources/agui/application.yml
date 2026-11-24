@@ -53,6 +53,9 @@ agentscope:
     max-thread-sessions: 1000
     session-timeout-minutes: 30
     enable-reasoning: true
+    # Keep the agent running after the client disconnects so the run completes
+    # and can be reattached from the session log after a page reload.
+    interrupt-on-disconnect: false
 
 # Logging
 logging:

@@ -63,7 +63,24 @@ import reactor.core.scheduler.Scheduler;
 public final class InvocationRecorder {
     public static final String CONTEXT_KEY = "agentscope.journal.recorder";
     public static final String PARENT_KEY = "agentscope.journal.parent";
+
+    /**
+     * Metadata key carrying the journal sequence assigned to the source event or chunk. The value
+     * is assigned when the event is appended and becomes committed on the next flush, so consumers
+     * must not assume the committed head already covers it.
+     */
+    public static final String SESSION_SEQ_KEY = "agentscope.session.seq";
+
+    /**
+     * Metadata key carrying the sequence of the event a frame belongs to. One model chunk can
+     * produce several agent events that share one sequence; only the last frame carries {@link
+     * #SESSION_SEQ_KEY} as the cursor, so a consumer advances the cursor once the whole event has
+     * been delivered.
+     */
+    public static final String SESSION_SOURCE_SEQ_KEY = "agentscope.session.sourceSeq";
+
     private final AtomicBoolean exporting = new AtomicBoolean();
+    private final AtomicBoolean exportRequested = new AtomicBoolean();
     private static final Duration LEASE = Duration.ofMinutes(2);
     private final ThreadJournal log;
     private final ThreadJournal.Writer writer;
@@ -71,6 +88,7 @@ public final class InvocationRecorder {
     private final String turnId;
     private final List<JournalEvent> pending = new ArrayList<>();
     private long durableSeq;
+    private long lastAppendedSeq;
     private int pendingBytes;
     private Throwable failure;
     private boolean closed;
@@ -291,6 +309,15 @@ public final class InvocationRecorder {
         return Set.copyOf(recordedMessages);
     }
 
+    /**
+     * Returns the sequence assigned to the most recently appended event, committed or not.
+     *
+     * @return the last assigned sequence, or {@code 0} when nothing was appended yet
+     */
+    public synchronized long lastAppendedSeq() {
+        return lastAppendedSeq;
+    }
+
     public JournalProjection initial() {
         return initial;
     }
@@ -391,6 +418,9 @@ public final class InvocationRecorder {
         pending.add(accepted);
         pendingBytes += byteLength;
         acceptedVersion++;
+        // Publish only after the event is really pending: a validation or buffer failure must not
+        // leave a cursor pointing at a record that does not exist.
+        lastAppendedSeq = seq;
         scheduleFlush();
         return seq;
     }
@@ -521,18 +551,24 @@ public final class InvocationRecorder {
 
     private void exportCommitted() {
         if (exporter == null) return;
+        exportRequested.set(true);
         if (!exporting.compareAndSet(false, true)) return;
         JournalSchedulers.maintenance()
                 .schedule(
                         () -> {
                             try {
-                                exporter.drain();
+                                // A commit that arrives while a drain is running must not be
+                                // dropped: keep draining until no request is left, or the final
+                                // events of a run wait for a retry after the heartbeat is gone.
+                                while (exportRequested.compareAndSet(true, false)) exporter.drain();
                             } catch (RuntimeException error) {
+                                exportRequested.set(false);
                                 LOGGER.warn(
                                         "Committed session export pending retry: {}",
                                         error.toString());
                             } finally {
                                 exporting.set(false);
+                                if (exportRequested.get()) exportCommitted();
                             }
                         });
     }
@@ -597,7 +633,7 @@ public final class InvocationRecorder {
                             durableSeq));
         for (int i = 0; i < messages.size(); i++) {
             Msg message = state.getContext().get(i);
-            if (!recordedMessages.add(message.getId())) continue;
+            if (recordedMessages.contains(message.getId())) continue;
             if (inputMessages.contains(message.getId()))
                 append("input/applied", Map.of("inputId", message.getId()));
             String type =
@@ -609,6 +645,7 @@ public final class InvocationRecorder {
                                             ? "message/system"
                                             : "message/user";
             append(type, Map.of("message", message));
+            recordedMessages.add(message.getId());
             for (ToolUseBlock use : message.getContentBlocks(ToolUseBlock.class))
                 append(
                         "tool/requested",
@@ -861,7 +898,24 @@ public final class InvocationRecorder {
     }
 
     /** Capture only runtime facts that are not already captured at the model/tool boundary. */
+    /**
+     * Captures the event and tags it with the journal sequence it produced. AG-UI replay uses the
+     * tag as its cursor; events that only carry facts already recorded elsewhere (for example a
+     * terminal event after {@code run/end}) stay uncursored and are followed through the journal.
+     */
     public void observe(AgentEvent event) {
+        long before = lastAppendedSeq();
+        observe0(event);
+        long after = lastAppendedSeq();
+        if (after > before) {
+            // A live frame only shares the source sequence so a broadcaster can order its tail.
+            // Cursors belong to committed replay frames; a live frame never advances them.
+            event.withMetadataEntry(SESSION_SOURCE_SEQ_KEY, after);
+        }
+    }
+
+    /** Marks an event as the replay boundary of the record that was just appended. */
+    private void observe0(AgentEvent event) {
         // A forwarded child's requests belong to its own journal, never the parent's inbox.
         if (event.getExecution() != null && !runId.equals(event.getExecution().runId())) return;
         if (event.getSource() != null && !event.getSource().isBlank()) return;

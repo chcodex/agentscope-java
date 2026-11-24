@@ -2882,7 +2882,7 @@ public class HarnessAgent implements Agent, AutoCloseable {
             SandboxContext defaultSandboxContext = null;
             SandboxBackedFilesystem capturedSandboxFs = null;
             if (sandboxFilesystemSpec != null) {
-                capturedSandboxFs = new SandboxBackedFilesystem();
+                capturedSandboxFs = sandboxFilesystemSpec.createFilesystem();
                 filesystem =
                         filesystemRoutes.isEmpty()
                                 ? capturedSandboxFs
@@ -3336,8 +3336,8 @@ public class HarnessAgent implements Agent, AutoCloseable {
                                 && routed.primary() instanceof SandboxBackedFilesystem)) {
                     String wsPrefix =
                             defaultSandboxContext != null
-                                            && defaultSandboxContext.getClientOptions() != null
-                                    ? defaultSandboxContext.getClientOptions().getWorkspaceRoot()
+                                            && defaultSandboxContext.getWorkspaceSpec() != null
+                                    ? defaultSandboxContext.getWorkspaceSpec().getRoot()
                                     : io.agentscope.harness.agent.skill.runtime.ShellPathPolicy
                                             .SANDBOX_WORKSPACE_PREFIX;
                     shellPolicy =

@@ -53,6 +53,9 @@ public record JournalProjection(
         var verifications = new ArrayList<io.agentscope.core.state.TaskVerification>();
         var extensions = new ArrayList<JournalEvent>();
         long upper = log.head().seq();
+        // A projection is a recovery view, not an incremental read: it must see every historical
+        // message identity and every unresolved dispatch, so it scans the committed prefix once.
+        // Backends optimize this by returning metadata and requiring materialize only for state.
         for (var event : log.scanMetadata(0, upper)) {
             JournalEventTypes.validate(event);
             observer.accept(event);

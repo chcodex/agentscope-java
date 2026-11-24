@@ -654,7 +654,7 @@ class WorkspaceProjectionRevocationTest {
         }
 
         @Override
-        protected String getWorkspaceRoot() {
+        public String getWorkspaceRoot() {
             return "/workspace";
         }
     }

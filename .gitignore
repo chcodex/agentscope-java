@@ -92,6 +92,10 @@ agentscope-examples/agentscope-copilotkit/src/main/resources/static/
 ## harness db
 **/*.db
 
+## oh-my-claudecode
+.omc/
+# .soloncode
+
 .dev-stack/
 
 # Mintlify documentation dependencies and local preview

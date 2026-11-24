@@ -15,6 +15,7 @@
  */
 package io.agentscope.core.agent.accumulator;
 
+import io.agentscope.core.journal.InvocationRecorder;
 import io.agentscope.core.message.AssistantMessage;
 import io.agentscope.core.message.ContentBlock;
 import io.agentscope.core.message.MessageMetadataKeys;
@@ -103,9 +104,17 @@ public class ReasoningContext {
             time = usage.getTime();
         }
 
-        // Propagate provider-specific metadata
+        // Propagate provider-specific metadata. Framework bookkeeping such as the session log seq
+        // stays out: it is only meaningful on the event stream, not in the persisted message. Any
+        // new internal ChatResponse metadata key must be excluded here as well.
         if (chunk.getMetadata() != null && !chunk.getMetadata().isEmpty()) {
-            responseMetadata.putAll(chunk.getMetadata());
+            chunk.getMetadata()
+                    .forEach(
+                            (key, value) -> {
+                                if (!InvocationRecorder.SESSION_SEQ_KEY.equals(key)) {
+                                    responseMetadata.put(key, value);
+                                }
+                            });
         }
 
         List<Msg> streamingMsgs = new ArrayList<>();

@@ -15,6 +15,7 @@
  */
 package io.agentscope.harness.agent.sandbox;
 
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.annotation.JsonTypeInfo;
@@ -34,6 +35,7 @@ import java.util.List;
  * {@code @JsonSubTypes} on this class.
  */
 @JsonTypeInfo(use = JsonTypeInfo.Id.NAME, include = JsonTypeInfo.As.PROPERTY, property = "type")
+@JsonIgnoreProperties(ignoreUnknown = true)
 public abstract class SandboxState {
 
     private String sessionId;
@@ -45,9 +47,9 @@ public abstract class SandboxState {
     private String workspaceProjectionHash;
 
     /**
-     * Workspace-relative paths of the last applied projection; drives authoritative
-     * revocation. Null for every deployment that never engages the grant layer — and
-     * omitted from JSON then, so their persisted state keeps the pre-grant shape exactly.
+     * Workspace-relative paths of the last applied projection; drives authoritative revocation.
+     * Null for every deployment that never engages the grant layer, and omitted from JSON then,
+     * so persisted state keeps the pre-grant shape exactly.
      */
     @JsonInclude(JsonInclude.Include.NON_NULL)
     private List<String> projectedWorkspacePaths;

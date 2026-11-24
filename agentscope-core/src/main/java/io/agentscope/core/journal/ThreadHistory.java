@@ -42,7 +42,10 @@ public final class ThreadHistory {
 
     /** Shared transcript extraction; ordinary checkpoints never contribute historical messages. */
     static List<Msg> messages(ThreadJournal log, JournalEvent event) {
-        if (event.type().equals("state/initialized")) {
+        // state/initialized is the current baseline. The other names are read for journals written
+        // before the Thread rename; a checkpoint is only a fallback when no baseline exists.
+        if (Set.of("state/initialized", "migration/baseline", "state/restored", "state/checkpoint")
+                .contains(event.type())) {
             String state = (String) log.materialize(event).data().get("stateJson");
             return state == null ? List.of() : AgentState.fromJsonString(state).getContext();
         }

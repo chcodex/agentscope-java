@@ -17,6 +17,7 @@ package io.agentscope.durable.store;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import java.util.List;
+import java.util.Map;
 import java.util.function.Function;
 
 /**
@@ -40,6 +41,25 @@ public interface RecordStore extends AutoCloseable {
         long now();
 
         JsonNode get(String part);
+
+        /**
+         * Reads several parts in one round trip when the store supports it.
+         *
+         * <p>Ordered journal recovery reads thousands of consecutive parts; doing that one
+         * {@link #get(String)} per part costs one network round trip each on a remote database.
+         * The default keeps per-part semantics so existing stores stay correct.
+         *
+         * @return present values keyed by part; absent parts are omitted
+         */
+        default Map<String, JsonNode> getAll(List<String> parts) {
+            if (parts == null || parts.isEmpty()) return Map.of();
+            var result = new java.util.LinkedHashMap<String, JsonNode>();
+            for (String part : parts) {
+                JsonNode value = get(part);
+                if (value != null) result.put(part, value);
+            }
+            return result;
+        }
 
         void put(String part, JsonNode value);
 
