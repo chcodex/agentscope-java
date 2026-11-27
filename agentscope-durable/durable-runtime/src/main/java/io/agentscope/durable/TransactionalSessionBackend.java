@@ -174,11 +174,17 @@ public final class TransactionalSessionBackend implements SessionBackend {
 
     private JsonNode readContent(SessionKey session, JsonNode stored) {
         if (stored == null || stored.isNull()) return DurableJson.value(null);
-        var value = DurableJson.convert(stored, StoredContent.class);
-        return value.reference() == null
-                ? DurableJson.copy(value.inline())
-                : DurableJson.parse(
-                        new String(readObject(session, value.reference()), StandardCharsets.UTF_8));
+        // `stored` is freshly parsed per read, so its inline payload is never shared: reading it
+        // directly avoids a treeToValue + deepCopy per journal entry, which dominated large
+        // journal recovery (measured 14.8s for ~4.9k entries).
+        JsonNode inline = stored.path("inline");
+        if (!inline.isNull() && !inline.isMissingNode()) return inline;
+        JsonNode reference = stored.path("reference");
+        if (reference.isNull() || reference.isMissingNode()) return DurableJson.value(null);
+        return DurableJson.parse(
+                new String(
+                        readObject(session, DurableJson.convert(reference, Reference.class)),
+                        StandardCharsets.UTF_8));
     }
 
     private static String objectScope(SessionKey key) {
@@ -299,6 +305,8 @@ public final class TransactionalSessionBackend implements SessionBackend {
         @JsonIgnore public Map<String, ToolData> tools = new LinkedHashMap<>();
         @JsonIgnore public Map<String, Signal> signals = new LinkedHashMap<>();
         @JsonIgnore public Map<String, VerificationView> verifications = new LinkedHashMap<>();
+        @JsonIgnore public Set<String> verifiedRuns = new HashSet<>();
+        @JsonIgnore public Set<String> verifiedSteps = new HashSet<>();
         public List<String> consumed = new ArrayList<>();
         public List<String> withdrawn = new ArrayList<>();
         @JsonIgnore public Map<String, CommitReceipt> receipts = new LinkedHashMap<>();
@@ -343,6 +351,23 @@ public final class TransactionalSessionBackend implements SessionBackend {
     }
 
     public record JobWait(String jobId, long deadline, ExecutionResult outcome) {}
+
+    /**
+     * Reads consecutive journal parts through one store round trip batch, preserving position
+     * order and failing loudly on a gap instead of returning a null entry.
+     */
+    private static List<JsonNode> readAll(RecordStore.Transaction tx, List<String> positions) {
+        if (positions.isEmpty()) return List.of();
+        var values = tx.getAll(positions);
+        var entries = new ArrayList<JsonNode>(positions.size());
+        for (String position : positions) {
+            JsonNode value = values.get(position);
+            if (value == null)
+                throw error(DurableException.Code.INVALID, "Missing journal entry at " + position);
+            entries.add(value);
+        }
+        return List.copyOf(entries);
+    }
 
     private static String positionKey(long value) {
         return String.format(Locale.ROOT, "%020d", value);
@@ -560,17 +585,129 @@ public final class TransactionalSessionBackend implements SessionBackend {
                 && turn.waiting.key().startsWith("interaction:");
     }
 
+    /**
+     * Read-only variant of {@link #change}: it loads the same state but never saves it back, so a
+     * polling or replay read does not become a write transaction. Native readers stay hot while a
+     * Turn streams, and flushing plus re-scheduling on every poll would also contend with the
+     * commit that produces those events.
+     */
+    private <T> T read(SessionKey key, BiFunction<State, Long, T> action) {
+        return store.readTransaction(
+                key.storageKey(),
+                tx -> {
+                    State state = load(tx);
+                    if (!key.equals(state.session.key()))
+                        throw error(DurableException.Code.CONFLICT, "Session key mismatch");
+                    return action.apply(state, tx.now());
+                });
+    }
+
+    private <T> T read(ThreadKey key, BiFunction<State, Long, T> action) {
+        return store.readTransaction(
+                key.session().storageKey(),
+                tx -> {
+                    State state = load(tx);
+                    if (!key.session().equals(state.session.key()))
+                        throw error(DurableException.Code.CONFLICT, "Session key mismatch");
+                    selectThread(state, key, null);
+                    return action.apply(state, tx.now());
+                });
+    }
+
     private <T> T change(ThreadKey key, BiFunction<State, Long, T> action) {
         return change(key, null, action);
     }
 
     private <T> T change(ThreadKey key, ThreadSpec initial, BiFunction<State, Long, T> action) {
-        return change(
-                key.session(),
-                (s, now) -> {
-                    selectThread(s, key, initial);
-                    return action.apply(s, now);
+        return store.transaction(
+                key.session().storageKey(),
+                tx -> {
+                    State state = load(tx);
+                    if (!key.session().equals(state.session.key()))
+                        throw error(DurableException.Code.CONFLICT, "Session key mismatch");
+                    selectThread(state, key, initial);
+                    T result = action.apply(state, tx.now());
+                    save(state);
+                    return result;
                 });
+    }
+
+    /**
+     * Commit transaction that publishes append-only journal/event parts before taking the Session
+     * lock. The action still reads the pre-lock snapshot; {@code afterLock} revalidates the
+     * volatile state (revision, ownership, session sequence) and only then saves the state.
+     */
+    private <T> T changeDeferred(
+            ThreadKey key,
+            Lease lease,
+            Commit command,
+            BiFunction<State, Long, T> action,
+            java.util.concurrent.atomic.AtomicBoolean idempotent) {
+        if (!Boolean.getBoolean("durable.deferredLock")) {
+            return change(key, action);
+        }
+        State[] holder = new State[1];
+        long[] base = new long[4];
+        return store.transactionDeferredLock(
+                key.session().storageKey(),
+                tx -> {
+                    State state = load(tx);
+                    selectThread(state, key, null);
+                    holder[0] = state;
+                    base[0] = state.sequence;
+                    base[1] = state.admitted;
+                    base[2] = state.retainedAfter;
+                    base[3] = state.thread.journalPosition;
+                    return action.apply(state, tx.now());
+                },
+                TransactionalSessionBackend::deferredPart,
+                tx -> {
+                    if (idempotent.get()) return;
+                    validateDeferred(holder[0], lease, command, base, tx);
+                    save(holder[0]);
+                });
+    }
+
+    private static boolean deferredPart(String part) {
+        return part.startsWith("event:")
+                || part.startsWith("event-id:")
+                || part.contains(":journal:");
+    }
+
+    private static void validateDeferred(
+            State snapshot, Lease lease, Commit command, long[] base, RecordStore.Transaction tx) {
+        State current = decode(tx.getLatest(""));
+        if (current == null) throw error(DurableException.Code.NOT_FOUND, "Session not found");
+        if (current.sequence != base[0]
+                || current.admitted != base[1]
+                || current.retainedAfter != base[2]) {
+            throw error(
+                    DurableException.Code.CONFLICT,
+                    "Session changed while the commit was prepared");
+        }
+        JsonNode threadNode = tx.getLatest("thread:" + DurableJson.hash(lease.thread().threadId()));
+        if (threadNode == null) throw error(DurableException.Code.NOT_FOUND, "Thread not found");
+        ThreadData thread = DurableJson.convert(threadNode.get("value"), ThreadData.class);
+        if (thread.journalPosition != base[3]) {
+            throw error(DurableException.Code.CONFLICT, "Native journal position changed");
+        }
+        JsonNode turnNode = tx.getLatest("turn:" + DurableJson.hash(lease.turnId()));
+        if (turnNode == null) throw error(DurableException.Code.NOT_FOUND, "Turn not found");
+        TurnData currentTurn = DurableJson.convert(turnNode.get("value"), TurnData.class);
+        if (!Objects.equals(currentTurn.owner, lease.owner())
+                || currentTurn.epoch != lease.epoch()
+                || currentTurn.expiresAt <= tx.now()
+                || currentTurn.status.terminal()) {
+            throw error(DurableException.Code.FENCED, "Execution ownership expired or changed");
+        }
+        if (currentTurn.revision != command.expectedRevision()) {
+            throw error(DurableException.Code.CONFLICT, "Revision changed");
+        }
+        TurnData local = requireTurn(snapshot, lease.turnId());
+        if (!local.status.terminal() && local.owner != null) {
+            // A concurrent renew advanced the lease while the commit was prepared.
+            local.expiresAt = Math.max(local.expiresAt, currentTurn.expiresAt);
+        }
     }
 
     private static void selectThread(State s, ThreadKey key, ThreadSpec initial) {
@@ -602,6 +739,16 @@ public final class TransactionalSessionBackend implements SessionBackend {
 
             public JsonNode get(String part) {
                 return tx.get(prefix + part);
+            }
+
+            public java.util.Map<String, JsonNode> getAll(java.util.List<String> parts) {
+                if (parts == null || parts.isEmpty()) return java.util.Map.of();
+                var prefixed = new java.util.ArrayList<String>(parts.size());
+                for (String part : parts) prefixed.add(prefix + part);
+                var values = tx.getAll(prefixed);
+                var result = new java.util.LinkedHashMap<String, JsonNode>(values.size());
+                values.forEach((key, value) -> result.put(key.substring(prefix.length()), value));
+                return result;
             }
 
             public void put(String part, JsonNode value) {
@@ -678,7 +825,7 @@ public final class TransactionalSessionBackend implements SessionBackend {
 
     @Override
     public ThreadView thread(ThreadKey key) {
-        return change(key, (s, n) -> s.thread.view());
+        return read(key, (s, n) -> s.thread.view());
     }
 
     @Override
@@ -831,7 +978,9 @@ public final class TransactionalSessionBackend implements SessionBackend {
     @Override
     public TurnPage turns(ThreadKey key, String after, int count) {
         limit(count);
-        return change(
+        // Listing metadata is read-only: loading it through change(...) rewrites the session
+        // root and both ready queues on every reconnect probe.
+        return read(
                 key,
                 (s, n) -> {
                     String scope = key.storageKey() + ":turns";
@@ -911,6 +1060,17 @@ public final class TransactionalSessionBackend implements SessionBackend {
                             .map(v -> DurableJson.convert(v, Interaction.class))
                             .toList();
                 });
+    }
+
+    /** Pending interactions of one Turn, in projection order, for waiting transitions. */
+    private static List<Interaction> pendingInteractions(State s, String turnId) {
+        return s.interactions.values().stream()
+                .filter(
+                        v ->
+                                turnId.equals(v.path("turnId").asText())
+                                        && "pending".equals(v.path("status").asText()))
+                .map(v -> DurableJson.convert(v, Interaction.class))
+                .toList();
     }
 
     @Override
@@ -1206,7 +1366,7 @@ public final class TransactionalSessionBackend implements SessionBackend {
 
     @Override
     public TurnView turn(ThreadKey key, String id) {
-        return change(key, (s, n) -> view(s, requireTurn(s, id)));
+        return read(key, (s, n) -> view(s, requireTurn(s, id)));
     }
 
     @Override
@@ -1302,13 +1462,15 @@ public final class TransactionalSessionBackend implements SessionBackend {
 
     @Override
     public RunView run(ThreadKey key, String turnId, String runId) {
-        return change(key, (s, now) -> invocations(s, requireTurn(s, turnId)).run(runId));
+        return read(key, (s, n) -> invocations(s, requireTurn(s, turnId)).run(runId));
     }
 
     @Override
     public RunPage runs(ThreadKey key, String turnId, String after, int count) {
         limit(count);
-        return change(
+        // Run metadata is read-only; keeping it out of change(...) avoids rewriting session state
+        // on every reconnect probe.
+        return read(
                 key,
                 (s, now) -> {
                     var records = invocations(s, requireTurn(s, turnId));
@@ -1655,16 +1817,32 @@ public final class TransactionalSessionBackend implements SessionBackend {
 
     @Override
     public Frame frame(Lease lease) {
+        return frame(lease, true);
+    }
+
+    @Override
+    public Frame frame(Lease lease, boolean withCheckpoint) {
         Frame stored =
-                change(
+                read(
                         lease.thread(),
                         (s, n) -> {
+                            // The thread, turn and checkpoint rows are always read below; one
+                            // batched round trip per scope replaces sequential point reads.
+                            s.tx.getAll(
+                                    List.of(
+                                            "thread:" + DurableJson.hash(lease.thread().threadId()),
+                                            "turn:" + DurableJson.hash(lease.turnId())));
+                            if (withCheckpoint) {
+                                s.threadTx.getAll(List.of("checkpoint"));
+                            }
                             TurnData r = owned(s, lease, n);
                             return new Frame(
                                     s.thread.definition,
                                     view(s, r),
                                     DurableJson.copy(r.input),
-                                    DurableJson.copy(s.threadTx.get("checkpoint")),
+                                    withCheckpoint
+                                            ? DurableJson.copy(s.threadTx.get("checkpoint"))
+                                            : DurableJson.value(null),
                                     s.thread.checkpointMetadata,
                                     r.tools.values().stream().map(ToolData::view).toList(),
                                     r.signals.values().stream()
@@ -1680,11 +1858,110 @@ public final class TransactionalSessionBackend implements SessionBackend {
                 stored.definition(),
                 stored.turn(),
                 stored.input(),
-                readContent(lease.session(), stored.checkpoint()),
+                withCheckpoint
+                        ? readContent(lease.session(), stored.checkpoint())
+                        : DurableJson.value(null),
                 stored.checkpointMetadata(),
                 stored.tools(),
                 stored.signals(),
                 stored.now());
+    }
+
+    /**
+     * Warms every part a journal commit is known to read, in two batched round trips (session
+     * scope plus thread-data scope). Keys derive from the lease and the command, so a wrong guess
+     * costs a few bytes in one batch query and never corrupts: the snapshot is stable and the
+     * point reads below hit the warmed cache.
+     */
+    private static void prefetchCommit(State s, Lease lease, Commit command) {
+        String turnId = lease.turnId();
+        String turnHash = DurableJson.hash(turnId);
+        String turnData = "turn-data:" + turnHash + ":";
+        String threadId = lease.thread().threadId();
+        var session = new LinkedHashSet<String>();
+        session.add("turn:" + turnHash);
+        session.add(turnData + "receipt:" + DurableJson.hash(command.commitId()));
+        for (var call : command.tools()) {
+            String executionId = executionId(lease.thread(), turnId, call.callId());
+            session.add(turnData + "tool:" + DurableJson.hash(executionId));
+            session.add("execution:" + DurableJson.hash(executionId));
+        }
+        for (var application : command.appliedResults()) {
+            session.add(turnData + "tool:" + DurableJson.hash(application.executionId()));
+        }
+        for (var event : command.events()) {
+            session.add("event-id:" + DurableJson.hash(event.eventId()));
+        }
+        var thread = new LinkedHashSet<String>();
+        if (!command.checkpoint().isNull()
+                && s.thread != null
+                && s.thread.checkpointPosition >= 1) {
+            thread.add("checkpoint-history:" + positionKey(s.thread.checkpointPosition));
+        }
+        var runIds = new LinkedHashSet<String>();
+        if (command.run() != null) {
+            runIds.add(command.run().runId());
+            session.add(
+                    "event-id:"
+                            + DurableJson.hash(
+                                    "run:"
+                                            + command.run().runId()
+                                            + ":"
+                                            + (command.run().status().terminal()
+                                                    ? "ended"
+                                                    : "started")));
+        }
+        for (var step : command.steps()) {
+            runIds.add(step.runId());
+            thread.add("step:" + DurableJson.hash(step.stepId()));
+            session.add(
+                    "event-id:"
+                            + DurableJson.hash(
+                                    "step:"
+                                            + step.stepId()
+                                            + ":"
+                                            + (step.status().terminal() ? "ended" : "started")
+                                            + ":"
+                                            + step.phase()));
+        }
+        for (var event : command.events()) {
+            if (event.runId() != null) {
+                runIds.add(event.runId());
+                if (event.stepId() != null) {
+                    thread.add("step:" + DurableJson.hash(event.stepId()));
+                }
+                if (event.type().startsWith("model.")) {
+                    String modelCallId = event.data().path("modelCallId").asText(null);
+                    if (modelCallId != null) {
+                        thread.add(
+                                "model-call:"
+                                        + DurableJson.hash(List.of(event.runId(), modelCallId)));
+                    }
+                }
+            }
+            if (event.type().equals("message.completed")) {
+                String messageId = event.data().path("messageId").asText(null);
+                if (messageId != null) {
+                    session.add("message:" + DurableJson.hash(messageId));
+                }
+            } else if (event.type().startsWith("tool.")
+                    && (event.data().hasNonNull("callId")
+                            || event.data().path("call").hasNonNull("callId"))) {
+                session.add(
+                        "tool-view:"
+                                + DurableJson.hash(
+                                        EventProjection.toolId(threadId, turnId, event.data())));
+            }
+        }
+        for (String runId : runIds) {
+            thread.add("invocation:" + DurableJson.hash(runId));
+        }
+        if (!session.isEmpty()) {
+            s.tx.getAll(new ArrayList<>(session));
+        }
+        if (!thread.isEmpty()) {
+            s.threadTx.getAll(new ArrayList<>(thread));
+        }
     }
 
     @Override
@@ -1699,13 +1976,23 @@ public final class TransactionalSessionBackend implements SessionBackend {
                         : command.journal().entries().stream()
                                 .map(entry -> storeContent(lease.session(), entry, true))
                                 .toList();
-        return change(
+        java.util.concurrent.atomic.AtomicBoolean idempotent =
+                new java.util.concurrent.atomic.AtomicBoolean();
+        return changeDeferred(
                 lease.thread(),
+                lease,
+                command,
                 (s, now) -> {
+                    // A journal commit touches a predictable key set (turn, receipt, tools,
+                    // executions, event digests, runs, steps, model calls, projections). Warming
+                    // them in two batched round trips replaces ~10 sequential point reads that
+                    // dominated every commit on a remote store.
+                    prefetchCommit(s, lease, command);
                     TurnData r = requireTurn(s, lease.turnId());
                     CommitReceipt old = r.receipts.get(command.commitId());
                     if (old != null) {
                         equal(old.digest(), digest, "Commit content changed");
+                        idempotent.set(true);
                         return old;
                     }
                     owned(s, lease, now);
@@ -1972,16 +2259,26 @@ public final class TransactionalSessionBackend implements SessionBackend {
                     if (next.terminal()
                             || next == TurnStatus.WAITING
                             || next == TurnStatus.PAUSED) {
-                        invocations(s, r).abandon(now, false);
+                        List<Interaction> pending =
+                                next == TurnStatus.WAITING
+                                        ? pendingInteractions(s, r.id)
+                                        : List.of();
+                        if (!pending.isEmpty()) invocations(s, r).suspend(now);
+                        else invocations(s, r).abandon(now, false);
                         r.owner = null;
                         r.expiresAt = 0;
+                        var data = (ObjectNode) lifecycle(r);
+                        if (next == TurnStatus.WAITING)
+                            data.set("interactions", DurableJson.value(pending));
                         append(
                                 s,
                                 r,
                                 new EventInput(
                                         "state:" + r.id + ":" + r.revision,
                                         "turn." + next.name().toLowerCase(Locale.ROOT),
-                                        lifecycle(r)));
+                                        data,
+                                        r.lastRunId,
+                                        null));
                     }
                     if (next == TurnStatus.CANCELLED) settleActiveCancellations(s, r);
                     if (next.terminal()) completeJobWaits(s, r, now);
@@ -1990,34 +2287,61 @@ public final class TransactionalSessionBackend implements SessionBackend {
                                     command.commitId(), digest, r.revision, cursor(s, s.sequence));
                     r.receipts.put(command.commitId(), receipt);
                     return receipt;
-                });
+                },
+                idempotent);
     }
 
     @Override
     public List<JsonNode> journal(Lease lease, long after, int limit) {
         limit(limit);
         List<JsonNode> stored =
-                change(
+                read(
                         lease.thread(),
                         (s, now) -> {
+                            s.tx.getAll(
+                                    List.of(
+                                            "thread:" + DurableJson.hash(lease.thread().threadId()),
+                                            "turn:" + DurableJson.hash(lease.turnId())));
                             owned(s, lease, now);
                             if (after < 0 || after > s.thread.journalPosition)
                                 throw error(
                                         DurableException.Code.INVALID,
                                         "Invalid native journal position");
-                            var entries = new ArrayList<JsonNode>();
+                            var positions = new ArrayList<String>();
                             for (long i = after + 1;
-                                    i <= s.thread.journalPosition && entries.size() < limit;
+                                    i <= s.thread.journalPosition && positions.size() < limit;
                                     i++)
-                                entries.add(
-                                        s.threadTx.get(
-                                                "journal:"
-                                                        + s.thread.journalBranch
-                                                        + ":"
-                                                        + positionKey(i)));
-                            return List.copyOf(entries);
+                                positions.add(
+                                        "journal:" + s.thread.journalBranch + ":" + positionKey(i));
+                            return readAll(s.threadTx, positions);
                         });
-        return stored.stream().map(entry -> readContent(lease.session(), entry)).toList();
+        var references = new ArrayList<Reference>();
+        for (var entry : stored) {
+            var reference = entry.path("reference");
+            if (reference.isObject()) {
+                references.add(DurableJson.convert(reference, Reference.class));
+            }
+        }
+        // Externalized entries live in one scope each; a page of them would otherwise cost one
+        // transaction per entry while replaying a long native journal.
+        var contents =
+                references.isEmpty()
+                        ? Map.<Reference, byte[]>of()
+                        : objects.readAll(objectScope(lease.session()), references);
+        return stored.stream().map(entry -> contentOf(lease.session(), entry, contents)).toList();
+    }
+
+    private JsonNode contentOf(
+            SessionKey session, JsonNode stored, Map<Reference, byte[]> contents) {
+        if (stored == null || stored.isNull()) return DurableJson.value(null);
+        JsonNode inline = stored.path("inline");
+        if (!inline.isNull() && !inline.isMissingNode()) return inline;
+        JsonNode reference = stored.path("reference");
+        if (reference.isNull() || reference.isMissingNode()) return DurableJson.value(null);
+        var ref = DurableJson.convert(reference, Reference.class);
+        var bytes = contents.get(ref);
+        if (bytes == null) bytes = readObject(session, ref);
+        return DurableJson.parse(new String(bytes, StandardCharsets.UTF_8));
     }
 
     @Override
@@ -2385,6 +2709,14 @@ public final class TransactionalSessionBackend implements SessionBackend {
         return change(
                 lease.thread(),
                 (s, n) -> {
+                    s.tx.getAll(
+                            List.of(
+                                    "thread:" + DurableJson.hash(lease.thread().threadId()),
+                                    "turn:" + DurableJson.hash(lease.turnId()),
+                                    "turn-data:"
+                                            + DurableJson.hash(lease.turnId())
+                                            + ":tool:"
+                                            + DurableJson.hash(id)));
                     TurnData r = owned(s, lease, n);
                     ToolData t = requireTool(r, id);
                     if (r.cancel
@@ -3206,7 +3538,7 @@ public final class TransactionalSessionBackend implements SessionBackend {
     @Override
     public EventPage events(SessionKey key, String after, int limit) {
         limit(limit);
-        return change(
+        return read(
                 key,
                 (s, n) -> {
                     long pos = position(s, after);
@@ -3512,8 +3844,12 @@ public final class TransactionalSessionBackend implements SessionBackend {
         if (input.runId() != null) {
             if (r == null) throw error(DurableException.Code.INVALID, "Run event requires a Turn");
             var records = invocations(s, r);
-            records.run(input.runId());
-            if (input.stepId() != null) records.step(input.runId(), input.stepId());
+            // Every public event carries the same run/step identity; validating it once per
+            // transaction avoids one part read per delta.
+            if (r.verifiedRuns.add(input.runId())) records.run(input.runId());
+            if (input.stepId() != null
+                    && r.verifiedSteps.add(input.runId() + "\u0000" + input.stepId()))
+                records.step(input.runId(), input.stepId());
         }
         String digest = DurableJson.hash(List.of(r == null ? "" : r.id, input));
         String old = s.eventDigests.get(input.eventId());

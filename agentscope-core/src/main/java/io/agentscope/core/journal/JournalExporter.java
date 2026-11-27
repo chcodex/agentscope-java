@@ -40,13 +40,16 @@ public final class JournalExporter {
     public synchronized long drain(long maxEvents) {
         if (maxEvents < 1) throw new IllegalArgumentException("Export limit must be positive");
         long cursor = log.exportCursor(sink.name());
-        long remaining = Math.max(0L, log.head().seq() - cursor);
-        long through = cursor + Math.min(maxEvents, remaining);
+        // Start at this sink's own acknowledged cursor. A new sink has cursor 0 and must receive
+        // the whole history; replayStart describes state recovery, not what a sink has seen.
+        long from = cursor;
+        long remaining = Math.max(0L, log.head().seq() - from);
+        long through = from + Math.min(maxEvents, remaining);
         long last = cursor;
         int pending = 0;
         long count = 0;
         try {
-            for (var event : log.scan(cursor, through)) {
+            for (var event : log.scan(from, through)) {
                 sink.accept(event);
                 last = event.seq();
                 count++;

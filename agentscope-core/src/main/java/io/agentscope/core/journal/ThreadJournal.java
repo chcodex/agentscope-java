@@ -42,6 +42,53 @@ public interface ThreadJournal {
 
     record Writer(String owner, long epoch) {}
 
+    /**
+     * A backend-specific state replay boundary. Consumers that need historical facts, including
+     * pending interactions and per-sink exports, must not infer they are represented in state.
+     */
+    default long replayStart() {
+        return 0;
+    }
+
+    /** Hosted thread identity, or {@code null} when the backend cannot expose one. */
+    default String threadId() {
+        return null;
+    }
+
+    /**
+     * Snapshot of a recovery view. This does not contain all historical recovery facts, so core
+     * journal readers currently replay the full committed prefix even when a seed is supplied.
+     */
+    record ProjectionSeed(
+            long asOfSeq,
+            String stateJson,
+            java.util.Set<String> uncertainToolCalls,
+            java.util.Set<String> activeRuns,
+            String positionTurnId,
+            String positionRunId,
+            io.agentscope.core.agent.AgentExecutionPosition executionPosition) {}
+
+    /** Recovery seed at the latest checkpoint, or {@code null} to replay from the beginning. */
+    default ProjectionSeed projectionSeed() {
+        return projectionSeed(head().seq());
+    }
+
+    /**
+     * Events appended since the latest checkpoint known at open time. The periodic checkpoint
+     * uses it so the checkpoint interval stays bounded across invocations, not just within one.
+     */
+    default long checkpointGap() {
+        return 0;
+    }
+
+    /**
+     * Recovery seed at the newest checkpoint at or before {@code fromSeq}. Callers pass the point
+     * they want to resume from — head for a normal resume, a fork point for a branch.
+     */
+    default ProjectionSeed projectionSeed(long fromSeq) {
+        return null;
+    }
+
     default long exportCursor(String sink) {
         return 0;
     }
@@ -49,6 +96,15 @@ public interface ThreadJournal {
     default void advanceExportCursor(String sink, long expected, long next) {
         throw new UnsupportedOperationException("Export cursor persistence not implemented");
     }
+
+    /**
+     * Best-effort presentation hook, called for every appended event before it is committed.
+     *
+     * <p>Hosted journals use this to forward streaming deltas to clients at the model's own pace
+     * instead of waiting for the next batched commit. Delivery may repeat or be lost and must never
+     * change committed state; implementations should swallow their own failures.
+     */
+    default void live(JournalEvent event) {}
 
     /**
      * Sequence of the most recent committed state baseline, or {@code 0} when the backend cannot

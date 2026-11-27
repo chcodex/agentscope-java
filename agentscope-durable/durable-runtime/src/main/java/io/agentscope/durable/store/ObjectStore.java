@@ -19,6 +19,7 @@ import io.agentscope.durable.DurableException;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
+import java.util.Map;
 
 /** Immutable, scoped bytes. Upload alone does not commit a checkpoint or authorize an effect. */
 public interface ObjectStore {
@@ -47,6 +48,22 @@ public interface ObjectStore {
     Reference put(String scope, byte[] content);
 
     byte[] read(Reference reference);
+
+    /**
+     * Reads several immutable objects in as few round trips as the store allows. The default keeps
+     * per-object semantics; a store that can batch should override it, because replaying a long
+     * journal otherwise costs one transaction per externalized entry.
+     */
+    default Map<Reference, byte[]> readAll(String scope, java.util.List<Reference> references) {
+        var result = new java.util.LinkedHashMap<Reference, byte[]>(references.size());
+        for (var reference : references) {
+            if (!java.util.Objects.equals(scope, reference.scope()))
+                throw new DurableException(
+                        DurableException.Code.INVALID, "Object belongs to another scope");
+            result.put(reference, read(reference));
+        }
+        return result;
+    }
 
     static String digest(byte[] bytes) {
         try {

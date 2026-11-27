@@ -25,7 +25,6 @@ import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.function.Predicate;
 
 /** Executable wire contract shared by local components and transport adapters. */
 public final class DurableProtocol {
@@ -61,25 +60,31 @@ public final class DurableProtocol {
         }
     }
 
-    private static final Map<String, Predicate<JsonNode>> VALIDATORS = new ConcurrentHashMap<>();
+    private static final Map<String, com.networknt.schema.Schema> SCHEMAS =
+            new ConcurrentHashMap<>();
 
     private DurableProtocol() {}
 
     /** Reject invalid input before accessing a store or an external executor. */
     public static void validate(String definition, Object value) {
-        var valid =
-                VALIDATORS.computeIfAbsent(
-                        definition,
-                        name -> {
-                            var schema = REGISTRY.getSchema(SchemaLocation.of(LOCATION + name));
-                            return node -> schema.validate(node).isEmpty();
-                        });
+        var schema =
+                SCHEMAS.computeIfAbsent(
+                        definition, name -> REGISTRY.getSchema(SchemaLocation.of(LOCATION + name)));
         var node = DurableJson.value(value);
         DurableJson.requirePortableNumbers(node);
-        if (!valid.test(node))
+        var errors = schema.validate(node);
+        if (!errors.isEmpty()) {
+            var detail =
+                    errors.stream()
+                            .limit(3)
+                            // Keyword and location only: the schema message embeds the offending
+                            // instance value, which must not leak through a protocol error.
+                            .map(e -> e.getInstanceLocation() + " " + e.getKeyword())
+                            .toList();
             throw new DurableException(
                     DurableException.Code.INVALID,
-                    "Value does not conform to Durable " + definition);
+                    "Value does not conform to Durable " + definition + ": " + detail);
+        }
     }
 
     public static JsonNode request(Endpoint endpoint, String operation, Object payload) {

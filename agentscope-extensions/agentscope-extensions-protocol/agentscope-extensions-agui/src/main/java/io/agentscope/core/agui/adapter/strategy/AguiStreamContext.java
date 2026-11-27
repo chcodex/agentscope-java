@@ -132,10 +132,10 @@ public class AguiStreamContext {
     }
 
     public void startTextMessage(String messageId) {
-        // A closed id is reopened with a new START; an id that is still open is not started
-        // twice, so every text segment keeps its own START/END boundary.
-        boolean reopening = endedTextMessages.remove(messageId);
-        if (reopening || startedTextMessages.add(messageId)) {
+        // A message id may be reused after its previous stream closed (retry/replay); clear the
+        // ended marker so the new stream opens and closes its own boundaries.
+        if (endedTextMessages.remove(messageId)) startedTextMessages.remove(messageId);
+        if (startedTextMessages.add(messageId)) {
             emit(new AguiEvent.TextMessageStart(threadId, runId, messageId, "assistant"));
         }
         currentTextMessageId = messageId;
@@ -169,10 +169,8 @@ public class AguiStreamContext {
     }
 
     public void startReasoningMessage(String messageId) {
+        if (endedReasoningMessages.remove(messageId)) startedReasoningMessages.remove(messageId);
         if (startedReasoningMessages.add(messageId)) {
-            emit(new AguiEvent.ReasoningMessageStart(threadId, runId, messageId, "reasoning"));
-        } else if (endedReasoningMessages.remove(messageId)) {
-            // Same stable reasoning id reused for a new segment.
             emit(new AguiEvent.ReasoningMessageStart(threadId, runId, messageId, "reasoning"));
         }
         currentReasoningMessageId = messageId;

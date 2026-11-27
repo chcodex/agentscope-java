@@ -61,6 +61,10 @@ public final class EventStreamOptions {
             case "message.started", "message.delta" -> deltas.contains(EventDeltaType.MESSAGE);
             case "tool.arguments.delta" -> deltas.contains(EventDeltaType.TOOL_ARGUMENTS);
             case "tool.output.delta" -> deltas.contains(EventDeltaType.TOOL_OUTPUT);
+            // Application result metadata has no typed live frame. It is delivered through its
+            // committed copy; accepting it here would feed an unsupported type into
+            // SessionStreamEvent.from() and terminate the typed stream.
+            case "x.result_metadata" -> false;
             default -> false;
         };
     }

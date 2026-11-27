@@ -28,6 +28,8 @@ import io.agentscope.core.agent.RuntimeContext;
 import io.agentscope.core.message.Msg;
 import io.agentscope.core.message.MsgRole;
 import io.agentscope.core.message.TextBlock;
+import io.agentscope.core.message.ToolResultBlock;
+import io.agentscope.core.message.ToolResultState;
 import io.agentscope.core.model.ChatResponse;
 import io.agentscope.core.model.Model;
 import io.agentscope.harness.agent.HarnessAgent;
@@ -37,6 +39,8 @@ import io.agentscope.harness.agent.filesystem.model.GlobResult;
 import io.agentscope.harness.agent.filesystem.model.GrepResult;
 import io.agentscope.harness.agent.filesystem.model.ReadResult;
 import io.agentscope.harness.agent.testing.HarnessQuiescence;
+import io.agentscope.harness.agent.tool.MemoryGetTool;
+import io.agentscope.harness.agent.workspace.WorkspaceManager;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -560,5 +564,14 @@ class LocalFilesystemUserIsolationExampleTest {
                         "stop");
         when(model.stream(anyList(), any(), any())).thenReturn(Flux.just(chunk));
         return model;
+    }
+
+    private static String toolErrorText(ToolResultBlock result) {
+        return result.getOutput().stream()
+                .filter(TextBlock.class::isInstance)
+                .map(TextBlock.class::cast)
+                .map(TextBlock::getText)
+                .findFirst()
+                .orElse("");
     }
 }

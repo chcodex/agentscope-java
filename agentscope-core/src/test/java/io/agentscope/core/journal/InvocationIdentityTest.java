@@ -151,7 +151,7 @@ class InvocationIdentityTest {
         var facts = agent.threadJournal(ctx).readAfter(0, 1000);
         String model =
                 facts.stream()
-                        .filter(e -> e.type().equals("model/chunk"))
+                        .filter(e -> e.type().equals("request/prepared"))
                         .map(e -> (String) e.data().get("modelCallId"))
                         .findFirst()
                         .orElseThrow();
@@ -164,10 +164,10 @@ class InvocationIdentityTest {
                         .toList();
         assertFalse(outputs.isEmpty());
         outputs.forEach(e -> assertEquals(model, e.data().get("modelCallId")));
-        var text = facts.stream().filter(e -> e.type().equals("presentation/text")).toList();
-        assertEquals(1, text.size());
-        assertEquals("done", text.get(0).data().get("text"));
-        assertEquals(outputs.get(0).data().get("stepId"), text.get(0).data().get("stepId"));
+        // Streaming chunks are committed so recovery can rebuild the model response identity.
+        assertEquals(1, facts.stream().filter(e -> e.type().equals("model/chunk")).count());
+        assertEquals(1, facts.stream().filter(e -> e.type().equals("model/response")).count());
+        assertTrue(facts.stream().noneMatch(e -> e.type().equals("presentation/text")));
     }
 
     @ParameterizedTest

@@ -618,6 +618,10 @@ class ToolCallInterceptorTest {
                     dispatchArgs,
                     "Dispatch must record post-interception arguments");
         } finally {
+            // Production always flushes (finish/checkpoint) before a recorder closes; an
+            // action/end merged into the following tool-result commit must be acknowledged
+            // before this log is read back or a new turn starts on it.
+            recorder.flushNow();
             recorder.close();
         }
 
@@ -655,6 +659,7 @@ class ToolCallInterceptorTest {
                             .block(TIMEOUT);
             assertEquals(ToolResultState.DENIED, denied.getState());
         } finally {
+            deniedRecorder.flushNow();
             deniedRecorder.close();
         }
 

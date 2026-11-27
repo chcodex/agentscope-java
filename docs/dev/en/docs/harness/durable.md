@@ -376,12 +376,17 @@ public projection, never private native logs. Event pruning preserves projected 
 A Turn can produce several assistant messages, with distinct reasoning rounds retained separately.
 Logical message IDs survive Run/Step changes. A new model request increments attempt; replaying a
 committed response replaces incomplete text through revision, preventing duplicated text after
-reconnection. `message.completed` is the authoritative durable fact. `message.delta` and
-`tool.arguments.delta` are best-effort `LiveEvent` previews produced from middleware-processed
-presentation facts; they have no sequence or cursor and never enter history, snapshots or replay.
+reconnection. `message.completed` is the authoritative durable fact. `message.delta` events are
+live-only previews: `LiveEvents.local()` keeps a bounded window of the current Step so a
+reconnect in the same process resumes the partial text, while deltas never enter history,
+snapshots, cursors or replay. Token-level `presentation/*` journal events and model chunks follow
+the same rule: the journal keeps only recoverable facts, plus the first chunk of each model call
+so the committed message can keep its model-call identity. A reconnect after a process restart or
+on another instance receives the last committed `message.completed` instead.
+`tool.arguments.delta` follows the same live-only contract.
 Private reasoning remains excluded. History uses the first public sequence for ordering; consumers
 reading the snapshot messages map should also sort by sequence rather than relying on object field
-order. Existing stored `message.delta` and `tool.call.arguments` events remain readable for
+order. Existing stored `tool.call.arguments` events remain readable for
 development-data compatibility, but new AgentScope writes do not create them.
 
 The snapshot tools projection associates argument fragments, progress and results by Thread,
@@ -498,13 +503,21 @@ Durable stores two event classes internally and exposes one typed SDK stream:
 | Delivery | Contract | Typical use |
 | --- | --- | --- |
 | `PublicEvent` | Persisted, sequenced, cursor-addressable and replayable | task state, completed messages, tool state, audit and recovery |
-| internal `LiveEvent` | Best effort, connection-time only, no cursor or replay | text and tool-argument previews |
+| internal `LiveEvent` | Best effort, connection-time only, with a bounded same-process replay window and no cursor or durable history | text, reasoning and tool-argument previews |
 
 Applications consume the sealed `SessionStreamEvent` union: `Committed` wraps a `PublicEvent`,
 `PreviewStarted` announces a preview, `EventDelta` carries an opted-in increment, and
 `SnapshotReset` replaces local durable state after resynchronization. Only `Committed` contains a
 Durable cursor. `EventStreamOptions.deltas(...)` enables message or tool-argument previews for one
 stream connection; the default delivers durable facts only.
+
+Tool-call events reach an AG-UI client exactly once per copy. A live preview streams the arguments
+as fragments, so the committed request does not repeat the complete JSON; a reconnect, which has no
+preview, still receives it. Each call delivers one terminal result: an observed output, never the
+status word, and a later status-only update does not replace content that was already delivered.
+The effective tool state is derived in one place (`ToolResultStates.resolve`): a tool that finishes
+without marking its state is read as success unless its output starts with `[ERROR]`, so execution
+and events never disagree about whether a call finished.
 
 ```java
 import io.agentscope.durable.EventStreamOptions;
@@ -562,6 +575,15 @@ with `event_deltas[]=agent.message`. Preview frames have no resume ID.
 [Claude event streams](https://platform.claude.com/docs/en/managed-agents/events-and-streaming)
 
 ### Preview transport for separate hosts
+
+A parked Run may still report `run.ended` first; that event is not terminal for AG-UI. The
+`turn.waiting` event closes the AG-UI Run: it maps to one `RUN_FINISHED` whose interrupt outcome
+carries every pending interaction of the Turn, after closing the steps, messages and tool calls
+the Run opened. Each interrupt id is the Durable interaction id and its `toolCallId` is the
+interaction request id, so the application resumes with the id it received. A Run stopped before
+completion finishes with the AG-UI cancelled outcome instead of reporting success. A waiting Turn
+without pending interactions, such as one waiting on a signal, has no AG-UI interrupt to deliver;
+its stream follows the Run's own terminal event, if any.
 
 The default `LiveEvents.local()` bus connects producers and observers only inside one Runtime
 assembly. A split Brain/API deployment must provide the same shared `LiveEvents` transport to both
@@ -1041,8 +1063,10 @@ or an externally managed executor.
 
 `turn.subscribeEvents(options, listener)` delivers committed events and opted-in deltas on the same
 serialized observer worker. Only a `Committed` item advances `subscription.cursor()`; deltas are
-not retried after disconnect and must not update a durable projection. A final
-`message.completed` remains authoritative if a client missed some or all previews.
+not retried after disconnect and must not update a durable projection. A same-process reconnect may
+replay the recent window of the current Step from the in-process live buffer, so consumers
+deduplicate by native event id. A final `message.completed` remains authoritative if a client
+missed some or all previews.
 
 Rehydrate the Session with `runtime.getSession(session)`, then use
 `mainThread().getTurn(turnId)` to access a task in the primary Thread. Queries/history/events never claim or execute

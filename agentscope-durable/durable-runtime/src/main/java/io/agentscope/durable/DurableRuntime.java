@@ -337,6 +337,15 @@ public final class DurableRuntime implements AutoCloseable {
         return new DurableSession(this, key);
     }
 
+    /**
+     * Wraps an existing Thread without reading the Session or Thread record. The first read made
+     * through the handle validates existence, so a caller that only needs a single read can skip
+     * the two extra round trips.
+     */
+    public DurableThread thread(SessionKey key, String threadId) {
+        return new DurableThread(this, new DurableSession(this, key), threadId);
+    }
+
     public SessionPage listSessions(String namespace, String cursor, int limit) {
         return DurableJson.convert(
                 call("listSessions", "namespace", namespace, "cursor", cursor, "limit", limit),
@@ -842,6 +851,11 @@ public final class DurableRuntime implements AutoCloseable {
         }
         activeCall.lease = lease;
         ScheduledFuture<?> heartbeat = null;
+        ScheduledFuture<?> leaseWatchdog = null;
+        var leaseDeadline =
+                new java.util.concurrent.atomic.AtomicLong(
+                        System.currentTimeMillis() + leaseDuration.toMillis());
+        Runnable lostLease = () -> interruptActive(key, activeCall, false);
         try {
             if (closed.get()) return;
             heartbeat =
@@ -849,7 +863,13 @@ public final class DurableRuntime implements AutoCloseable {
                             () -> {
                                 try {
                                     if (activeCall.stopped.get()) return;
+                                    if (System.currentTimeMillis() >= leaseDeadline.get()) {
+                                        lostLease.run();
+                                        return;
+                                    }
                                     backend.renew(lease, leaseDuration);
+                                    leaseDeadline.set(
+                                            System.currentTimeMillis() + leaseDuration.toMillis());
                                     if (activeCall.invoking
                                             && backend.turn(key, lease.turnId())
                                                     .cancellationRequested()) {
@@ -861,6 +881,15 @@ public final class DurableRuntime implements AutoCloseable {
                             },
                             Math.max(25, leaseDuration.toMillis() / 3),
                             Math.max(25, leaseDuration.toMillis() / 3),
+                            TimeUnit.MILLISECONDS);
+            leaseWatchdog =
+                    timer.scheduleWithFixedDelay(
+                            () -> {
+                                if (System.currentTimeMillis() >= leaseDeadline.get())
+                                    lostLease.run();
+                            },
+                            Math.max(25, leaseDuration.toMillis() / 6),
+                            Math.max(25, leaseDuration.toMillis() / 6),
                             TimeUnit.MILLISECONDS);
             Frame frame = backend.frame(lease);
             if (frame.turn().status() == TurnStatus.PAUSING) return;
@@ -940,6 +969,7 @@ public final class DurableRuntime implements AutoCloseable {
             }
         } finally {
             if (heartbeat != null) heartbeat.cancel(false);
+            if (leaseWatchdog != null) leaseWatchdog.cancel(false);
             // Shutdown and cancellation can interrupt an invocation before it reaches release.
             Thread.interrupted();
             try {
@@ -949,8 +979,19 @@ public final class DurableRuntime implements AutoCloseable {
                 if (e.code() == DurableException.Code.FENCED) activeCall.acknowledge = true;
                 else reportError(key.session(), e);
             }
-            // Do not leak a cancellation interrupt into the next session on this pooled worker.
-            Thread.interrupted();
+            // A Run's live previews are only meaningful while that Run is executing. Once this
+            // invocation boundary is reached (finished, parked for input or waiting for tools),
+            // drop the replay window: the next subscriber is normally the resumed Run, whose first
+            // frames are new, and the interrupted Run's output is already committed.
+            try {
+                liveEvents.clear(key.session(), key.threadId());
+            } catch (RuntimeException cleanupFailure) {
+                // Live events are best effort; cleanup must never mask the durable outcome.
+                reportError(key.session(), cleanupFailure);
+            } finally {
+                // Do not leak a cancellation interrupt into the next session on this pooled worker.
+                Thread.interrupted();
+            }
         }
     }
 

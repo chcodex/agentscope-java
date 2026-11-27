@@ -134,6 +134,22 @@ class DurableProtocolTest {
     }
 
     @Test
+    void validationFailureReportsLocationsWithoutEchoingTheOffendingValue() {
+        var secret = "sk-live-secret-42";
+        var invalid =
+                DurableJson.parse(
+                        """
+                        {"eventId":"e","type":"%s","data":{},"runId":null,"stepId":null}
+                        """
+                                .formatted(secret));
+        var error =
+                assertThrows(
+                        DurableException.class,
+                        () -> DurableProtocol.validate("eventInput", invalid));
+        assertFalse(error.getMessage().contains(secret));
+    }
+
+    @Test
     void modelFactsRequireExplicitRequestIdentityUsageAndExecutionScope() throws Exception {
         try (var input = getClass().getResourceAsStream("/durable-protocol/vectors.json")) {
             var vectors =
@@ -146,6 +162,29 @@ class DurableProtocolTest {
                         DurableException.class,
                         () -> DurableProtocol.validate("eventInput", event));
         }
+    }
+
+    @Test
+    void reasoningMessageDeltaConformsToCommitSchema() {
+        var event =
+                new DurableTypes.EventInput(
+                        "reasoning-1",
+                        "message.delta",
+                        DurableJson.value(
+                                Map.of(
+                                        "messageId",
+                                        "thinking:abc",
+                                        "attempt",
+                                        1,
+                                        "revision",
+                                        0,
+                                        "text",
+                                        "why",
+                                        "reasoning",
+                                        true)),
+                        "run-1",
+                        null);
+        DurableProtocol.validate("eventInput", event);
     }
 
     @Test

@@ -323,10 +323,14 @@ var history = handle.history(null, 100);
 同一 Turn 可以产生多条 assistant 消息，不同推理轮次分别保留。消息的逻辑 ID 不随
 Run/Step 更换而改变；重新调用模型时增加 attempt，重放已提交模型结果时用 revision
 替换未完成文本，避免重连后重复拼接。`message.completed` 是权威持久事实；
-`message.delta` 与 `tool.arguments.delta` 是由 middleware 处理后展示事实产生的尽力而为
-`LiveEvent` 预览，没有 sequence/cursor，也不进入 history、snapshot 或重放。模型私有推理
-仍不公开。history 按首次公共 sequence 排序；直接读取 snapshot 的 messages 映射时也应
-使用 sequence，不能依赖对象字段顺序。已有存储中的 `message.delta` 和
+`message.delta` 只是仅 live 的预览：`LiveEvents.local()` 为当前 Step 保留有上限的
+回放窗口，同进程重连可接上未完成的文本，而 delta 不进入 history、snapshot、游标或
+重放。逐 token 的 `presentation/*` journal 事件和模型 chunk 遵循同样规则：journal 只
+保留可恢复事实，外加每次模型调用的首个 chunk（保证已提交消息的模型调用身份）。
+进程重启或换实例后的重连只会拿到最近一条已提交的 `message.completed`。
+`tool.arguments.delta` 遵循同样的仅 live 约定。
+模型私有推理仍不公开。history 按首次公共 sequence 排序；直接读取 snapshot 的 messages 映射时也应
+使用 sequence，不能依赖对象字段顺序。已有存储中的
 `tool.call.arguments` 仍可读取，但 AgentScope 的新写入不再创建它们。
 
 工具调用统一保存在 snapshot 的 tools 投影中，按 Thread、Turn 和 callId 关联参数分片、
@@ -430,12 +434,18 @@ Durable 内部区分两类事件存储语义，对 SDK 用户提供一条强类�
 | 交付类型 | 契约 | 常见用途 |
 | --- | --- | --- |
 | `PublicEvent` | 持久化、有序号、有游标、可重放 | 任务状态、完成消息、工具状态、审计与恢复 |
-| 内部 `LiveEvent` | 尽力而为、只在连接期间交付、无游标和重放 | 文本与工具参数预览 |
+| 内部 `LiveEvent` | 尽力而为、只在连接期间交付，同进程保留有限回放窗口，无游标和持久历史 | 文本、推理与工具参数预览 |
 
 应用统一消费 sealed `SessionStreamEvent`：`Committed` 包装持久 `PublicEvent`，
 `PreviewStarted` 表示预览开始，`EventDelta` 携带显式订阅的增量，`SnapshotReset` 用于游标
 失效后的状态替换。只有 `Committed` 包含 Durable cursor。每条连接通过
 `EventStreamOptions.deltas(...)` 显式启用消息或工具参数预览，默认只交付持久事实。
+
+工具调用事件对 AG-UI 客户端每份只交付一次：实时预览按分片推送参数，提交态请求就不再重复
+完整 JSON（没有预览的重连仍会收到完整参数）。每次调用只交付一个终态结果，内容是真实输出而
+不是状态词；后续只带状态的更新不会覆盖已交付的内容。工具的有效状态只在
+`ToolResultStates.resolve` 一处推导：工具结束时未显式标状态，按输出是否以 `[ERROR]` 开头
+判定成功或失败，因此执行层与事件层对"是否结束"的结论始终一致。
 
 ```java
 import io.agentscope.durable.EventStreamOptions;
@@ -489,6 +499,14 @@ Java 原生入口为 `session.cancelActiveTurns(requestId, threadId)`，全部�
 [Claude 事件流](https://platform.claude.com/docs/en/managed-agents/events-and-streaming)
 
 ### 分离部署的实时预览传输
+
+`run.ended` 可能先于 `turn.waiting` 到达，但它不是 AG-UI 的终止帧。`turn.waiting` 事件结束
+AG-UI Run：映射为一个 `RUN_FINISHED`，其 interrupt outcome 携带该 Turn 的全部待处理
+interaction，并先关闭该 Run 已打开的 step、message 与 tool call。每个 interrupt id 是
+Durable interaction id，其 `toolCallId` 是 interaction request id，应用用收到的 id 恢复。
+未完成即停止的 Run 以 AG-UI cancelled outcome 结束，不会报告为成功。没有待处理
+interaction 的等待（例如等待 signal）没有可投递的 AG-UI interrupt，其流由该 Run 自己的
+终止事件决定。
 
 默认 `LiveEvents.local()` 只连接同一个 Runtime 装配内的生产者与观察者。Brain/API 分离部署
 而且需要实时预览时，两侧必须配置同一个共享 `LiveEvents` 传输。即使该传输缺失或丢事件，
@@ -903,7 +921,8 @@ highWatermark 判断本次是否追平。过滤流的 sequence 可以不连续�
 
 `turn.subscribeEvents(options, listener)` 会在同一串行观察线程交付持久事件和显式订阅的 delta。
 只有 `Committed` 会推进 `subscription.cursor()`；delta 断线后不重试，也不能用于更新持久
-投影。客户端即使遗漏部分或全部预览，最终 `message.completed` 仍是权威结果。
+投影。同进程重连可能从进程内 live 缓冲重放当前 Step 的最近窗口，消费方应按原生事件 id
+去重。客户端即使遗漏部分或全部预览，最终 `message.completed` 仍是权威结果。
 
 通过 `runtime.getSession(session)` 重新取得会话句柄，再使用
 `mainThread().getTurn(turnId)` 获取主 Thread 的任务；查询、历史和事件均不认领或执行任务。

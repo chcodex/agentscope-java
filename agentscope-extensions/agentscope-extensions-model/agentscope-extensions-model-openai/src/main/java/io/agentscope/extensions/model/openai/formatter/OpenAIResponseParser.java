@@ -494,6 +494,10 @@ public class OpenAIResponseParser {
                             if (toolCall.getFunction() != null) {
                                 try {
                                     String toolCallId = toolCall.getId();
+                                    // Fragments must stay attached to their own call. The
+                                    // accumulator otherwise appends a blank-name fragment to
+                                    // whichever parallel call it saw last.
+                                    String declaredId = toolCallId;
                                     Integer toolIndex = toolCall.getIndex();
                                     String toolName = toolCall.getFunction().getName();
                                     String arguments = toolCall.getFunction().getArguments();
@@ -526,10 +530,9 @@ public class OpenAIResponseParser {
                                             thoughtSignature != null ? "present" : "null");
 
                                     // For streaming, we get partial tool calls that need to be
-                                    // accumulated
-                                    if (toolName != null
-                                            && ToolValidator.requireNonBlank(
-                                                    "OpenAI", toolName, toolCallId)) {
+                                    // accumulated. A blank name is the normal shape of argument
+                                    // fragments; do not warn and do not drop them.
+                                    if (toolName != null && !toolName.isBlank()) {
                                         // First chunk with complete metadata (has tool name)
                                         Map<String, Object> argsMap = new HashMap<>();
 
@@ -586,7 +589,7 @@ public class OpenAIResponseParser {
 
                                         contentBlocks.add(
                                                 ToolUseBlock.builder()
-                                                        .id("")
+                                                        .id(declaredId != null ? declaredId : "")
                                                         .name(FRAGMENT_PLACEHOLDER)
                                                         .input(new HashMap<>())
                                                         .content(arguments)

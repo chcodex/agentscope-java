@@ -16,6 +16,8 @@
 package io.agentscope.durable;
 
 import io.agentscope.durable.DurableTypes.LiveEvent;
+import io.agentscope.durable.DurableTypes.SessionKey;
+import java.util.Objects;
 import java.util.function.Consumer;
 
 /**
@@ -44,4 +46,37 @@ public interface LiveEvents {
     void publish(LiveEvent event);
 
     AutoCloseable subscribe(Consumer<LiveEvent> listener);
+
+    /**
+     * Drops the replay window of one Thread once its Run is over.
+     *
+     * <p>A parked or finished Run must not replay its previews to the next subscriber: the
+     * resumed Run starts fresh, and the interrupted Run's output is already covered by its
+     * committed events. Leaving the buffer in place makes a resume connection receive orphaned
+     * {@code TEXT_MESSAGE_START}/{@code TOOL_CALL_START} frames whose matching end frames were
+     * committed (and therefore skipped by the new cursor).
+     *
+     * <p>The Session is part of the identity: Thread ids are only unique inside one Session.
+     */
+    default void clear(SessionKey session, String threadId) {}
+
+    /**
+     * Subscribes for one Thread and first replays the recent live events still held in memory, so
+     * a reconnect can resume the current partial message without committing every delta. The
+     * replay is best effort and process-local, exactly like {@link #publish}.
+     *
+     * <p>Only events of the given Session and Thread are delivered; implementations that keep no
+     * per-Thread window are filtered here.
+     */
+    default AutoCloseable subscribe(
+            SessionKey session, String threadId, Consumer<LiveEvent> listener) {
+        Objects.requireNonNull(session, "session");
+        Objects.requireNonNull(listener, "listener");
+        return subscribe(
+                event -> {
+                    if (session.equals(event.session())
+                            && (threadId == null || threadId.equals(event.threadId())))
+                        listener.accept(event);
+                });
+    }
 }

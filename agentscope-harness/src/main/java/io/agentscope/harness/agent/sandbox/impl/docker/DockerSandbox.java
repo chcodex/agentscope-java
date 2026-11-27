@@ -333,7 +333,7 @@ public class DockerSandbox extends AbstractBaseSandbox implements SandboxFileTra
                 "-xpf",
                 "-",
                 "-C",
-                dockerState.getWorkspaceRoot());
+                getWorkspaceRoot());
     }
 
     @Override

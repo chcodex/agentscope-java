@@ -66,6 +66,7 @@ class SessionStreamEventTest {
         assertEquals(EventDeltaType.MESSAGE, delta.deltaType());
         assertEquals("text-1", delta.blockId());
         assertEquals("hi", delta.data().path("text").asText());
+        assertEquals("message.delta-source", delta.sourceEventId());
     }
 
     @Test
@@ -81,6 +82,7 @@ class SessionStreamEventTest {
 
         assertEquals("call-1", delta.eventId());
         assertEquals(EventDeltaType.TOOL_ARGUMENTS, delta.deltaType());
+        assertEquals("tool.arguments.delta-source", delta.sourceEventId());
     }
 
     @Test

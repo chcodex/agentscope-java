@@ -290,4 +290,68 @@ class OpenAIStreamingToolCallTest {
         assertEquals("call_null", toolUse.getId());
         assertEquals("null_args_tool", toolUse.getName());
     }
+
+    @Test
+    @DisplayName("Blank-name fragments stay attached to their parallel call")
+    void testParallelFragmentsKeepCallIdentity() {
+        // Two calls open in one chunk; the next chunk only carries arguments for the first.
+        OpenAIResponse names = new OpenAIResponse();
+        names.setId("chatcmpl-parallel");
+        names.setObject("chat.completion.chunk");
+        OpenAIChoice namesChoice = new OpenAIChoice();
+        namesChoice.setIndex(0);
+        OpenAIMessage namesDelta = new OpenAIMessage();
+        OpenAIToolCall first = new OpenAIToolCall();
+        first.setId("call_1");
+        first.setIndex(0);
+        first.setType("function");
+        OpenAIFunction firstFunction = new OpenAIFunction();
+        firstFunction.setName("get_weather");
+        firstFunction.setArguments("{\"city\":");
+        first.setFunction(firstFunction);
+        OpenAIToolCall second = new OpenAIToolCall();
+        second.setId("call_2");
+        second.setIndex(1);
+        second.setType("function");
+        OpenAIFunction secondFunction = new OpenAIFunction();
+        secondFunction.setName("get_time");
+        secondFunction.setArguments("{\"zone\":");
+        second.setFunction(secondFunction);
+        namesDelta.setToolCalls(List.of(first, second));
+        namesChoice.setDelta(namesDelta);
+        names.setChoices(List.of(namesChoice));
+
+        OpenAIResponse fragment = new OpenAIResponse();
+        fragment.setId("chatcmpl-parallel");
+        fragment.setObject("chat.completion.chunk");
+        OpenAIChoice fragmentChoice = new OpenAIChoice();
+        fragmentChoice.setIndex(0);
+        OpenAIMessage fragmentDelta = new OpenAIMessage();
+        OpenAIToolCall fragmentCall = new OpenAIToolCall();
+        fragmentCall.setId("call_1");
+        fragmentCall.setIndex(0);
+        fragmentCall.setType("function");
+        OpenAIFunction fragmentFunction = new OpenAIFunction();
+        fragmentFunction.setArguments("\"Paris\"}");
+        fragmentCall.setFunction(fragmentFunction);
+        fragmentDelta.setToolCalls(List.of(fragmentCall));
+        fragmentChoice.setDelta(fragmentDelta);
+        fragment.setChoices(List.of(fragmentChoice));
+
+        var accumulator = new io.agentscope.core.agent.accumulator.ToolCallsAccumulator();
+        for (var response : List.of(names, fragment)) {
+            var parsed = parser.parseResponse(response, Instant.now());
+            assertNotNull(parsed);
+            for (ContentBlock block : parsed.getContent()) {
+                accumulator.add((ToolUseBlock) block);
+            }
+        }
+        var calls = accumulator.buildAllToolCalls();
+        assertEquals(2, calls.size());
+        assertEquals("call_1", calls.get(0).getId());
+        assertEquals("get_weather", calls.get(0).getName());
+        assertEquals("{\"city\":\"Paris\"}", calls.get(0).getContent());
+        assertEquals("call_2", calls.get(1).getId());
+        assertEquals("get_time", calls.get(1).getName());
+    }
 }

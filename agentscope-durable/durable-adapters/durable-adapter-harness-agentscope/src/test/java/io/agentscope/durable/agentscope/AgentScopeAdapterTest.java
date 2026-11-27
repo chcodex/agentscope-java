@@ -38,6 +38,7 @@ import io.agentscope.core.ReActAgent;
 import io.agentscope.core.agent.Agent;
 import io.agentscope.core.agent.RuntimeContext;
 import io.agentscope.core.event.AgentEvent;
+import io.agentscope.core.event.AgentResultEvent;
 import io.agentscope.core.event.TextBlockDeltaEvent;
 import io.agentscope.core.journal.InvocationRecorder;
 import io.agentscope.core.journal.JournalEvent;
@@ -52,6 +53,7 @@ import io.agentscope.core.message.ToolExecutionDetails;
 import io.agentscope.core.message.ToolResultBlock;
 import io.agentscope.core.message.ToolResultState;
 import io.agentscope.core.message.ToolUseBlock;
+import io.agentscope.core.middleware.AgentInput;
 import io.agentscope.core.middleware.MiddlewareBase;
 import io.agentscope.core.middleware.ModelCallInput;
 import io.agentscope.core.model.ChatResponse;
@@ -130,6 +132,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
@@ -259,6 +262,69 @@ class AgentScopeAdapterTest {
     }
 
     @Test
+    void interruptedRunHandlerCanSettleInsteadOfResuming() {
+        var backend =
+                new TransactionalSessionBackend(
+                        JdbcRecordStore.sqlite(directory.resolve("interrupted.db")));
+        var factoryCalls = new AtomicInteger();
+        var observedRuns = new AtomicReference<Set<String>>();
+        var adapter =
+                AgentScopeAdapter.forReAct(
+                        binding -> {
+                            factoryCalls.incrementAndGet();
+                            return ReActAgent.builder()
+                                    .name("interrupted-fixture")
+                                    .model(new ScriptedModel(false));
+                        },
+                        Map.of(),
+                        run -> {
+                            observedRuns.set(run.activeRunIds());
+                            return Optional.of(
+                                    new InterruptedRunHandler.Settlement(
+                                            TurnStatus.CANCELLED, "interrupted"));
+                        });
+        var threadKey = new ThreadKey(key, "main");
+        try (var runtime = runtime(backend, adapter, null)) {
+            runtime.createSession(key, "agent").mainThread().view().definition();
+            var turn = runtime.getSession(key).submit("request", "hello");
+
+            // Leave a run/start without its run/end, the journal state a crashed host produces.
+            var lease = backend.claim(threadKey, "fixture", Duration.ofSeconds(30)).orElseThrow();
+            var context = new HarnessContext(backend, lease, new AtomicBoolean());
+            var log = new BackendThreadJournal(context, Map.of());
+            var run = context.prepareRun();
+            var writer = log.acquire(run.runId(), Duration.ofMinutes(1));
+            long seq = log.head().seq() + 1;
+            log.commit(
+                    writer,
+                    "interrupted-fixture",
+                    seq - 1,
+                    List.of(
+                            new JournalEvent(
+                                    JournalEvent.SCHEMA_VERSION,
+                                    java.util.UUID.randomUUID().toString(),
+                                    seq,
+                                    System.currentTimeMillis(),
+                                    "run/start",
+                                    run.runId(),
+                                    turn.turnId(),
+                                    true,
+                                    JsonUtils.getJsonCodec()
+                                            .toJson(Map.of("executionRunId", run.runId())))));
+            log.release(writer);
+            backend.release(lease, Duration.ZERO);
+
+            runtime.tick(threadKey);
+
+            assertNull(runtime.lastFailure(threadKey));
+            assertEquals(TurnStatus.CANCELLED, backend.turn(threadKey, turn.turnId()).status());
+            assertEquals(1, observedRuns.get().size(), "handler sees the unfinished run");
+            assertEquals(
+                    0, factoryCalls.get(), "the agent must not be built for a declined resume");
+        }
+    }
+
+    @Test
     void adapterOwnsTheInvocationJournalConfiguration() {
         var adapter =
                 AgentScopeAdapter.forReAct(
@@ -275,6 +341,60 @@ class AgentScopeAdapterTest {
             assertNull(runtime.lastFailure(new ThreadKey(key, "main")));
             assertEquals(TurnStatus.SUCCEEDED, turn.status().status());
             assertTrue(!backend.checkpoints(new ThreadKey(key, "main"), 0, 1000).isEmpty());
+        }
+    }
+
+    @Test
+    void publishesConfiguredResultMetadataAsExtensionEvent() {
+        Map<String, Object> artifacts =
+                Map.of("deliver_artifacts", List.of(Map.of("url", "https://files/report.pdf")));
+        MiddlewareBase attachMetadata =
+                new MiddlewareBase() {
+                    public Set<ExtensionPoint> activePoints() {
+                        return Set.of(ExtensionPoint.ON_AGENT);
+                    }
+
+                    public Flux<AgentEvent> onAgent(
+                            Agent agent,
+                            RuntimeContext context,
+                            AgentInput input,
+                            Function<AgentInput, Flux<AgentEvent>> next) {
+                        return next.apply(input)
+                                .map(
+                                        event ->
+                                                event instanceof AgentResultEvent result
+                                                        ? result.withMetadata(artifacts)
+                                                        : event);
+                    }
+                };
+        var adapter =
+                AgentScopeAdapter.forReAct(
+                                binding ->
+                                        ReActAgent.builder()
+                                                .name("result-metadata")
+                                                .model(new ScriptedModel(false))
+                                                .middleware(attachMetadata),
+                                Map.of())
+                        .withResultMetadataKeys("deliver_artifacts");
+        try (var backend = LocalBackend.open(directory.resolve("result-metadata"));
+                var runtime = runtime(backend, adapter, null)) {
+            runtime.createSession(key, "agent").submit("request", "hello");
+            runtime.tick(new ThreadKey(key, "main"));
+            assertNull(runtime.lastFailure(new ThreadKey(key, "main")));
+
+            var events = backend.events(key, null, 1000).events();
+            var types = events.stream().map(event -> event.type()).toList();
+            assertTrue(types.contains("x.result_metadata"), "events=" + types);
+            var metadata =
+                    events.stream()
+                            .filter(event -> event.type().equals("x.result_metadata"))
+                            .findFirst()
+                            .orElseThrow();
+            assertEquals(
+                    "https://files/report.pdf",
+                    metadata.data().path("deliver_artifacts").get(0).path("url").asText());
+            assertTrue(metadata.runId() != null && !metadata.runId().isBlank());
+            assertTrue(events.stream().anyMatch(event -> event.type().equals("run.ended")));
         }
     }
 
@@ -631,7 +751,10 @@ class AgentScopeAdapterTest {
                 assertEquals("done", answer.path("text").asText());
                 assertEquals(1, answer.path("attempt").asLong());
                 assertEquals(
-                        1, answer.path("revision").asLong(), "Replay replaces the partial stream");
+                        0,
+                        answer.path("revision").asLong(),
+                        "Streaming deltas are live-only, so replay produces no committed partial"
+                                + " to replace");
                 var projection = new EventProjection(key);
                 for (var event : storage.events(key, null, 1000).events()) projection.accept(event);
                 assertEquals(
@@ -1893,7 +2016,7 @@ class AgentScopeAdapterTest {
                 var runtime = runtime(backend, adapter, null, liveEvents)) {
             var turn = runtime.createSession(key, "agent").submit("request", "hello");
             runtime.tick(new ThreadKey(key, "main"));
-            assertNull(runtime.lastFailure(new ThreadKey(key, "main")));
+            assertEquals(TurnStatus.SUCCEEDED, turn.status().status());
             assertEquals(TurnStatus.SUCCEEDED, turn.status().status());
             assertEquals(3, calls.get());
             var snapshot = backend.snapshot(key);
@@ -1967,13 +2090,36 @@ class AgentScopeAdapterTest {
             assertTrue(arguments.isEmpty());
             assertEquals(
                     4, live.stream().filter(e -> "tool.arguments.delta".equals(e.type())).count());
-            assertTrue(events.stream().noneMatch(e -> "message.delta".equals(e.type())));
+            var committedDeltas =
+                    events.stream().filter(e -> "message.delta".equals(e.type())).toList();
+            assertTrue(
+                    committedDeltas.isEmpty(),
+                    "streaming deltas stay live-only; message.completed is the durable truth");
             var deltas = live.stream().filter(e -> "message.delta".equals(e.type())).toList();
-            assertEquals(3, deltas.size());
             assertEquals(
                     List.of("shown 0", "shown 1", "shown 2"),
-                    deltas.stream().map(e -> e.data().path("text").asText()).toList());
-            assertFalse(DurableJson.value(events).toString().contains("private reasoning"));
+                    deltas.stream()
+                            .filter(e -> !e.data().path("reasoning").asBoolean(false))
+                            .map(e -> e.data().path("text").asText())
+                            .toList());
+            assertEquals(
+                    3,
+                    deltas.stream()
+                            .filter(e -> e.data().path("reasoning").asBoolean(false))
+                            .count());
+            var completedIds =
+                    events.stream()
+                            .filter(e -> "message.completed".equals(e.type()))
+                            .map(e -> e.data().path("messageId").asText())
+                            .toList();
+            assertTrue(
+                    deltas.stream()
+                            .filter(e -> !e.data().path("reasoning").asBoolean(false))
+                            .allMatch(
+                                    e ->
+                                            completedIds.contains(
+                                                    e.data().path("messageId").asText())),
+                    "live text deltas and message.completed share the Step's message id");
             assertFalse(DurableJson.value(events).toString().contains("raw "));
             var projection = new EventProjection(key);
             events.forEach(projection::accept);

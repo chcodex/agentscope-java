@@ -83,6 +83,7 @@ public final class ThreadStateAccess {
             throw new IllegalArgumentException("A state change reason is required");
         ThreadJournal.Writer writer = log.acquire(UUID.randomUUID().toString(), LEASE);
         try {
+            // The write path compares the caller's asOfSeq and must see the full projection.
             JournalProjection projection = JournalProjection.read(log);
             if (!projection.uncertainToolCalls().isEmpty())
                 throw new JournalException(

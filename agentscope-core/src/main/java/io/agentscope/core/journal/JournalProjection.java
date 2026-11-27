@@ -45,28 +45,47 @@ public record JournalProjection(
 
     /** Builds one projection while allowing startup readers to inspect that same metadata prefix. */
     public static JournalProjection read(ThreadJournal log, Consumer<JournalEvent> observer) {
+        return read(log, null, observer);
+    }
+
+    /**
+     * Reads a recovery view. The current seed does not contain all facts needed to reconstruct
+     * tool outcomes and run history, so it is not used as a replay boundary. The observer sees
+     * the complete committed prefix, just as in {@link #read(ThreadJournal, Consumer)}.
+     */
+    public static JournalProjection read(
+            ThreadJournal log, ThreadJournal.ProjectionSeed seed, Consumer<JournalEvent> observer) {
         long cursor = 0;
         String state = null;
         JournalEvent checkpoint = null;
+        String positionTurnId = null;
+        String positionRunId = null;
         var uncertain = new LinkedHashSet<String>();
         var runs = new LinkedHashSet<String>();
         var results = new LinkedHashMap<String, ToolResultBlock>();
         var verifications = new ArrayList<io.agentscope.core.state.TaskVerification>();
         var extensions = new ArrayList<JournalEvent>();
         long upper = log.head().seq();
-        // A projection is a recovery view, not an incremental read: it must see every historical
-        // message identity and every unresolved dispatch, so it scans the committed prefix once.
-        // Backends optimize this by returning metadata and requiring materialize only for state.
-        for (var event : log.scanMetadata(0, upper)) {
+        // Checkpoints can repeat an earlier state and do not fold all recovery facts into it.
+        for (var event : log.scanMetadata(cursor, upper)) {
             JournalEventTypes.validate(event);
             observer.accept(event);
             var data = event.data();
             switch (event.type()) {
-                case "state/checkpoint",
-                        "state/initialized",
-                        "migration/baseline",
-                        "state/restored" -> {
+                case "state/checkpoint" -> {
                     checkpoint = event;
+                    // A periodic checkpoint carries no run identity; keep the last known one.
+                    if (event.turnId() != null) positionTurnId = event.turnId();
+                    if (event.executionRunId() != null) positionRunId = event.executionRunId();
+                    verifications.clear();
+                    extensions.clear();
+                }
+                case "state/initialized", "migration/baseline", "state/restored" -> {
+                    checkpoint = event;
+                    // A new baseline starts a new execution identity; inheriting the previous
+                    // turn/run would attach unrelated calls to the old execution position.
+                    positionTurnId = event.turnId();
+                    positionRunId = event.executionRunId();
                     verifications.clear();
                     extensions.clear();
                 }
@@ -153,8 +172,8 @@ public record JournalProjection(
                 state,
                 Set.copyOf(uncertain),
                 Set.copyOf(runs),
-                checkpoint == null ? null : checkpoint.turnId(),
-                checkpoint == null ? null : checkpoint.executionRunId(),
+                positionTurnId,
+                positionRunId,
                 position);
     }
 

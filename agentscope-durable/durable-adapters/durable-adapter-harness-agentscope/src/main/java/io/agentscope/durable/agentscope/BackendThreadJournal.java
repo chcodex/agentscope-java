@@ -54,6 +54,7 @@ import io.agentscope.durable.codec.agentscope.AgentScopeCheckpointCodec;
 import io.agentscope.durable.codec.agentscope.DurableEventSchemas;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -66,15 +67,58 @@ import java.util.UUID;
 final class BackendThreadJournal implements ThreadJournal {
     private final HarnessContext context;
     private final Map<String, String> executors;
+
+    /**
+     * Local export watermark per sink. The Durable journal is the source of truth and a fresh
+     * journal instance replays the committed prefix, so the watermark stays in memory: a lost ACK
+     * repeats events and every sink de-duplicates by event id.
+     */
+    private final Map<String, Long> exportCursors = new HashMap<>();
+
     private final Map<String, ToolBinding> bindings;
     private final String initialInputId;
     private final JsonNode initialInput;
     private final Set<String> sealed = new HashSet<>();
     private final List<String> signalsToApply = new ArrayList<>();
+
+    /**
+     * Result metadata from the native event stream, waiting for the recorder's next commit. It is
+     * published as one {@code x.result_metadata} public event, not as a native journal event: the
+     * value describes a result, not Agent state, and replay reads it back from the public stream.
+     */
+    private final Map<String, QueuedResultMetadata> queuedResultMetadata = new LinkedHashMap<>();
+
+    private record QueuedResultMetadata(String runId, Map<String, Object> values) {}
+
     private String owner;
-    private final Map<String, ModelCapture> captures = new LinkedHashMap<>();
+
+    /** Concurrent: the model stream records chunks while a commit may freeze the same call. */
+    /** Events since the latest checkpoint seen while replaying; seed for the periodic check. */
+    private long checkpointGap;
+
+    private final Map<String, ModelCapture> captures =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
     private ObjectNode cached;
+
+    /**
+     * Journal sequence covered by the checkpoint this invocation restores from. History before it
+     * is already reflected in the native state, so replay starts there instead of at the beginning
+     * of the thread.
+     */
+    private long baseSeq;
+
     private AgentScopeMessageEvents messages = new AgentScopeMessageEvents();
+
+    /**
+     * Presentation-only state for streaming deltas. It mirrors the committed state machine on the
+     * same event sequence, so live frames carry the same message ids as the committed ones.
+     */
+    private final AgentScopeMessageEvents liveMessages = new AgentScopeMessageEvents();
+
+    /** Guards {@link #liveMessages} only; it must never wait on the commit monitor. */
+    private final Object liveLock = new Object();
+
     private AgentScopeToolEvents toolEvents = new AgentScopeToolEvents();
 
     BackendThreadJournal(HarnessContext context, Map<String, String> executors) {
@@ -89,7 +133,7 @@ final class BackendThreadJournal implements ThreadJournal {
         DurableEventSchemas.ensureRegistered();
         this.context = context;
         this.executors = executors;
-        var frame = context.frame();
+        var frame = context.frameWithCheckpoint();
         initialInputId = frame.turn().inputMessageId();
         initialInput = frame.input();
         var checkpoint = frame.checkpoint();
@@ -105,7 +149,12 @@ final class BackendThreadJournal implements ThreadJournal {
         cached.putArray("events");
         cached.putObject("receipts");
         cached.put("lastCommit", checkpoint.path("lastCommit").asText(null));
-        long position = 0;
+        // A state checkpoint alone does not capture pending interactions, finalization, message
+        // identities or the run history needed by consumers of this journal. Until a seed contains
+        // those facts, replay the complete prefix instead of treating a step boundary as proof.
+        baseSeq = 0;
+        long position = baseSeq;
+        long lastCheckpoint = baseSeq;
         while (true) {
             var page = context.journal(position, 1000);
             for (var entry : page) {
@@ -114,30 +163,63 @@ final class BackendThreadJournal implements ThreadJournal {
                 if (event.seq() != ++position)
                     throw new DurableException(
                             DurableException.Code.CONFLICT, "Native journal is discontinuous");
+                if ("state/checkpoint".equals(event.type())) lastCheckpoint = event.seq();
                 cached.withArray("events").add(entry);
                 messages.accept(event);
+                // Mirror the committed prefix into the presentation state machine: after a
+                // restart the first live delta must still resolve its Step/message mapping.
+                liveMessages.accept(event);
                 toolEvents.accept(event, messages);
             }
             if (page.size() < 1000) break;
         }
+        checkpointGap = position - lastCheckpoint;
         if (checkpoint.path("position").asLong() != position)
             throw new DurableException(
                     DurableException.Code.CONFLICT, "Native checkpoint and journal disagree");
     }
 
-    synchronized void modelStarted(String id, ModelCapture capture) {
+    /**
+     * Queues result metadata for the recorder's next commit. It must not append its own batch:
+     * that would advance the journal head past the recorder's preallocated sequence and fence the
+     * next native commit with a conflict.
+     */
+    synchronized void queueResultMetadata(String runId, Map<String, Object> values) {
+        if (runId == null || values == null || values.isEmpty()) return;
+        var merged = new LinkedHashMap<String, Object>();
+        var previous = queuedResultMetadata.get(runId);
+        if (previous != null) merged.putAll(previous.values());
+        merged.putAll(values);
+        queuedResultMetadata.put(runId, new QueuedResultMetadata(runId, merged));
+    }
+
+    /**
+     * Publishes metadata that arrived after the recorder's final commit. The flush writes one
+     * marker fact so the existing commit path stays the only writer; the payload itself rides on
+     * the public event.
+     */
+    synchronized void flushQueuedResultMetadata(String turnId) {
+        if (turnId == null || queuedResultMetadata.isEmpty()) return;
+        try {
+            append(turnId, List.of(Map.entry(DurableEventSchemas.RESULT_METADATA, Map.of())));
+        } catch (RuntimeException ignored) {
+            // Optional metadata must not turn a completed invocation into a failure.
+        }
+    }
+
+    void modelStarted(String id, ModelCapture capture) {
         captures.put(id, capture);
     }
 
-    synchronized void modelChunk(String id, ChatResponse chunk) {
+    /**
+     * Must not take the journal monitor: it runs on the model stream thread, and a commit holds
+     * that monitor for its database round trips, which would stall reading the next chunk.
+     */
+    void modelChunk(String id, ChatResponse chunk) {
         captures.get(id).accept(chunk);
     }
 
     private JournalEvent capture(JournalEvent event) {
-        if ("model/request_started".equals(event.type())) {
-            var capture = captures.get(String.valueOf(event.data().get("modelCallId")));
-            if (capture != null) capture.nextAttempt();
-        }
         if (!"model/end".equals(event.type())) return event;
         var capture = captures.get(String.valueOf(event.data().get("modelCallId")));
         if (capture == null) return event;
@@ -171,15 +253,59 @@ final class BackendThreadJournal implements ThreadJournal {
         return cached.deepCopy();
     }
 
+    /**
+     * Forwards a streaming delta as soon as it is appended instead of waiting for the next batched
+     * commit. Presentation is best effort: failures stay out of the durable path, and a re-delivery
+     * repeats at most a preview that the committed {@code message.completed} replaces.
+     */
+    @Override
+    public void live(JournalEvent event) {
+        // Attempt boundaries are stream-time facts, not commit-time facts. The adapter accumulates
+        // chunk usage as the model streams, so the reset must run when request_started is appended.
+        // Resetting when the batch commits would wipe chunks that streamed before a commit that
+        // batches request_started with its request_ended (append-merged attempts).
+        if ("model/request_started".equals(event.type())) {
+            var capture = captures.get(String.valueOf(event.data().get("modelCallId")));
+            if (capture != null) capture.nextAttempt();
+        }
+        AgentScopeMessageEvents.Output output;
+        synchronized (liveLock) {
+            try {
+                output = liveMessages.accept(event);
+            } catch (RuntimeException ignored) {
+                // A malformed preview must not break recording; the committed path reports it.
+                return;
+            }
+        }
+        if (!output.live().isEmpty()) {
+            context.publish(output.live());
+        }
+    }
+
+    @Override
+    public synchronized long exportCursor(String sink) {
+        return exportCursors.getOrDefault(sink, 0L);
+    }
+
+    @Override
+    public synchronized void advanceExportCursor(String sink, long expected, long next) {
+        if (exportCursor(sink) != expected)
+            throw new DurableException(
+                    DurableException.Code.CONFLICT, "Export cursor moved for sink " + sink);
+        exportCursors.put(sink, next);
+    }
+
     @Override
     public synchronized Head head() {
-        return head(checkpoint());
+        // head(...) only reads the state; copying the whole event array per call dominated
+        // recovery and every append on a long thread.
+        return head(cached);
     }
 
     private Head head(ObjectNode state) {
         return new Head(
                 FORMAT_VERSION,
-                state.path("events").size(),
+                baseSeq + state.path("events").size(),
                 context.lease().epoch(),
                 owner,
                 context.lease().expiresAt(),
@@ -204,7 +330,8 @@ final class BackendThreadJournal implements ThreadJournal {
     }
 
     private void check(Writer writer) {
-        context.frame();
+        // Ownership is enforced atomically by commit/owned(); an extra Frame read here would be
+        // a write transaction before every flush and could not prove the lease at commit time.
         if (!writer.owner().equals(owner)
                 || writer.epoch() != context.lease().epoch()
                 || sealed.contains(writer.owner()))
@@ -213,7 +340,13 @@ final class BackendThreadJournal implements ThreadJournal {
 
     @Override
     public synchronized void renew(Writer writer, Duration lease) {
-        check(writer); // Outer runtime exclusively owns lease renewal.
+        // Only the runtime owns lease renewal; this guard only proves the writer still belongs to
+        // this host. Reading a Frame here would add a write transaction to every flush batch and
+        // compete with commit for the session row lock.
+        if (!writer.owner().equals(owner)
+                || writer.epoch() != context.lease().epoch()
+                || sealed.contains(writer.owner()))
+            throw new DurableException(DurableException.Code.FENCED, "Stale native writer");
     }
 
     @Override
@@ -256,11 +389,24 @@ final class BackendThreadJournal implements ThreadJournal {
             return DurableJson.convert(previous.path("head"), Head.class);
         }
         check(writer);
-        if (state.path("events").size() != expected)
+        if (baseSeq + state.path("events").size() != expected)
             throw new DurableException(DurableException.Code.CONFLICT, "Native sequence changed");
         var tools = new ArrayList<ToolCall>();
         var publicEvents = new ArrayList<EventInput>();
         var liveEvents = new ArrayList<LiveEventInput>();
+        // Result metadata precedes every event this commit derives, so a client sees it before
+        // run.ended closes the Run. The event id stays stable across retries of the same value.
+        for (var metadata : queuedResultMetadata.values())
+            publicEvents.add(
+                    new EventInput(
+                            "x.result_metadata:"
+                                    + metadata.runId()
+                                    + ":"
+                                    + DurableJson.hash(metadata.values()),
+                            "x.result_metadata",
+                            DurableJson.value(metadata.values()),
+                            metadata.runId(),
+                            null));
         var nextMessages = new AgentScopeMessageEvents(messages);
         var nextToolEvents = new AgentScopeToolEvents(toolEvents);
         RunChange runChange = null;
@@ -403,7 +549,6 @@ final class BackendThreadJournal implements ThreadJournal {
             }
             var message = nextMessages.accept(event);
             if (message.durable() != null) publicEvents.add(message.durable());
-            liveEvents.addAll(message.live());
             publicEvents.addAll(nextToolEvents.accept(event, nextMessages));
             var toolPreview = nextToolEvents.preview(event, context.lease().epoch());
             if (toolPreview != null) liveEvents.add(toolPreview);
@@ -465,11 +610,12 @@ final class BackendThreadJournal implements ThreadJournal {
                                 expected, events.stream().map(DurableJson::value).toList()),
                         runChange,
                         stepChanges));
+        context.publish(liveEvents);
+        queuedResultMetadata.clear();
         cached = state;
         messages = nextMessages;
         toolEvents = nextToolEvents;
         if (hasCheckpoint) signalsToApply.clear();
-        context.publish(liveEvents);
         return result;
     }
 
@@ -581,6 +727,26 @@ final class BackendThreadJournal implements ThreadJournal {
         }
     }
 
+    /** Committed sequence this invocation restored from; history before it is not in memory. */
+    long baseSeq() {
+        return baseSeq;
+    }
+
+    @Override
+    public long replayStart() {
+        return baseSeq;
+    }
+
+    @Override
+    public String threadId() {
+        return context.lease().thread().threadId();
+    }
+
+    @Override
+    public long checkpointGap() {
+        return checkpointGap;
+    }
+
     synchronized String messageId(String turnId, Msg message) {
         return messages.messageId(turnId, message);
     }
@@ -588,10 +754,19 @@ final class BackendThreadJournal implements ThreadJournal {
     @Override
     public synchronized List<JournalEvent> readAfter(long after, int limit) {
         if (after < 0 || limit < 1) throw new IllegalArgumentException("Invalid native range");
-        var events = checkpoint().path("events");
         var result = new ArrayList<JournalEvent>();
-        for (long i = after; i < events.size() && result.size() < limit; i++)
-            result.add(DurableJson.convert(events.get((int) i), JournalEvent.class));
+        // History at or before baseSeq lives only in the store; the cached array starts after it.
+        if (after < baseSeq) {
+            for (var entry : context.journal(after, (int) Math.min(limit, baseSeq - after))) {
+                result.add(DurableJson.convert(entry, JournalEvent.class));
+                if (result.size() >= limit) return List.copyOf(result);
+            }
+        }
+        var events = cached.path("events");
+        for (long i = Math.max(after, baseSeq);
+                i < baseSeq + events.size() && result.size() < limit;
+                i++)
+            result.add(DurableJson.convert(events.get((int) (i - baseSeq)), JournalEvent.class));
         return List.copyOf(result);
     }
 
@@ -612,7 +787,7 @@ final class BackendThreadJournal implements ThreadJournal {
                                 JournalEvent.SCHEMA_VERSION,
                                 UUID.randomUUID().toString(),
                                 ++sequence,
-                                context.frame().now(),
+                                System.currentTimeMillis(),
                                 fact.getKey(),
                                 writer.owner(),
                                 turnId,

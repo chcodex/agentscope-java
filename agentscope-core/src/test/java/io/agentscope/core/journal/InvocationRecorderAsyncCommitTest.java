@@ -23,6 +23,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
@@ -261,6 +262,25 @@ class InvocationRecorderAsyncCommitTest {
             assertEquals(1, log.head().seq());
         } finally {
             release.countDown();
+            recorder.close();
+        }
+    }
+
+    @Test
+    void tokenPreviewsStayOutOfTheDurableJournal() {
+        var log = log();
+        var recorder = new InvocationRecorder(log, "turn", "run", null);
+        try {
+            recorder.append("step/start", Map.of("stepId", "first", "iteration", 0));
+            recorder.liveOnly("presentation/text", Map.of("text", "hi"));
+            recorder.liveOnly("model/chunk", Map.of("chunk", Map.of("id", "m")));
+            recorder.flush().block(Duration.ofSeconds(5));
+
+            assertEquals(
+                    List.of("step/start"),
+                    log.readAfter(0, 10).stream().map(JournalEvent::type).toList());
+            verify(log).live(argThat(event -> "presentation/text".equals(event.type())));
+        } finally {
             recorder.close();
         }
     }

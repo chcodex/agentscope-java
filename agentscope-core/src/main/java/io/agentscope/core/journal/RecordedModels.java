@@ -140,6 +140,8 @@ public final class RecordedModels {
                         }
                         var last = new AtomicReference<ChatResponse>();
                         var usage = new AtomicReference<ChatUsage>();
+                        var responseRecorded = new java.util.concurrent.atomic.AtomicBoolean(false);
+                        var responseId = new java.util.concurrent.atomic.AtomicReference<String>();
                         var requests = new RecordedModelRequests(recorder, callId, purpose);
                         return Flux.usingWhen(
                                 admission
@@ -157,6 +159,24 @@ public final class RecordedModels {
                                                             last.set(chunk);
                                                             if (chunk.getUsage() != null)
                                                                 usage.set(chunk.getUsage());
+                                                            // Record the response identity once per
+                                                            // model call; the chunks themselves
+                                                            // are committed by the payload below.
+                                                            if (chunk.getId() != null
+                                                                    && responseRecorded
+                                                                            .compareAndSet(
+                                                                                    false, true)) {
+                                                                responseId.set(chunk.getId());
+                                                                recorder.append(
+                                                                        "model/response",
+                                                                        Map.of(
+                                                                                "modelCallId",
+                                                                                id,
+                                                                                "responseId",
+                                                                                chunk.getId(),
+                                                                                "purpose",
+                                                                                purpose));
+                                                            }
                                                             Map<String, Object> payload =
                                                                     Map.of(
                                                                             "modelCallId",
@@ -190,7 +210,8 @@ public final class RecordedModels {
                                                         ? usage.get()
                                                         : requests.latestUsage(),
                                                 requests.count(),
-                                                null),
+                                                null,
+                                                responseId.get()),
                                 (id, error) ->
                                         JournalException.causedBy(error)
                                                         || error
@@ -205,7 +226,8 @@ public final class RecordedModels {
                                                                 ? usage.get()
                                                                 : requests.latestUsage(),
                                                         requests.count(),
-                                                        error),
+                                                        error,
+                                                        responseId.get()),
                                 id ->
                                         end(
                                                 recorder,
@@ -216,7 +238,8 @@ public final class RecordedModels {
                                                         ? usage.get()
                                                         : requests.latestUsage(),
                                                 requests.count(),
-                                                null));
+                                                null,
+                                                responseId.get()));
                     });
         }
 
@@ -227,7 +250,15 @@ public final class RecordedModels {
                 ChatResponse last,
                 ChatUsage usage,
                 int observedRequests,
-                Throwable error) {
+                Throwable error,
+                String firstResponseId) {
+            // Streaming assemblers can mint a per-delta id while the terminal response carries the
+            // provider id. Record that final identity too so recovery can map the committed
+            // assistant message back to its streamed preview.
+            if (last != null && last.getId() != null && !last.getId().equals(firstResponseId))
+                recorder.append(
+                        "model/response",
+                        Map.of("modelCallId", id, "responseId", last.getId(), "purpose", purpose));
             var payload = new LinkedHashMap<String, Object>();
             payload.put("modelCallId", id);
             payload.put("status", status);

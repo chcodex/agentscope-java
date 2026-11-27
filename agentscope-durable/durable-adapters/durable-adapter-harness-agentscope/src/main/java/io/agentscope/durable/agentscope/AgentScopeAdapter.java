@@ -51,6 +51,7 @@ import io.agentscope.durable.DurableMessages.ToolResponse;
 import io.agentscope.durable.DurableTypes.Commit;
 import io.agentscope.durable.DurableTypes.EventInput;
 import io.agentscope.durable.DurableTypes.Frame;
+import io.agentscope.durable.DurableTypes.LiveEventInput;
 import io.agentscope.durable.DurableTypes.Signal;
 import io.agentscope.durable.DurableTypes.ThreadSpec;
 import io.agentscope.durable.DurableTypes.TurnStatus;
@@ -69,6 +70,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -108,6 +110,8 @@ public final class AgentScopeAdapter implements HarnessAdapter {
     private final String modelRoute;
     private final Duration replyTimeout;
     private final AgentScopeToolHooks toolHooks;
+    private final InterruptedRunHandler interruptedRunHandler;
+    private final Set<String> resultMetadataKeys;
 
     private AgentScopeAdapter(
             Function<InvocationBinding, NativeAgent> factory,
@@ -121,7 +125,9 @@ public final class AgentScopeAdapter implements HarnessAdapter {
                 null,
                 null,
                 ExecutionConfig.MODEL_DEFAULTS.getTimeout(),
-                AgentScopeToolHooks.NONE);
+                AgentScopeToolHooks.NONE,
+                InterruptedRunHandler.RESUME,
+                Set.of());
     }
 
     private AgentScopeAdapter(
@@ -132,7 +138,9 @@ public final class AgentScopeAdapter implements HarnessAdapter {
             ModelExecutions modelExecutions,
             String modelRoute,
             Duration replyTimeout,
-            AgentScopeToolHooks toolHooks) {
+            AgentScopeToolHooks toolHooks,
+            InterruptedRunHandler interruptedRunHandler,
+            Set<String> resultMetadataKeys) {
         this.replyTimeout = replyTimeout;
         this.publisher = publisher;
         this.modelExecutions = modelExecutions;
@@ -141,6 +149,8 @@ public final class AgentScopeAdapter implements HarnessAdapter {
         this.executors = Map.copyOf(executors);
         this.bindings = Map.copyOf(bindings);
         this.toolHooks = Objects.requireNonNull(toolHooks);
+        this.interruptedRunHandler = Objects.requireNonNull(interruptedRunHandler);
+        this.resultMetadataKeys = Set.copyOf(resultMetadataKeys);
     }
 
     /** Configure durable tool hooks for this adapter's pinned Harness definition. */
@@ -153,7 +163,9 @@ public final class AgentScopeAdapter implements HarnessAdapter {
                 modelExecutions,
                 modelRoute,
                 replyTimeout,
-                hooks);
+                hooks,
+                interruptedRunHandler,
+                resultMetadataKeys);
     }
 
     /** Dispatch reasoning model calls to a durable message queue. */
@@ -174,7 +186,9 @@ public final class AgentScopeAdapter implements HarnessAdapter {
                 null,
                 null,
                 replyTimeout,
-                toolHooks);
+                toolHooks,
+                interruptedRunHandler,
+                resultMetadataKeys);
     }
 
     /** Hand off reasoning to a lease-based Model Worker. */
@@ -194,31 +208,81 @@ public final class AgentScopeAdapter implements HarnessAdapter {
                 Objects.requireNonNull(executions),
                 DurableJson.text(route, "model route"),
                 replyTimeout,
-                toolHooks);
+                toolHooks,
+                interruptedRunHandler,
+                resultMetadataKeys);
+    }
+
+    /**
+     * Publishes the listed {@code AgentResultEvent} metadata keys as one {@code x.result_metadata}
+     * public event per Run. Middleware attach result-level values to the event, which the
+     * Msg-only native journal does not persist; replaying that event keeps them available after a
+     * reconnect or restart. Keys outside this list never enter the journal.
+     */
+    public AgentScopeAdapter withResultMetadataKeys(String... keys) {
+        var selected = new LinkedHashSet<String>();
+        for (String key : keys) {
+            if (key != null && !key.isBlank()) selected.add(key);
+        }
+        return new AgentScopeAdapter(
+                factory,
+                executors,
+                bindings,
+                publisher,
+                modelExecutions,
+                modelRoute,
+                replyTimeout,
+                toolHooks,
+                interruptedRunHandler,
+                selected);
     }
 
     /** Registers schemas from the same immutable definitions used by the remote worker. */
     public static AgentScopeAdapter forReAct(
             Function<Binding, ReActAgent.Builder> factory, Collection<ToolBinding> tools) {
+        return forReAct(factory, tools, InterruptedRunHandler.RESUME);
+    }
+
+    public static AgentScopeAdapter forReAct(
+            Function<Binding, ReActAgent.Builder> factory,
+            Collection<ToolBinding> tools,
+            InterruptedRunHandler interruptedRunHandler) {
         var frozen = ToolBinding.catalog(tools);
-        return createReAct(factory, ToolBinding.routes(frozen.values()), frozen);
+        return createReAct(
+                factory, ToolBinding.routes(frozen.values()), frozen, interruptedRunHandler);
     }
 
     public static AgentScopeAdapter forHarness(
             Function<Binding, HarnessAgent.Builder> factory, Collection<ToolBinding> tools) {
+        return forHarness(factory, tools, InterruptedRunHandler.RESUME);
+    }
+
+    public static AgentScopeAdapter forHarness(
+            Function<Binding, HarnessAgent.Builder> factory,
+            Collection<ToolBinding> tools,
+            InterruptedRunHandler interruptedRunHandler) {
         var frozen = ToolBinding.catalog(tools);
-        return createHarness(factory, ToolBinding.routes(frozen.values()), frozen);
+        return createHarness(
+                factory, ToolBinding.routes(frozen.values()), frozen, interruptedRunHandler);
     }
 
     public static AgentScopeAdapter forReAct(
             Function<Binding, ReActAgent.Builder> factory, Map<String, String> executors) {
-        return createReAct(factory, executors, Map.of());
+        return forReAct(factory, executors, InterruptedRunHandler.RESUME);
+    }
+
+    public static AgentScopeAdapter forReAct(
+            Function<Binding, ReActAgent.Builder> factory,
+            Map<String, String> executors,
+            InterruptedRunHandler interruptedRunHandler) {
+        return createReAct(factory, executors, Map.of(), interruptedRunHandler);
     }
 
     private static AgentScopeAdapter createReAct(
             Function<Binding, ReActAgent.Builder> factory,
             Map<String, String> executors,
-            Map<String, ToolBinding> bindings) {
+            Map<String, ToolBinding> bindings,
+            InterruptedRunHandler interruptedRunHandler) {
         Objects.requireNonNull(factory);
         return new AgentScopeAdapter(
                 invocation -> {
@@ -253,18 +317,33 @@ public final class AgentScopeAdapter implements HarnessAdapter {
                     };
                 },
                 executors,
-                bindings);
+                bindings,
+                null,
+                null,
+                null,
+                ExecutionConfig.MODEL_DEFAULTS.getTimeout(),
+                AgentScopeToolHooks.NONE,
+                interruptedRunHandler,
+                Set.of());
     }
 
     public static AgentScopeAdapter forHarness(
             Function<Binding, HarnessAgent.Builder> factory, Map<String, String> executors) {
-        return createHarness(factory, executors, Map.of());
+        return forHarness(factory, executors, InterruptedRunHandler.RESUME);
+    }
+
+    public static AgentScopeAdapter forHarness(
+            Function<Binding, HarnessAgent.Builder> factory,
+            Map<String, String> executors,
+            InterruptedRunHandler interruptedRunHandler) {
+        return createHarness(factory, executors, Map.of(), interruptedRunHandler);
     }
 
     private static AgentScopeAdapter createHarness(
             Function<Binding, HarnessAgent.Builder> factory,
             Map<String, String> executors,
-            Map<String, ToolBinding> bindings) {
+            Map<String, ToolBinding> bindings,
+            InterruptedRunHandler interruptedRunHandler) {
         Objects.requireNonNull(factory);
         return new AgentScopeAdapter(
                 invocation -> {
@@ -303,7 +382,14 @@ public final class AgentScopeAdapter implements HarnessAdapter {
                     };
                 },
                 executors,
-                bindings);
+                bindings,
+                null,
+                null,
+                null,
+                ExecutionConfig.MODEL_DEFAULTS.getTimeout(),
+                AgentScopeToolHooks.NONE,
+                interruptedRunHandler,
+                Set.of());
     }
 
     private static void route(Toolkit toolkit, Set<String> names) {
@@ -362,6 +448,7 @@ public final class AgentScopeAdapter implements HarnessAdapter {
         if (pauseIfRequested(context)) return;
         if (context.draining()) return;
         var log = new BackendThreadJournal(context, executors, bindings);
+        if (declineInterruptedRun(context, log)) return;
         var turnId = context.lease().turnId();
         if (log.hasUnsettledNativeTools(turnId)
                 && resolveNativeToolOutcomes(context, log, JournalProjection.read(log)) == null)
@@ -501,7 +588,14 @@ public final class AgentScopeAdapter implements HarnessAdapter {
                 throw new DurableException(
                         DurableException.Code.INCOMPATIBLE,
                         "Adapter did not install the invocation journal");
-            agent.stream(List.copyOf(input), runtimeContext).blockLast();
+            try {
+                agent.stream(List.copyOf(input), runtimeContext)
+                        .doOnNext(
+                                event -> publishResultMetadata(context, log, runtimeContext, event))
+                        .blockLast();
+            } finally {
+                log.flushQueuedResultMetadata(runtimeContext.getTurnId());
+            }
         } catch (DurableException failure) {
             throw failure;
         } catch (RuntimeException failure) {
@@ -529,26 +623,27 @@ public final class AgentScopeAdapter implements HarnessAdapter {
         if (host.pending())
             throw new DurableException(
                     DurableException.Code.UNAVAILABLE, "Native finalization is incomplete");
-        if (completeInvocation(context, log)) return;
+        if (completeInvocation(context, log, context.frameWithCheckpoint())) return;
         var invocation = latestInvocation(log, context.lease().turnId());
-        if (invocation != null
-                && invocation.outcome().status() == RunOutcome.Status.COMPLETED
-                && hasPendingInput(context.frame())) {
-            var latest = context.frame();
-            context.commit(
-                    new Commit(
-                            "continue:" + invocation.runId(),
-                            latest.turn().revision(),
-                            latest.checkpoint(),
-                            List.of(),
-                            List.of(),
-                            List.of(),
-                            List.of(),
-                            TurnStatus.RUNNING,
-                            null,
-                            null,
-                            null));
-            return;
+        if (invocation != null && invocation.outcome().status() == RunOutcome.Status.COMPLETED) {
+            var pendingFrame = context.frame();
+            if (hasPendingInput(pendingFrame)) {
+                var latest = context.frameWithCheckpoint();
+                context.commit(
+                        new Commit(
+                                "continue:" + invocation.runId(),
+                                latest.turn().revision(),
+                                latest.checkpoint(),
+                                List.of(),
+                                List.of(),
+                                List.of(),
+                                List.of(),
+                                TurnStatus.RUNNING,
+                                null,
+                                null,
+                                null));
+                return;
+            }
         }
         var pending =
                 ThreadInteractions.pending(log).values().stream()
@@ -610,6 +705,54 @@ public final class AgentScopeAdapter implements HarnessAdapter {
                 .block();
     }
 
+    /**
+     * Copies configured metadata off any native event. A value that arrives before the recorder's
+     * final commit joins that batch; a late value is flushed after the stream ends, so the Run's
+     * terminal events are never delayed by an optional payload.
+     */
+    private void publishResultMetadata(
+            HarnessContext harnessContext,
+            BackendThreadJournal log,
+            RuntimeContext context,
+            AgentEvent event) {
+        if (resultMetadataKeys.isEmpty()) return;
+        var attached = event.getMetadata();
+        if (attached == null || attached.isEmpty()) return;
+        var selected = new LinkedHashMap<String, Object>();
+        for (String key : resultMetadataKeys) {
+            if (attached.containsKey(key)) selected.put(key, attached.get(key));
+        }
+        if (selected.isEmpty()) return;
+        // The value is hashed and written by the next commit. Dropping an unserializable
+        // optional payload is better than failing the invocation after its result is produced.
+        try {
+            DurableJson.value(selected);
+        } catch (RuntimeException ignored) {
+            return;
+        }
+        log.queueResultMetadata(context.getRunId(), selected);
+        // Best-effort live copy: the attached AG-UI client sees the result metadata before
+        // run.ended closes its subscription. The committed x.result_metadata event stays the
+        // source for reconnect replay. A serialization or publish failure here must not fail the
+        // invocation that already produced its result.
+        try {
+            harnessContext.publish(
+                    List.of(
+                            new LiveEventInput(
+                                    "x.result_metadata:"
+                                            + context.getRunId()
+                                            + ":"
+                                            + DurableJson.hash(selected),
+                                    System.currentTimeMillis(),
+                                    "x.result_metadata",
+                                    DurableJson.value(selected),
+                                    context.getRunId(),
+                                    null)));
+        } catch (RuntimeException ignored) {
+            // The durable event still carries the metadata for reconnect.
+        }
+    }
+
     private record NativeInvocation(String runId, RunOutcome outcome, Msg output) {}
 
     /** Reads invocation facts only; native journals do not own the durable Turn state. */
@@ -617,7 +760,7 @@ public final class AgentScopeAdapter implements HarnessAdapter {
         String runId = null;
         RunOutcome outcome = null;
         Msg output = null;
-        for (var event : log.scanMetadata(0, log.head().seq())) {
+        for (var event : log.scanMetadata(log.replayStart(), log.head().seq())) {
             if ("state/restored".equals(event.type())) {
                 runId = null;
                 outcome = null;
@@ -658,7 +801,13 @@ public final class AgentScopeAdapter implements HarnessAdapter {
     }
 
     private static boolean completeInvocation(HarnessContext context, BackendThreadJournal log) {
-        var frame = context.frame();
+        // A late input/steer signal can arrive from another host; read it fresh before deciding.
+        context.refreshFrame();
+        return completeInvocation(context, log, context.frameWithCheckpoint());
+    }
+
+    private static boolean completeInvocation(
+            HarnessContext context, BackendThreadJournal log, Frame frame) {
         var invocation = latestInvocation(log, frame.turn().turnId());
         if (invocation == null) return false;
         var outcome = invocation.outcome();
@@ -710,8 +859,50 @@ public final class AgentScopeAdapter implements HarnessAdapter {
         return true;
     }
 
-    private static boolean pauseIfRequested(HarnessContext context) {
+    /**
+     * Offers an interrupted native run to the configured {@link InterruptedRunHandler}. The
+     * default handler resumes, so the journal is only read when a policy is installed.
+     *
+     * @return {@code true} when the Turn was settled and must not execute
+     */
+    private boolean declineInterruptedRun(HarnessContext context, BackendThreadJournal log) {
+        if (interruptedRunHandler == InterruptedRunHandler.RESUME) {
+            return false;
+        }
         var frame = context.frame();
+        var projection = JournalProjection.read(log);
+        if (projection.activeRuns().isEmpty()) {
+            return false;
+        }
+        // The runtime reconciles dispatched tools before invoking the adapter; a non-terminal
+        // tool here means settlement would conflict, so keep the previous recovery path.
+        if (frame.tools().stream().anyMatch(tool -> !tool.result().state().terminal())) {
+            return false;
+        }
+        var settlement =
+                interruptedRunHandler.decide(
+                        new InterruptedRunHandler.InterruptedRun(
+                                frame.definition().key(),
+                                frame.definition(),
+                                frame.turn(),
+                                projection.activeRuns()));
+        Objects.requireNonNull(
+                settlement, "InterruptedRunHandler.decide must return a settlement, not null");
+        if (settlement.isEmpty()) {
+            return false;
+        }
+        settle(context, settlement.get().status(), settlement.get().reason());
+        return true;
+    }
+
+    private static boolean pauseIfRequested(HarnessContext context) {
+        // Pause is a control-plane change made by another host; refresh instead of trusting the
+        // per-invocation frame cache, then only load the checkpoint when a commit is needed.
+        context.refreshFrame();
+        return pauseIfRequested(context, context.frameWithCheckpoint());
+    }
+
+    private static boolean pauseIfRequested(HarnessContext context, Frame frame) {
         if (frame.turn().status() != TurnStatus.PAUSING) return false;
         context.commit(
                 new Commit(
@@ -730,7 +921,8 @@ public final class AgentScopeAdapter implements HarnessAdapter {
     }
 
     private static void waitFor(HarnessContext context, WaitCondition condition) {
-        var frame = context.frame();
+        context.refreshFrame();
+        var frame = context.frameWithCheckpoint();
         context.commit(
                 new Commit(
                         "yield:" + UUID.randomUUID(),
@@ -867,6 +1059,7 @@ public final class AgentScopeAdapter implements HarnessAdapter {
     public void settle(HarnessContext context, TurnStatus status, String error) {
         if (status != TurnStatus.CANCELLED && status != TurnStatus.FAILED)
             throw new IllegalArgumentException("Settlement requires FAILED or CANCELLED");
+        context.refreshFrame();
         String reason = status == TurnStatus.CANCELLED ? "cancelled" : "failed";
         var frame = context.frame();
         if (frame.tools().stream().anyMatch(tool -> !tool.result().state().terminal()))

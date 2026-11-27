@@ -24,6 +24,7 @@ import io.agentscope.core.event.ExternalExecutionResultEvent;
 import io.agentscope.core.event.RequireExternalExecutionEvent;
 import io.agentscope.core.event.RequireUserConfirmEvent;
 import io.agentscope.core.event.TextBlockDeltaEvent;
+import io.agentscope.core.event.ThinkingBlockDeltaEvent;
 import io.agentscope.core.event.ToolCallDeltaEvent;
 import io.agentscope.core.event.ToolResultEndEvent;
 import io.agentscope.core.event.UserConfirmResultEvent;
@@ -82,6 +83,19 @@ public final class InvocationRecorder {
     private final AtomicBoolean exporting = new AtomicBoolean();
     private final AtomicBoolean exportRequested = new AtomicBoolean();
     private static final Duration LEASE = Duration.ofMinutes(2);
+
+    /**
+     * Events per commit. The Durable journal append accepts at most 1000 entries, so a fast stream
+     * must flush before that; otherwise the whole batch is rejected as an invalid commit.
+     */
+    private static final int COMMIT_BATCH = 900;
+
+    /**
+     * Journal events between periodic checkpoints. Recovery replays from the latest checkpoint, so
+     * this bounds the replay cost regardless of how sparse the semantic boundaries are.
+     */
+    private static final int CHECKPOINT_EVERY = 500;
+
     private final ThreadJournal log;
     private final ThreadJournal.Writer writer;
     private final String runId;
@@ -90,6 +104,15 @@ public final class InvocationRecorder {
     private long durableSeq;
     private long lastAppendedSeq;
     private int pendingBytes;
+
+    /** Last committed state snapshot; periodic checkpoints repeat it at a later sequence. */
+    private String lastStateJson;
+
+    private int eventsSinceCheckpoint;
+
+    /** Identity of the last checkpoint written, chained through {@code parentCheckpointId}. */
+    private String lastCheckpointId;
+
     private Throwable failure;
     private boolean closed;
     private RunOutcome resultOutcome;
@@ -100,7 +123,6 @@ public final class InvocationRecorder {
     private String interruptedStep;
     private AgentExecutionPosition executionPosition = new AgentExecutionPosition(0, 0);
     private AgentExecutionPosition previousPosition;
-    private String batchId;
     private final ReentrantLock writerLock = new ReentrantLock();
     private final AtomicBoolean renewing = new AtomicBoolean();
     private long acceptedVersion;
@@ -109,6 +131,10 @@ public final class InvocationRecorder {
     private Disposable delayedFlush;
     private final Map<String, String> actionIds = new ConcurrentHashMap<>();
     private final Map<String, String> messageModelCalls = new ConcurrentHashMap<>();
+
+    /** Model call that produced the assistant message currently being captured. */
+    private String activeModelCallId;
+
     private String previousState;
     private String pendingModelCallId;
     private String previousPendingModelCallId;
@@ -142,6 +168,9 @@ public final class InvocationRecorder {
         this.writer = log.acquire(runId, LEASE);
         try {
             var history = new InvocationHistory(turnId);
+            // Recorder startup also validates all run identities and tracks historical message
+            // identities. ProjectionSeed does not carry those facts, so it cannot replace this
+            // full scan even when a backend supplies one for state-only reads.
             initial =
                     JournalProjection.read(
                             log,
@@ -151,9 +180,17 @@ public final class InvocationRecorder {
                                             "Run ID already used; prepare a new execution to"
                                                     + " resume");
                                 history.accept(event);
+                                if ("state/checkpoint".equals(event.type())
+                                        && event.data().get("checkpointId") instanceof String id)
+                                    lastCheckpointId = id;
                                 for (var message : ThreadHistory.messages(log, event))
                                     recordedMessages.add(message.getId());
                             });
+            // The gap is journal-wide, not per-invocation: without this, short invocations
+            // that append fewer than CHECKPOINT_EVERY events would let the interval grow
+            // unbounded across invocations.
+            eventsSinceCheckpoint = (int) Math.min(Integer.MAX_VALUE, log.checkpointGap());
+            if (initial.stateJson() != null) lastStateJson = initial.stateJson();
             durableSeq = initial.asOfSeq();
             if (!initial.uncertainToolCalls().isEmpty())
                 throw new JournalException(
@@ -394,8 +431,36 @@ public final class InvocationRecorder {
         return append(type, payload, true);
     }
 
-    public synchronized long append(String type, Object payload, boolean required) {
+    /**
+     * Publishes a presentation preview without recording it. Token-level chunks and deltas are not
+     * recoverable facts: the committed message carries the full text, and a reconnect resumes the
+     * current Step from the in-process live buffer.
+     */
+    public synchronized long liveOnly(String type, Object payload) {
         check();
+        payload = prepare(type, payload);
+        String json = JsonUtils.getJsonCodec().toJson(typedPayload(payload));
+        var event =
+                new JournalEvent(
+                        JournalEvent.SCHEMA_VERSION,
+                        UUID.randomUUID().toString(),
+                        Math.max(1, lastAppendedSeq),
+                        System.currentTimeMillis(),
+                        type,
+                        runId,
+                        turnId,
+                        false,
+                        json);
+        JournalEventTypes.validate(event);
+        try {
+            log.live(event);
+        } catch (RuntimeException ignored) {
+            // Best effort; a failed preview must never break recording.
+        }
+        return lastAppendedSeq;
+    }
+
+    private Object prepare(String type, Object payload) {
         if (payload instanceof Map<?, ?> data) {
             if (type.equals("model/chunk") && data.get("chunk") instanceof ChatResponse chunk)
                 messageModelCalls.put(chunk.getId(), String.valueOf(data.get("modelCallId")));
@@ -419,6 +484,12 @@ public final class InvocationRecorder {
             scoped.putIfAbsent("stepId", stepId);
             payload = scoped;
         }
+        return payload;
+    }
+
+    public synchronized long append(String type, Object payload, boolean required) {
+        check();
+        payload = prepare(type, payload);
         String json = JsonUtils.getJsonCodec().toJson(typedPayload(payload));
         int byteLength = json.getBytes(StandardCharsets.UTF_8).length;
         if (pendingBytes + byteLength > 16 * 1024 * 1024)
@@ -443,6 +514,35 @@ public final class InvocationRecorder {
         // leave a cursor pointing at a record that does not exist.
         lastAppendedSeq = seq;
         scheduleFlush();
+        if (pending.size() >= COMMIT_BATCH) {
+            // A burst can outrun the timer; commit what is buffered instead of exceeding the
+            // journal append limit on the next flush.
+            flush().subscribe(ignored -> {}, this::failed);
+        }
+        // Presentation runs at the model's own pace instead of the batched commit: a hosted
+        // journal forwards the delta now and only records it for durability.
+        try {
+            log.live(accepted);
+        } catch (RuntimeException ignored) {
+            // Best effort; a failed preview must never break recording.
+        }
+        // A step boundary is a safe recovery point: checkout never crosses an unfinished step,
+        // so a seeded replay still sees the step that was in progress.
+        if ("step/end".equals(type) && lastStateJson != null) {
+            appendCheckpoint(lastStateJson, "step_boundary");
+        }
+        if (!"state/checkpoint".equals(type)
+                && lastStateJson != null
+                && ++eventsSinceCheckpoint >= CHECKPOINT_EVERY) {
+            eventsSinceCheckpoint = 0;
+            // Repeat the last state at this later position: the payload is content-addressed, so
+            // an unchanged snapshot costs a reference, and recovery replays at most this window.
+            String checkpointId = UUID.randomUUID().toString();
+            append(
+                    "state/checkpoint",
+                    checkpointData(lastStateJson, "periodic", checkpointId, lastCheckpointId));
+            lastCheckpointId = checkpointId;
+        }
         return seq;
     }
 
@@ -521,45 +621,51 @@ public final class InvocationRecorder {
     public void flushNow() {
         writerLock.lock();
         try {
-            List<JournalEvent> batch;
-            long expected;
-            long target;
-            String identity;
-            synchronized (this) {
-                check();
-                cancelDelayedFlush();
-                batch = List.copyOf(pending);
-                expected = durableSeq;
-                target = acceptedVersion;
-                if (!batch.isEmpty() && batchId == null) batchId = UUID.randomUUID().toString();
-                identity = batchId;
-            }
-            log.renew(writer, LEASE);
-            if (batch.isEmpty()) return;
-            var head = log.commit(writer, identity, expected, batch);
-            synchronized (this) {
-                durableSeq = head.seq();
-                flushedVersion = target;
-                pending.subList(0, batch.size()).clear();
-                // Hosted logs may discard diagnostic events. Rebase only the uncommitted suffix.
-                pendingBytes = 0;
-                for (int i = 0; i < pending.size(); i++) {
-                    var event = pending.get(i);
-                    pending.set(
-                            i,
-                            new JournalEvent(
-                                    event.schemaVersion(),
-                                    event.eventId(),
-                                    durableSeq + i + 1,
-                                    event.occurredAt(),
-                                    event.type(),
-                                    event.executionRunId(),
-                                    event.turnId(),
-                                    event.required(),
-                                    event.payloadJson()));
-                    pendingBytes += event.payloadJson().getBytes(StandardCharsets.UTF_8).length;
+            // A fast stream can buffer more than the Durable journal append limit (1000) between
+            // flushes. Commit fixed-size prefixes instead of sending the whole buffer, which the
+            // schema rejects as an invalid commit.
+            while (true) {
+                List<JournalEvent> batch;
+                long expected;
+                synchronized (this) {
+                    check();
+                    cancelDelayedFlush();
+                    if (pending.isEmpty()) {
+                        // Publish the barrier under the same monitor that proved the buffer is
+                        // empty; an append after this point must not be marked as flushed.
+                        flushedVersion = acceptedVersion;
+                        break;
+                    }
+                    batch = List.copyOf(pending.subList(0, Math.min(COMMIT_BATCH, pending.size())));
+                    expected = durableSeq;
                 }
-                batchId = null;
+                String identity = UUID.randomUUID().toString();
+                log.renew(writer, LEASE);
+                var head = log.commit(writer, identity, expected, batch);
+                synchronized (this) {
+                    durableSeq = head.seq();
+                    pending.subList(0, batch.size()).clear();
+                    // Hosted logs may discard diagnostic events. Rebase only the uncommitted
+                    // suffix.
+                    pendingBytes = 0;
+                    for (int i = 0; i < pending.size(); i++) {
+                        var event = pending.get(i);
+                        pending.set(
+                                i,
+                                new JournalEvent(
+                                        event.schemaVersion(),
+                                        event.eventId(),
+                                        durableSeq + i + 1,
+                                        event.occurredAt(),
+                                        event.type(),
+                                        event.executionRunId(),
+                                        event.turnId(),
+                                        event.required(),
+                                        event.payloadJson()));
+                        pendingBytes += event.payloadJson().getBytes(StandardCharsets.UTF_8).length;
+                    }
+                }
+                exportCommitted();
             }
         } catch (RuntimeException error) {
             failed(error);
@@ -567,7 +673,6 @@ public final class InvocationRecorder {
         } finally {
             writerLock.unlock();
         }
-        exportCommitted();
     }
 
     private void exportCommitted() {
@@ -632,13 +737,37 @@ public final class InvocationRecorder {
 
     public synchronized void captureState(AgentState state, String reason) {
         check();
+        // A checkpoint from another thread must never be written here: restoring it would bind
+        // that state to this thread and drop the real conversation.
+        String expectedThread = log.threadId();
+        String actualThread = state.getThreadId();
+        if (expectedThread != null
+                && actualThread != null
+                && !expectedThread.equals(actualThread)) {
+            LOGGER.warn(
+                    "Native checkpoint identity mismatch: expected={} actual={} session={}"
+                            + " context={} reason={}",
+                    expectedThread,
+                    actualThread,
+                    state.getSessionId(),
+                    state.getContext().size(),
+                    reason,
+                    new IllegalStateException("checkpoint identity mismatch"));
+            // Never persist another thread's state: a restore would bind it to this thread and
+            // silently discard the real conversation.
+            return;
+        }
         String json = state.toJson();
         if (json.equals(previousState)
                 && executionPosition.equals(previousPosition)
                 && Objects.equals(pendingModelCallId, previousPendingModelCallId)
                 && Objects.equals(modelAnswerId, previousModelAnswerId)
                 && state.getContext().stream()
-                        .allMatch(message -> recordedMessages.contains(message.getId()))) return;
+                        .allMatch(message -> recordedMessages.contains(message.getId()))) {
+            // No write needed, but the periodic check still needs a snapshot to repeat.
+            lastStateJson = json;
+            return;
+        }
         var messages = messageJson(state);
         int prefix = 0;
         while (prefix < previousMessages.size()
@@ -667,7 +796,11 @@ public final class InvocationRecorder {
                                     : message.getRole() == MsgRole.SYSTEM
                                             ? "message/system"
                                             : "message/user";
-            append(type, Map.of("message", message));
+            var messagePayload = new LinkedHashMap<String, Object>();
+            messagePayload.put("message", message);
+            if (message.getRole() == MsgRole.ASSISTANT && activeModelCallId != null)
+                messagePayload.put("modelCallId", activeModelCallId);
+            append(type, messagePayload);
             recordedMessages.add(message.getId());
             for (ToolUseBlock use : message.getContentBlocks(ToolUseBlock.class))
                 append(
@@ -696,7 +829,11 @@ public final class InvocationRecorder {
                                         : "permission/changed",
                         Map.of("state", value));
         }
-        append("state/checkpoint", checkpointData(json, reason));
+        String checkpointId = UUID.randomUUID().toString();
+        append("state/checkpoint", checkpointData(json, reason, checkpointId, lastCheckpointId));
+        lastCheckpointId = checkpointId;
+        lastStateJson = json;
+        eventsSinceCheckpoint = 0;
         previousState = json;
         previousPosition = executionPosition;
         previousPendingModelCallId = pendingModelCallId;
@@ -704,7 +841,16 @@ public final class InvocationRecorder {
         previousMessages = messages;
     }
 
-    private Map<String, Object> checkpointData(String json, String reason) {
+    private void appendCheckpoint(String json, String reason) {
+        String checkpointId = UUID.randomUUID().toString();
+        append("state/checkpoint", checkpointData(json, reason, checkpointId, lastCheckpointId));
+        lastCheckpointId = checkpointId;
+        lastStateJson = json;
+        eventsSinceCheckpoint = 0;
+    }
+
+    private Map<String, Object> checkpointData(
+            String json, String reason, String checkpointId, String parentCheckpointId) {
         var data =
                 new LinkedHashMap<String, Object>(
                         Map.of(
@@ -718,6 +864,9 @@ public final class InvocationRecorder {
                                 executionPosition));
         if (pendingModelCallId != null) data.put("pendingModelCallId", pendingModelCallId);
         if (modelAnswerId != null) data.put("modelAnswerId", modelAnswerId);
+        // LangGraph-style chain: a checkpoint knows its predecessor, so a branch can be traced.
+        data.put("checkpointId", checkpointId);
+        if (parentCheckpointId != null) data.put("parentCheckpointId", parentCheckpointId);
         return data;
     }
 
@@ -757,7 +906,7 @@ public final class InvocationRecorder {
                 boolean checkpoint =
                         pending.stream().anyMatch(event -> "state/checkpoint".equals(event.type()));
                 append(type, payload);
-                if (!checkpoint) append("state/checkpoint", checkpointData(state.toJson(), reason));
+                if (!checkpoint) appendCheckpoint(state.toJson(), reason);
             }
             flushNow();
         } finally {
@@ -804,7 +953,7 @@ public final class InvocationRecorder {
                     append("input/received", Map.of("messages", input == null ? List.of() : input));
                     // A crash before the first model boundary must recover this invocation's
                     // starting position, not counters from an earlier completed call.
-                    append("state/checkpoint", checkpointData(state.toJson(), "run_start"));
+                    appendCheckpoint(state.toJson(), "run_start");
                     return flush();
                 });
     }
@@ -983,9 +1132,19 @@ public final class InvocationRecorder {
         // A forwarded child's requests belong to its own journal, never the parent's inbox.
         if (event.getExecution() != null && !runId.equals(event.getExecution().runId())) return;
         if (event.getSource() != null && !event.getSource().isBlank()) return;
+        if (event instanceof ThinkingBlockDeltaEvent delta) {
+            if (delta.getDelta() != null && !delta.getDelta().isEmpty())
+                liveOnly(
+                        "presentation/thinking",
+                        Map.of(
+                                "replyId", delta.getReplyId(),
+                                "blockId", delta.getBlockId(),
+                                "text", delta.getDelta()));
+            return;
+        }
         if (event instanceof TextBlockDeltaEvent delta) {
             if (delta.getDelta() != null && !delta.getDelta().isEmpty())
-                append(
+                liveOnly(
                         "presentation/text",
                         Map.of(
                                 "replyId", delta.getReplyId(),
@@ -1000,7 +1159,7 @@ public final class InvocationRecorder {
                 data.put("toolCallId", delta.getToolCallId());
                 if (delta.getToolCallName() != null) data.put("name", delta.getToolCallName());
                 data.put("text", delta.getDelta());
-                append("presentation/tool_arguments", data);
+                liveOnly("presentation/tool_arguments", data);
             }
             return;
         }
@@ -1118,6 +1277,7 @@ public final class InvocationRecorder {
                     synchronized (this) {
                         if (handoff) pendingModelCallId = callId;
                         captureState(state, "before_model");
+                        activeModelCallId = callId;
                         var payload = new LinkedHashMap<String, Object>();
                         payload.put("modelCallId", callId);
                         payload.put("purpose", purpose);
