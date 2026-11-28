@@ -26,6 +26,9 @@ class E2bFilesystemSpecTest {
     void defaultWorkspaceSpec_hasE2bRoot() {
         E2bFilesystemSpec spec = new E2bFilesystemSpec();
         WorkspaceSpec ws = spec.workspaceSpec();
-        assertEquals("/workspace", ws.getRoot());
+        // The product default is E2B's real home, not the harness-generic /workspace:
+        // nothing is explicitly configured here, so the client options default applies.
+        // Keep this pinned to the options default so the two cannot drift apart.
+        assertEquals(new E2bSandboxClientOptions().getWorkspaceRoot(), ws.getRoot());
     }
 }

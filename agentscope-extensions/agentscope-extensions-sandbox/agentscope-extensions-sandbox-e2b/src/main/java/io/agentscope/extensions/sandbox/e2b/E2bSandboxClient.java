@@ -119,10 +119,15 @@ public class E2bSandboxClient implements SandboxClient<E2bSandboxClientOptions> 
             throw new IllegalArgumentException(
                     "Expected E2bSandboxState but got: " + state.getClass().getName());
         }
-        // Resume the directory that actually backed this sandbox. The constructor aligns
-        // legacy manifest metadata before the superclass captures its materialization root.
-        String workspaceRoot = e2b.getWorkspaceRoot();
+        // Resume the directory that actually backed this sandbox. An explicitly set spec
+        // root is the source of truth; a default spec root (never set) loses to the persisted
+        // string root from pre-spec manifests. The resolved root is written back so the state
+        // keeps describing the effective directory, like create() does.
+        WorkspaceSpec spec = e2b.getWorkspaceSpec();
+        String specRoot = spec != null && spec.isRootExplicitlySet() ? spec.getRoot() : null;
+        String workspaceRoot = specRoot != null ? specRoot : e2b.getWorkspaceRoot();
         requireAbsoluteWorkspaceRoot(workspaceRoot);
+        e2b.setWorkspaceRoot(workspaceRoot);
         e2b.setWorkspaceOnVolume(isWorkspaceOnVolume(workspaceRoot, e2b.getVolumeMounts()));
         E2bSandboxClientOptions resumed = copy(defaultOptions);
         resumed.setCodec(e2b.getCodec());

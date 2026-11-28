@@ -45,6 +45,7 @@ import org.slf4j.LoggerFactory;
 // the platform answers an unknown name with an opaque 400).
 // Each test kills every sandbox it creates, even on failure.
 @EnabledIfEnvironmentVariable(named = "E2B_API_KEY", matches = ".+")
+@EnabledIfEnvironmentVariable(named = "E2B_VOLUME_NAME", matches = ".+")
 class E2bVolumeMountLiveTest {
 
     private static final Logger log = LoggerFactory.getLogger(E2bVolumeMountLiveTest.class);
