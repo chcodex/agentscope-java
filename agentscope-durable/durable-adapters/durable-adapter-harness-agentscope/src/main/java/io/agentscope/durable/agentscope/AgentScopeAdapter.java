@@ -33,6 +33,7 @@ import io.agentscope.core.message.ContentBlock;
 import io.agentscope.core.message.GenerateReason;
 import io.agentscope.core.message.Msg;
 import io.agentscope.core.message.ToolCallState;
+import io.agentscope.core.message.ToolExecutionDetails;
 import io.agentscope.core.message.ToolResultBlock;
 import io.agentscope.core.message.ToolResultMessage;
 import io.agentscope.core.message.ToolResultState;
@@ -450,9 +451,11 @@ public final class AgentScopeAdapter implements HarnessAdapter {
         var log = new BackendThreadJournal(context, executors, bindings);
         if (declineInterruptedRun(context, log)) return;
         var turnId = context.lease().turnId();
-        if (log.hasUnsettledNativeTools(turnId)
-                && resolveNativeToolOutcomes(context, log, JournalProjection.read(log)) == null)
-            return;
+        if (log.hasUnsettledNativeTools(turnId)) {
+            var projection = JournalProjection.read(log);
+            if (escalateUnknownOutcomes(context, log, turnId, projection)) return;
+            if (resolveNativeToolOutcomes(context, log, projection) == null) return;
+        }
         var hooks =
                 new ToolHookJournal(
                         toolHooks, context.frame().definition(), context.lease().turnId(), log);
@@ -613,7 +616,8 @@ public final class AgentScopeAdapter implements HarnessAdapter {
         if (pauseIfRequested(context)) return;
         if (host.yieldingForDrain()) return;
         if (host.waitingForNativeReconciliation()) {
-            parkNativeToolOutcomes(context, JournalProjection.read(log).uncertainToolCalls());
+            parkNativeToolOutcomes(
+                    context, log, JournalProjection.read(log).uncertainToolCalls(), false);
             return;
         }
         if (host.waitingForModel() != null) {
@@ -771,6 +775,12 @@ public final class AgentScopeAdapter implements HarnessAdapter {
                 runId = event.executionRunId();
                 outcome = null;
                 output = null;
+            } else if (runId == null
+                    && ("run/output".equals(event.type()) || "run/end".equals(event.type()))
+                    && event.executionRunId() != null) {
+                // The run started before the replay anchor; adopt its tail instead of
+                // discarding a completed invocation the seed folded into state.
+                runId = event.executionRunId();
             }
             if (!Objects.equals(runId, event.executionRunId())) continue;
             if ("run/output".equals(event.type()))
@@ -785,8 +795,14 @@ public final class AgentScopeAdapter implements HarnessAdapter {
     }
 
     private static boolean hasAppliedInput(ThreadJournal log, String turnId, String inputId) {
+        var seed = log.projectionSeed();
+        if (seed != null && seed.appliedInputs().contains(inputId)) return true;
+        long from = seed == null ? 0 : seed.asOfSeq();
+        // An input recorded into state before the seed keeps its message identity; a suffix
+        // scan alone would miss it.
+        if (seed != null && seed.messageIds().contains(inputId)) return true;
         boolean applied = false;
-        for (var event : log.scanMetadata(0, log.head().seq())) {
+        for (var event : log.scanMetadata(from, log.head().seq())) {
             if ("state/restored".equals(event.type())) applied = false;
             if ("input/applied".equals(event.type())
                     && turnId.equals(event.turnId())
@@ -870,7 +886,7 @@ public final class AgentScopeAdapter implements HarnessAdapter {
             return false;
         }
         var frame = context.frame();
-        var projection = JournalProjection.read(log);
+        var projection = JournalProjection.read(log, log.projectionSeed(), ignored -> {});
         if (projection.activeRuns().isEmpty()) {
             return false;
         }
@@ -951,14 +967,14 @@ public final class AgentScopeAdapter implements HarnessAdapter {
                                                 signal.key()))
                         .findFirst();
         if (evidence.isEmpty()) {
-            parkNativeToolOutcomes(context, pending);
+            parkNativeToolOutcomes(context, log, pending, false);
             return null;
         }
         var signal = evidence.get();
         var reconciliation = matchNativeEvidence(signal, pending);
         if (reconciliation == null) {
             context.rejectNativeToolReconciliation(signal);
-            parkNativeToolOutcomes(context, pending);
+            parkNativeToolOutcomes(context, log, pending, true);
             return null;
         }
         var calls = new LinkedHashMap<String, ToolUseBlock>();
@@ -1010,17 +1026,29 @@ public final class AgentScopeAdapter implements HarnessAdapter {
         return null;
     }
 
-    private static void parkNativeToolOutcomes(HarnessContext context, Set<String> pending) {
+    private static void parkNativeToolOutcomes(
+            HarnessContext context,
+            BackendThreadJournal log,
+            Set<String> pending,
+            boolean evidenceExamined) {
         var frame = context.frame();
+        long now = frame.now();
+        var sorted = pending.stream().sorted().toList();
+        var last = reconcilingWait(log, context.lease().turnId());
+        boolean same = last != null && last.pending().equals(sorted);
+        // Only an expired wait or a freshly examined (and rejected) evidence opens a new
+        // attempt: re-parks from retries, duplicate ticks, or unchanged waits refresh the
+        // deadline without fast-forwarding the bound. Otherwise repeated re-parks could
+        // settle UNKNOWN tools after seconds instead of minutes.
+        boolean expired = !same || now >= last.deadline();
+        int attempt = !same ? 1 : expired || evidenceExamined ? last.attempt() + 1 : last.attempt();
+        long startedAt = same ? last.startedAt() : now;
+        long deadline = Math.addExact(now, UNKNOWN_PARK_MILLIS);
         var condition =
-                new WaitCondition(
-                        WaitCondition.NATIVE_TOOL_RECONCILIATION,
-                        0,
-                        pending.stream().sorted().toList());
+                new WaitCondition(WaitCondition.NATIVE_TOOL_RECONCILIATION, deadline, sorted);
         if (condition.equals(frame.turn().waiting())) return;
         var events =
-                pending.stream()
-                        .sorted()
+                sorted.stream()
                         .map(
                                 callId ->
                                         new EventInput(
@@ -1039,28 +1067,166 @@ public final class AgentScopeAdapter implements HarnessAdapter {
                                                                 "reason",
                                                                 "execution_outcome_unconfirmed"))))
                         .toList();
-        context.commit(
-                new Commit(
-                        "native-outcome-wait:" + UUID.randomUUID(),
-                        frame.turn().revision(),
-                        frame.checkpoint(),
-                        List.of(),
-                        List.of(),
-                        List.of(),
-                        events,
-                        TurnStatus.WAITING,
-                        condition,
-                        null,
-                        null,
-                        null));
+        // One transaction for the marker and the WAITING status: a journal-only commit would
+        // clear the wait, and a status-only commit would lose the attempt count on crash.
+        log.appendWaiting(
+                context.lease().turnId(),
+                List.of(
+                        Map.entry(
+                                DurableEventSchemas.WAIT_RECONCILING,
+                                Map.of(
+                                        "startedAt",
+                                        startedAt,
+                                        "attempt",
+                                        attempt,
+                                        "deadline",
+                                        deadline,
+                                        "pending",
+                                        sorted))),
+                TurnStatus.WAITING,
+                null,
+                events,
+                condition,
+                null);
+    }
+
+    /**
+     * Bounded UNKNOWN settlement: at most this many wakeups while native outcomes stay missing.
+     */
+    private static final int UNKNOWN_SETTLE_ATTEMPTS = 30;
+
+    /**
+     * Absolute cap on waiting for native outcomes before settling them as UNKNOWN.
+     */
+    private static final long UNKNOWN_SETTLE_WINDOW_MILLIS = 10L * 60 * 1000;
+
+    /**
+     * One waiting stretch between wakeups; the runtime re-invokes the host past the deadline.
+     */
+    private static final long UNKNOWN_PARK_MILLIS = 20_000;
+
+    /**
+     * Model-facing warning carried by every UNKNOWN-settled tool result. The turn completes
+     * instead of parking forever; the model must verify the external state before retrying
+     * anything that is not idempotent.
+     */
+    static final String UNKNOWN_OUTCOME_WARNING =
+            "Outcome unknown: this tool call was still running when the turn stopped waiting for"
+                    + " it (30 checks over 10 minutes). Do not assume it succeeded, failed, or had"
+                    + " any particular side effect. Verify the external state before retrying"
+                    + " anything that is not idempotent.";
+
+    private record ReconcilingWait(
+            long startedAt, int attempt, List<String> pending, long deadline) {}
+
+    /**
+     * Latest reconciliation wait episode for this Turn, or null before the first park.
+     */
+    private static ReconcilingWait reconcilingWait(BackendThreadJournal log, String turnId) {
+        ReconcilingWait last = null;
+        long upper = log.head().seq();
+        for (var event : log.scanMetadata(log.replayStart(), upper)) {
+            if (!turnId.equals(event.turnId())
+                    || !DurableEventSchemas.WAIT_RECONCILING.equals(event.type())) continue;
+            var data = log.materialize(event).data();
+            long startedAt =
+                    data.get("startedAt") instanceof Number started ? started.longValue() : 0L;
+            int attempt = data.get("attempt") instanceof Number count ? count.intValue() : 0;
+            var pending = new ArrayList<String>();
+            if (data.get("pending") instanceof List<?> ids)
+                for (var id : ids) pending.add(String.valueOf(id));
+            // Markers written before deadlines existed count as expired: the next park opens a
+            // fresh window instead of inheriting an unbounded one.
+            long deadline = data.get("deadline") instanceof Number until ? until.longValue() : 0L;
+            last = new ReconcilingWait(startedAt, attempt, List.copyOf(pending), deadline);
+        }
+        return last;
+    }
+
+    /**
+     * Settles native tools as UNKNOWN once the wait bound is exhausted: 30 wakeups or 10 minutes
+     * with the same calls still unconfirmed. Returns true when it committed the terminal turn.
+     * Frame-level external executions keep their own deadlines and still conflict here.
+     */
+    private boolean escalateUnknownOutcomes(
+            HarnessContext context,
+            BackendThreadJournal log,
+            String turnId,
+            JournalProjection projection) {
+        var uncertain = projection.uncertainToolCalls().stream().sorted().toList();
+        if (uncertain.isEmpty()) return false;
+        var wait = reconcilingWait(log, turnId);
+        if (wait == null || !wait.pending().equals(uncertain)) return false;
+        long now = context.frame().now();
+        if (wait.attempt() < UNKNOWN_SETTLE_ATTEMPTS
+                && now - wait.startedAt() < UNKNOWN_SETTLE_WINDOW_MILLIS) return false;
+        if (context.frame().tools().stream().anyMatch(tool -> !tool.result().state().terminal()))
+            return false;
+        settleUnknown(context, uncertain);
+        return true;
     }
 
     @Override
     public void settle(HarnessContext context, TurnStatus status, String error) {
-        if (status != TurnStatus.CANCELLED && status != TurnStatus.FAILED)
-            throw new IllegalArgumentException("Settlement requires FAILED or CANCELLED");
+        if (status != TurnStatus.CANCELLED
+                && status != TurnStatus.FAILED
+                && status != TurnStatus.INTERRUPTED)
+            throw new IllegalArgumentException(
+                    "Settlement requires FAILED, CANCELLED, or INTERRUPTED");
         context.refreshFrame();
-        String reason = status == TurnStatus.CANCELLED ? "cancelled" : "failed";
+        String reason =
+                status == TurnStatus.CANCELLED
+                        ? "cancelled"
+                        : status == TurnStatus.INTERRUPTED ? "interrupted" : "failed";
+        settleWith(
+                context,
+                status,
+                error,
+                reason,
+                status.name(),
+                call ->
+                        ToolResultBlock.text(
+                                        "Tool did not execute because the Turn was " + reason + ".")
+                                .withIdAndName(call.getId(), call.getName())
+                                .withState(ToolResultState.INTERRUPTED),
+                true);
+    }
+
+    /**
+     * Bounded UNKNOWN settlement for native tools whose outcome never arrived: 30 wakeups or 10
+     * minutes with the same calls unconfirmed. The Turn SUCCEEDS with truthful UNKNOWN results
+     * carrying the model-facing warning instead of parking forever; frame-level external
+     * executions keep their own deadlines and still conflict.
+     */
+    private void settleUnknown(HarnessContext context, List<String> pending) {
+        context.refreshFrame();
+        settleWith(
+                context,
+                TurnStatus.SUCCEEDED,
+                null,
+                "unknown",
+                "UNKNOWN",
+                call ->
+                        ToolResultBlock.text(UNKNOWN_OUTCOME_WARNING)
+                                .withIdAndName(call.getId(), call.getName())
+                                .withState(ToolResultState.INTERRUPTED)
+                                .withExecutionDetails(
+                                        new ToolExecutionDetails(
+                                                "native",
+                                                ToolExecutionDetails.Outcome.UNKNOWN,
+                                                null,
+                                                false)),
+                false);
+    }
+
+    private void settleWith(
+            HarnessContext context,
+            TurnStatus status,
+            String error,
+            String reason,
+            String settlementLabel,
+            Function<ToolUseBlock, ToolResultBlock> buildSynthetic,
+            boolean resolveFirst) {
         var frame = context.frame();
         if (frame.tools().stream().anyMatch(tool -> !tool.result().state().terminal()))
             throw new DurableException(
@@ -1076,7 +1242,9 @@ public final class AgentScopeAdapter implements HarnessAdapter {
                                 Collectors.toMap(
                                         tool -> tool.request().call().callId(),
                                         Function.identity()));
-        if (projection.uncertainToolCalls().stream().anyMatch(id -> !executions.containsKey(id))) {
+        if (resolveFirst
+                && projection.uncertainToolCalls().stream()
+                        .anyMatch(id -> !executions.containsKey(id))) {
             projection = resolveNativeToolOutcomes(context, log, projection);
             if (projection == null) return;
             frame = context.frame();
@@ -1104,6 +1272,9 @@ public final class AgentScopeAdapter implements HarnessAdapter {
         var calls = new LinkedHashMap<String, ToolUseBlock>();
         var responses = new LinkedHashMap<String, Signal>();
         var messages = state.contextMutable();
+        String materializedRun =
+                materializeUnappliedAssistant(
+                        log, turnId, status, messages, facts, status != TurnStatus.SUCCEEDED);
         if (turnId.equals(projection.positionTurnId())) {
             var pending = MessageUtils.pendingToolUseIds(messages);
             var assistant = MessageUtils.lastAssistantMessage(messages);
@@ -1173,11 +1344,7 @@ public final class AgentScopeAdapter implements HarnessAdapter {
                                 manualToolResult(call, response.value()),
                                 DurableJson.hash(response.value()));
             } else {
-                result =
-                        ToolResultBlock.text(
-                                        "Tool did not execute because the Turn was " + reason + ".")
-                                .withIdAndName(callId, call.getName())
-                                .withState(ToolResultState.INTERRUPTED);
+                result = buildSynthetic.apply(call);
             }
             var message =
                     ToolResultMessage.builder()
@@ -1195,7 +1362,7 @@ public final class AgentScopeAdapter implements HarnessAdapter {
                                             "synthetic",
                                             true,
                                             "settlement",
-                                            status.name())
+                                            settlementLabel)
                                     : Map.of("message", message)));
         }
         for (int i = 0; i < messages.size(); i++) {
@@ -1230,6 +1397,115 @@ public final class AgentScopeAdapter implements HarnessAdapter {
                                     "reason",
                                     reason)));
         log.consuming(responses.values().stream().map(Signal::id).toList());
-        log.append(turnId, facts, status, error);
+        log.append(turnId, facts, status, error, materializedRun);
+    }
+
+    /**
+     * Materializes a committed but never-applied {@code model/end(completed)} as a {@code
+     * message/assistant} fact before tool settlement runs. The crash window sits between the
+     * model-outcome commit and the state-checkpoint commit: without this the assistant (and its
+     * tool calls) vanishes while the tool results below still settle as INTERRUPTED, leaving a
+     * dangling result with no request. Message-id dedup: a response whose native id already
+     * appears in the restored context is skipped, so replay plus settle never duplicates it.
+     *
+     * @return the interrupted native Run that produced the materialized facts, or null when
+     * nothing needed materializing. The caller attributes the settlement batch to it so the
+     * assistant rejoins the interrupted Run instead of naming a Run that was never created.
+     */
+    private static String materializeUnappliedAssistant(
+            BackendThreadJournal log,
+            String turnId,
+            TurnStatus status,
+            List<Msg> messages,
+            List<Map.Entry<String, Object>> facts,
+            boolean interrupted) {
+        var known = new HashSet<String>();
+        for (var message : messages) known.add(message.getId());
+        String name = null;
+        for (var message : messages)
+            if (message.getRole() == io.agentscope.core.message.MsgRole.ASSISTANT
+                    && message.getName() != null) name = message.getName();
+        if (name == null) name = "assistant";
+        long upper = log.head().seq();
+        String materializedRun = null;
+        for (var event : log.scanMetadata(log.replayStart(), upper)) {
+            if (!turnId.equals(event.turnId()) || !"model/end".equals(event.type())) continue;
+            var data = log.materialize(event).data();
+            if (!"completed".equals(String.valueOf(data.get("status")))) continue;
+            if (!(data.get(ModelCapture.OUTCOME) instanceof Map<?, ?> outcome)) continue;
+            if (!(outcome.get("responses") instanceof List<?> responses)) continue;
+            for (var raw : responses) {
+                String responseId = null;
+                List<ContentBlock> blocks = null;
+                List<?> rawBlocks = List.of();
+                try {
+                    if (!(raw instanceof Map<?, ?> response)) continue;
+                    Object id = response.get("id");
+                    responseId = id == null ? null : String.valueOf(id);
+                    Object content = response.get("content");
+                    if (content instanceof List<?> list) rawBlocks = list;
+                    blocks =
+                            content == null
+                                    ? List.of()
+                                    : JsonUtils.getJsonCodec()
+                                            .convertValue(
+                                                    content,
+                                                    new com.fasterxml.jackson.core.type
+                                                                    .TypeReference<
+                                                            List<ContentBlock>>() {});
+                } catch (RuntimeException convertError) {
+                    continue;
+                }
+                if (responseId == null || !known.add(responseId)) continue;
+                if (blocks == null) blocks = List.of();
+                if (blocks.isEmpty()) continue;
+                var assistant =
+                        io.agentscope.core.message.AssistantMessage.builder()
+                                .id(responseId)
+                                .name(name)
+                                .content(blocks)
+                                .metadata(
+                                        interrupted
+                                                ? Map.of(
+                                                        "interrupted",
+                                                        true,
+                                                        "settlement",
+                                                        status.name())
+                                                : Map.of("settlement", status.name()))
+                                .build();
+                messages.add(assistant);
+                var payload = new LinkedHashMap<String, Object>();
+                payload.put("message", assistant);
+                if (data.get("modelCallId") != null)
+                    payload.put("modelCallId", String.valueOf(data.get("modelCallId")));
+                // Carry the interrupted Step so the completed event rejoins it; the commit path
+                // stamps the event's Run/Step onto the public message like recorder-written
+                // facts. Without it the assistant would float outside the interrupted Run.
+                if (data.get("stepId") instanceof String stepId) payload.put("stepId", stepId);
+                facts.add(Map.entry("message/assistant", payload));
+                // Store the raw frozen block maps, not the converted objects: the commit path
+                // converts them exactly like recorder-written facts, avoiding a lossy double
+                // round-trip through the in-memory model.
+                for (int i = 0; i < blocks.size() && i < rawBlocks.size(); i++) {
+                    if (!(blocks.get(i) instanceof ToolUseBlock)) continue;
+                    var rawBlock = rawBlocks.get(i);
+                    if (!(rawBlock instanceof Map<?, ?> block)) continue;
+                    Object callId = block.get("id");
+                    if (callId == null) continue;
+                    facts.add(
+                            Map.entry(
+                                    "tool/requested",
+                                    Map.of(
+                                            "messageId",
+                                            assistant.getId(),
+                                            "toolCallId",
+                                            String.valueOf(callId),
+                                            "call",
+                                            rawBlock)));
+                }
+                if (event.executionRunId() != null) materializedRun = event.executionRunId();
+            }
+        }
+        return materializedRun;
     }
 }

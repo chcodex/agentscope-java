@@ -2552,7 +2552,7 @@ public final class TransactionalSessionBackend implements SessionBackend {
                 switch (child.status) {
                     case SUCCEEDED -> ExecutionState.SUCCEEDED;
                     case FAILED -> ExecutionState.FAILED;
-                    case CANCELLED, CONVERTED -> ExecutionState.CANCELLED;
+                    case CANCELLED, CONVERTED, INTERRUPTED -> ExecutionState.CANCELLED;
                     default -> null;
                 };
         return terminal == null
@@ -3546,9 +3546,13 @@ public final class TransactionalSessionBackend implements SessionBackend {
                         throw error(
                                 DurableException.Code.CURSOR_EXPIRED,
                                 "Cursor expired; load a snapshot");
-                    var page = new ArrayList<PublicEvent>();
-                    for (long seq = pos + 1; seq <= s.sequence && page.size() < limit; seq++)
-                        page.add(readEvent(s, seq));
+                    long end = pos + Math.min((long) limit, Math.max(0, s.sequence - pos));
+                    var positions = new ArrayList<String>((int) (end - pos));
+                    for (long seq = pos + 1; seq <= end; seq++)
+                        positions.add("event:" + positionKey(seq));
+                    var page = new ArrayList<PublicEvent>(positions.size());
+                    for (JsonNode entry : readAll(s.tx, positions))
+                        page.add(DurableJson.convert(entry, PublicEvent.class));
                     return new EventPage(
                             page,
                             page.isEmpty() ? cursor(s, pos) : page.get(page.size() - 1).cursor(),
@@ -3561,7 +3565,7 @@ public final class TransactionalSessionBackend implements SessionBackend {
     @Override
     public EventPage eventsBefore(SessionKey key, String before, int limit) {
         limit(limit);
-        return change(
+        return read(
                 key,
                 (s, n) -> {
                     long pos = before == null ? s.sequence + 1 : position(s, before);

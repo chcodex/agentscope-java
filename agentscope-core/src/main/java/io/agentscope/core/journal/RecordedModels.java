@@ -193,7 +193,15 @@ public final class RecordedModels {
                                                                         "modelHandoff", true);
                                                                 payload = resumedPayload;
                                                             }
-                                                            recorder.append("model/chunk", payload);
+                                                            // Chunks stay live-only previews: the
+                                                            // committed
+                                                            // model/response carries the identity
+                                                            // and model/end the outcome. The poll
+                                                            // loop refreshes its own frame, so the
+                                                            // reply deadline no longer depends on
+                                                            // incidental journal writes.
+                                                            recorder.liveOnly(
+                                                                    "model/chunk", payload);
                                                         })
                                                 .contextWrite(
                                                         context ->

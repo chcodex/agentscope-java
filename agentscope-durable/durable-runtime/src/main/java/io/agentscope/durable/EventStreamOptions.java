@@ -24,7 +24,19 @@ import java.util.Set;
 
 /** Options for one event stream or subscription. Delta previews are opt-in per connection. */
 public final class EventStreamOptions {
-    static final int LIVE_BUFFER_CAPACITY = 128;
+    /**
+     * Bounded live queue for one stream or subscription. A reconnect replays the per-Thread
+     * preview window, which holds up to {@code LocalLiveEvents.RECENT_EVENTS} deltas, so the
+     * queue must be able to hold one complete window instead of truncating a long Step.
+     */
+    static final int LIVE_BUFFER_CAPACITY = 2048;
+
+    /**
+     * Per-poll delivery budget. Draining is bounded independently of the queue size so a large
+     * replay cannot monopolize the shared scheduler; callers reschedule immediately while work
+     * remains.
+     */
+    static final int LIVE_DRAIN_BATCH = 128;
 
     public enum EventDeltaType {
         MESSAGE,

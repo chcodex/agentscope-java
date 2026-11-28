@@ -169,11 +169,105 @@ class SessionStreamEventTest {
                 transport.publish(
                         live(
                                 "message.delta",
-                                Map.of("messageId", "m1", "blockId", "b1", "text", "" + index)));
+                                Map.of("messageId", "m1", "blockId", "b1", "text", "" + index),
+                                "message.delta-source-" + index));
             }
-            stream.forEach(delivered::add, Duration.ofMillis(20));
+            // Delivery is capped by LIVE_DRAIN_BATCH per poll, so a full queue needs several
+            // rounds; the deadline only bounds scheduling, not the assertion.
+            stream.forEach(delivered::add, Duration.ofMillis(500));
         }
         assertEquals(EventStreamOptions.LIVE_BUFFER_CAPACITY, delivered.size());
+    }
+
+    @Test
+    void lateSubscriberReceivesTheAccumulatedPartial() {
+        var transport = LiveEvents.local();
+        var handle = mock(DurableSession.class);
+        when(handle.liveEvents()).thenReturn(transport);
+        when(handle.key()).thenReturn(session);
+        when(handle.wakeups()).thenReturn(Wakeups.none());
+        when(handle.listEvents(eq(new EventFilter("main", null, null)), any(), eq(100)))
+                .thenReturn(new EventPage(List.of(), "0", "0", "0", "0"));
+        var options = EventStreamOptions.builder().deltas(EventDeltaType.MESSAGE).build();
+        // Deltas published before the subscriber arrives simulate an in-flight Step.
+        for (int index = 0; index < 3; index++) {
+            transport.publish(
+                    live(
+                            "message.delta",
+                            Map.of("messageId", "m1", "blockId", "b1", "text", "part-" + index),
+                            "replay-source-" + index));
+        }
+        var delivered = new ArrayList<SessionStreamEvent>();
+        try (var stream =
+                new SessionEventStream(handle, new EventFilter("main", null, null), options)) {
+            stream.forEach(delivered::add, Duration.ofMillis(50));
+        }
+        var texts =
+                delivered.stream()
+                        .filter(SessionStreamEvent.EventDelta.class::isInstance)
+                        .map(SessionStreamEvent.EventDelta.class::cast)
+                        .map(delta -> delta.data().path("text").asText())
+                        .toList();
+        assertEquals(
+                List.of("part-0part-1part-2"),
+                texts,
+                "a reconnect receives the accumulated text in one frame");
+    }
+
+    @Test
+    void clearedWindowReplaysNothingToTheNextRun() {
+        var transport = LiveEvents.local();
+        var handle = mock(DurableSession.class);
+        when(handle.liveEvents()).thenReturn(transport);
+        when(handle.key()).thenReturn(session);
+        when(handle.wakeups()).thenReturn(Wakeups.none());
+        when(handle.listEvents(eq(new EventFilter("main", null, null)), any(), eq(100)))
+                .thenReturn(new EventPage(List.of(), "0", "0", "0", "0"));
+        var options = EventStreamOptions.builder().deltas(EventDeltaType.MESSAGE).build();
+        transport.publish(
+                live("message.delta", Map.of("messageId", "m1", "text", "stale"), "stale-1"));
+        transport.clear(session, "main");
+        var delivered = new ArrayList<SessionStreamEvent>();
+        try (var stream =
+                new SessionEventStream(handle, new EventFilter("main", null, null), options)) {
+            stream.forEach(delivered::add, Duration.ofMillis(50));
+        }
+        assertTrue(delivered.isEmpty());
+    }
+
+    @Test
+    void reconnectingSubscriberReceivesTheWholePreviewAsOneDelta() {
+        var handle = mock(DurableSession.class);
+        var transport = LiveEvents.local();
+        when(handle.liveEvents()).thenReturn(transport);
+        when(handle.key()).thenReturn(session);
+        when(handle.wakeups()).thenReturn(Wakeups.none());
+        var threadFilter = new EventFilter("main", null, null);
+        when(handle.listEvents(eq(threadFilter), any(), eq(100)))
+                .thenReturn(new EventPage(List.of(), "0", "0", "0", "0"));
+        int buffered = 1200;
+        // Published before subscribing, so these land in the per-Thread preview window and reach
+        // the new subscriber only through replay.
+        for (int index = 0; index < buffered; index++) {
+            transport.publish(
+                    live(
+                            "message.delta",
+                            Map.of("messageId", "m1", "blockId", "b1", "text", "" + index),
+                            "replay-source-" + index));
+        }
+        var options = EventStreamOptions.builder().deltas(EventDeltaType.MESSAGE).build();
+        var delivered = new ArrayList<SessionStreamEvent>();
+        try (var stream = new SessionEventStream(handle, threadFilter, options)) {
+            stream.forEach(delivered::add, Duration.ofMillis(500));
+        }
+        var expected = new StringBuilder();
+        for (int index = 0; index < buffered; index++) expected.append(index);
+        assertEquals(1, delivered.size(), "the whole preview replays as one accumulated delta");
+        var delta = assertInstanceOf(SessionStreamEvent.EventDelta.class, delivered.get(0));
+        assertEquals(
+                expected.toString(),
+                delta.data().path("text").asText(),
+                "a reconnect must replay the whole window, not the delivery batch size");
     }
 
     private LiveEvent live(String type, Map<String, ?> data) {
@@ -185,6 +279,20 @@ class SessionStreamEventTest {
                 "1",
                 type + "-source",
                 scope,
+                "main",
+                "turn-1",
+                "run-1",
+                "step-1",
+                1,
+                type,
+                DurableJson.value(data));
+    }
+
+    private LiveEvent live(String type, Map<String, ?> data, String eventId) {
+        return new LiveEvent(
+                "1",
+                eventId,
+                session,
                 "main",
                 "turn-1",
                 "run-1",

@@ -157,10 +157,15 @@ final class AgentScopeToolEvents {
                     // it.
                     boolean reconciled = Boolean.TRUE.equals(data.get("reconciled"));
                     String key = key(event, block.getId());
-                    String status =
-                            data.get("settlement") instanceof String settlement
-                                    ? settlement
-                                    : status(block);
+                    // A settlement names the Turn outcome, not the tool outcome. CANCELLED and
+                    // FAILED settle the tool the same way; any other settlement (including
+                    // UNKNOWN) keeps the truthful block status, which maps an UNKNOWN outcome
+                    // (hasUnknownOutcome) to the public "UNKNOWN" state per status(block).
+                    String status;
+                    if (data.get("settlement") instanceof String settlement
+                            && ("CANCELLED".equals(settlement) || "FAILED".equals(settlement)))
+                        status = settlement;
+                    else status = status(block);
                     if (reconciled && block.getState() == ToolResultState.INTERRUPTED)
                         status = "CANCELLED";
                     boolean showResult =

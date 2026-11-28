@@ -78,6 +78,16 @@ final class AgentScopeMessageEvents {
         return messageId(turnId, message.getId());
     }
 
+    /**
+     * Step message id a model call belongs to, for committed facts that must reconcile with the
+     * Step's live preview (for example a stopped partial). Null when its request was recorded in
+     * a later batch that this machine has not accepted yet.
+     */
+    String stepMessageId(String modelCallId) {
+        var reference = calls.get(modelCallId);
+        return reference == null ? null : reference.messageId();
+    }
+
     String messageId(String turnId, String nativeId) {
         String key = nativeKey(turnId, nativeId);
         var reference = nativeMessages.get(key);

@@ -679,6 +679,379 @@ class AgentScopeAdapterTest {
     }
 
     @Test
+    void streamingDeltasPublishExactlyOnce() throws Exception {
+        var model = new ScriptedModel(false);
+        var liveEvents = LiveEvents.local();
+        var live = new CopyOnWriteArrayList<LiveEvent>();
+        try (var subscription = liveEvents.subscribe(live::add);
+                var backend = LocalBackend.open(directory.resolve("single-delivery"));
+                var runtime =
+                        runtime(
+                                backend,
+                                adapter(model, PermissionMode.BYPASS, Map.of()),
+                                null,
+                                liveEvents)) {
+            var turn = runtime.createSession(key, "agent").submit("one", "hello");
+            runtime.tick(new ThreadKey(key, "main"));
+            assertEquals(TurnStatus.SUCCEEDED, turn.status().status());
+        }
+        var deltas = live.stream().filter(e -> "message.delta".equals(e.type())).toList();
+        assertFalse(deltas.isEmpty(), "the scripted answer must stream at least one delta");
+        var keys =
+                deltas.stream()
+                        .map(
+                                e ->
+                                        e.data().path("messageId").asText()
+                                                + "\0"
+                                                + e.data().path("revision").asLong()
+                                                + "\0"
+                                                + e.data().path("text").asText())
+                        .toList();
+        assertEquals(
+                new java.util.HashSet<>(keys).size(),
+                keys.size(),
+                "each live delta must be published exactly once: " + keys);
+    }
+
+    @Test
+    void userStopDuringStreamingSettlesCancelWithoutLosingText() throws Exception {
+        var streamed = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        Model model =
+                new Model() {
+                    public String getModelName() {
+                        return "fixture";
+                    }
+
+                    public Flux<ChatResponse> stream(
+                            List<Msg> messages, List<ToolSchema> tools, GenerateOptions options) {
+                        return Flux.create(
+                                sink -> {
+                                    sink.next(
+                                            ChatResponse.builder()
+                                                    .id("m-1")
+                                                    .content(
+                                                            List.of(
+                                                                    TextBlock.builder()
+                                                                            .text("hello")
+                                                                            .build()))
+                                                    .build());
+                                    streamed.countDown();
+                                    try {
+                                        assertTrue(release.await(20, TimeUnit.SECONDS));
+                                    } catch (InterruptedException interrupted) {
+                                        sink.error(interrupted);
+                                        return;
+                                    }
+                                    sink.complete();
+                                });
+                    }
+                };
+        var liveEvents = LiveEvents.local();
+        var live = new CopyOnWriteArrayList<LiveEvent>();
+        try (var subscription = liveEvents.subscribe(live::add);
+                var backend = LocalBackend.open(directory.resolve("user-stop"));
+                var runtime =
+                        runtime(
+                                backend,
+                                adapter(model, PermissionMode.BYPASS, Map.of()),
+                                null,
+                                liveEvents)) {
+            var turn = runtime.createSession(key, "agent").submit("one", "hello");
+            var ticking = new AtomicReference<Throwable>();
+            var tick =
+                    new Thread(
+                            () -> {
+                                try {
+                                    runtime.tick(new ThreadKey(key, "main"));
+                                } catch (Throwable error) {
+                                    ticking.set(error);
+                                }
+                            });
+            tick.start();
+            assertTrue(streamed.await(10, TimeUnit.SECONDS), "model streamed first chunk");
+            long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            while (live.stream().noneMatch(e -> "message.delta".equals(e.type()))
+                    && System.nanoTime() < until) Thread.sleep(10);
+            assertTrue(
+                    live.stream().anyMatch(e -> "message.delta".equals(e.type())),
+                    "first delta visible live before stop");
+            // A stop requested while the tick is running does not abort the in-flight stream on
+            // this stack: the turn finishes the step, finalization observes the cancellation,
+            // and the terminal state settles on the next tick. Nothing streamed may be lost.
+            turn.cancel("stop");
+            release.countDown();
+            tick.join(30000);
+            assertFalse(tick.isAlive(), "tick must terminate after stop");
+            if (ticking.get() != null) throw new AssertionError("tick failed", ticking.get());
+            assertEquals(TurnStatus.CANCELLING, turn.status().status());
+            runtime.tick(new ThreadKey(key, "main"));
+            assertEquals(TurnStatus.CANCELLED, turn.status().status());
+            var events = backend.events(key, null, 1000).events();
+            var completed =
+                    events.stream()
+                            .filter(e -> e.type().equals("message.completed"))
+                            .findFirst()
+                            .orElseThrow();
+            assertEquals("hello", completed.data().path("text").asText());
+            var ended =
+                    events.stream()
+                            .filter(e -> e.type().equals("model.call.ended"))
+                            .findFirst()
+                            .orElseThrow();
+            assertEquals("COMPLETED", ended.data().required("status").asText());
+            // The completed call carries no partial: the full text is already durable.
+            assertTrue(ended.data().path("partial").isMissingNode());
+        }
+    }
+
+    @Test
+    void interruptedHostCanSettleAnUnfinishedRunAsInterrupted() throws Exception {
+        var parked = new CountDownLatch(1);
+        Model model =
+                new Model() {
+                    public String getModelName() {
+                        return "fixture";
+                    }
+
+                    public Flux<ChatResponse> stream(
+                            List<Msg> messages, List<ToolSchema> tools, GenerateOptions options) {
+                        return Flux.create(
+                                sink -> {
+                                    sink.next(
+                                            ChatResponse.builder()
+                                                    .id("m-1")
+                                                    .content(
+                                                            List.of(
+                                                                    TextBlock.builder()
+                                                                            .text("partial")
+                                                                            .build()))
+                                                    .build());
+                                    try {
+                                        assertTrue(parked.await(30, TimeUnit.SECONDS));
+                                    } catch (InterruptedException interrupted) {
+                                        sink.error(interrupted);
+                                        return;
+                                    }
+                                    sink.complete();
+                                });
+                    }
+                };
+        var liveEvents = LiveEvents.local();
+        var live = new CopyOnWriteArrayList<LiveEvent>();
+        String turnId;
+        try (var subscription = liveEvents.subscribe(live::add);
+                var backend = LocalBackend.open(directory.resolve("interrupted-host"));
+                var first =
+                        runtime(
+                                backend,
+                                adapter(model, PermissionMode.BYPASS, Map.of()),
+                                null,
+                                liveEvents)) {
+            var turn = first.createSession(key, "agent").submit("one", "hello");
+            turnId = turn.turnId();
+            var ticking = new AtomicReference<Throwable>();
+            var tick =
+                    new Thread(
+                            () -> {
+                                try {
+                                    first.tick(new ThreadKey(key, "main"));
+                                } catch (Throwable error) {
+                                    ticking.set(error);
+                                }
+                            });
+            tick.start();
+            long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            while (live.stream().noneMatch(e -> "message.delta".equals(e.type()))
+                    && System.nanoTime() < until) Thread.sleep(25);
+            assertTrue(
+                    live.stream().anyMatch(e -> "message.delta".equals(e.type())),
+                    "model must stream before the host is lost");
+            // Simulate a lost host: close without settling. The native run stays unfinished,
+            // the lease is released, and nothing is recorded as failed.
+            first.close();
+            tick.join(30000);
+            assertFalse(tick.isAlive(), "interrupted tick must terminate");
+            assertFalse(
+                    backend.turn(new ThreadKey(key, "main"), turnId).status().terminal(),
+                    "a lost host must not settle the turn by itself");
+        }
+        var replacementModel = new ScriptedModel(false);
+        var settled = new AtomicReference<String>();
+        var adapter =
+                AgentScopeAdapter.forReAct(
+                        binding -> {
+                            var toolkit = new Toolkit();
+                            return ReActAgent.builder()
+                                    .name("durable-fixture")
+                                    .model(replacementModel)
+                                    .toolkit(toolkit)
+                                    .permissionContext(
+                                            PermissionContextState.builder()
+                                                    .mode(PermissionMode.BYPASS)
+                                                    .build());
+                        },
+                        Map.of(),
+                        run ->
+                                Optional.of(
+                                        new InterruptedRunHandler.Settlement(
+                                                TurnStatus.INTERRUPTED, "host lost")));
+        try (var backend = LocalBackend.open(directory.resolve("interrupted-host"));
+                var replacement = runtime(backend, adapter, null, LiveEvents.local())) {
+            var turn = replacement.getSession(key).getTurn(turnId);
+            replacement.tick(new ThreadKey(key, "main"));
+            assertNull(replacement.lastFailure(new ThreadKey(key, "main")));
+            assertEquals(TurnStatus.INTERRUPTED, turn.status().status());
+            assertTrue(turn.status().status().terminal());
+            assertTrue(replacementModel.inputs.isEmpty(), "settled runs must not re-invoke");
+            settled.set(
+                    backend.events(key, null, 100).events().stream()
+                            .filter(e -> e.type().equals("run.ended"))
+                            .findFirst()
+                            .map(e -> e.data().path("status").asText())
+                            .orElse("missing"));
+        }
+        // The terminal run event stays observable under the same lifecycle as before.
+        assertEquals("STOPPED", settled.get());
+    }
+
+    @Test
+    void settleMaterializesACompletedButUnappliedToolCall() throws Exception {
+        var model = new ScriptedModel(true);
+        var crash = new AtomicBoolean();
+        var armed = new AtomicBoolean();
+        String turnId;
+        try (var storage = LocalBackend.open(directory.resolve("settle-materialize"))) {
+            var backend = spy(storage);
+            doAnswer(
+                            invocation -> {
+                                Commit command = invocation.getArgument(1);
+                                if (command.journal() != null) {
+                                    boolean ended =
+                                            command.journal().entries().stream()
+                                                    .map(
+                                                            value ->
+                                                                    DurableJson.convert(
+                                                                            value,
+                                                                            JournalEvent.class))
+                                                    .anyMatch(
+                                                            event ->
+                                                                    event.type()
+                                                                            .equals("model/end"));
+                                    if (armed.get()) {
+                                        crash.set(true);
+                                        throw new DurableException(
+                                                DurableException.Code.UNAVAILABLE,
+                                                "Simulated loss between model/end and checkpoint");
+                                    }
+                                    Object receipt = invocation.callRealMethod();
+                                    if (ended) armed.set(true);
+                                    return receipt;
+                                }
+                                return invocation.callRealMethod();
+                            })
+                    .when(backend)
+                    .commit(any(), any());
+            try (var first =
+                    runtime(backend, adapter(model, PermissionMode.BYPASS, Map.of()), null)) {
+                var submitted = first.createSession(key, "agent").submit("one", "run the job");
+                turnId = submitted.turnId();
+                first.tick(new ThreadKey(key, "main"));
+                assertTrue(crash.get(), "must crash between model/end and state checkpoint");
+                assertFalse(backend.turn(new ThreadKey(key, "main"), turnId).status().terminal());
+            }
+            Thread.sleep(5);
+            var replacementModel = new ScriptedModel(true);
+            var adapter =
+                    AgentScopeAdapter.forReAct(
+                            binding -> {
+                                var toolkit = new Toolkit();
+                                toolkit.registerSchema(
+                                        ToolSchema.builder()
+                                                .name("job")
+                                                .description("external fixture")
+                                                .parameters(
+                                                        Map.of(
+                                                                "type",
+                                                                "object",
+                                                                "properties",
+                                                                Map.of(
+                                                                        "value",
+                                                                        Map.of("type", "integer"))))
+                                                .build());
+                                return ReActAgent.builder()
+                                        .name("durable-fixture")
+                                        .model(replacementModel)
+                                        .toolkit(toolkit)
+                                        .permissionContext(
+                                                PermissionContextState.builder()
+                                                        .mode(PermissionMode.BYPASS)
+                                                        .build());
+                            },
+                            Map.of(),
+                            run ->
+                                    Optional.of(
+                                            new InterruptedRunHandler.Settlement(
+                                                    TurnStatus.INTERRUPTED, "host lost")));
+            try (var replacement = runtime(storage, adapter, null)) {
+                replacement.tick(new ThreadKey(key, "main"));
+                assertNull(replacement.lastFailure(new ThreadKey(key, "main")));
+                var status = storage.turn(new ThreadKey(key, "main"), turnId).status();
+                assertEquals(TurnStatus.INTERRUPTED, status);
+                assertTrue(replacementModel.inputs.isEmpty(), "settled runs must not re-invoke");
+                // The unapplied model outcome survives as one assistant: user input plus the
+                // materialized tool-call message, no duplicate on replay.
+                var messages = storage.snapshot(key).projection().path("messages");
+                assertEquals(2, messages.size(), "user input plus one materialized assistant");
+                assertTrue(
+                        StreamSupport.stream(messages.spliterator(), false)
+                                .anyMatch(
+                                        m ->
+                                                "assistant"
+                                                        .equals(
+                                                                m.path("message")
+                                                                        .path("role")
+                                                                        .asText())));
+                var tool =
+                        storage.snapshot(key)
+                                .projection()
+                                .path("tools")
+                                .path(EventProjection.toolId("main", turnId, "call-1"))
+                                .path("data");
+                assertEquals(
+                        "UNKNOWN",
+                        tool.path("status").asText(),
+                        "settled-interrupted tool keeps a truthful UNKNOWN outcome");
+                // A second tick must not duplicate the materialized assistant.
+                replacement.tick(new ThreadKey(key, "main"));
+                assertEquals(
+                        2,
+                        storage.snapshot(key).projection().path("messages").size(),
+                        "settle plus replay must not duplicate the assistant");
+            }
+        }
+    }
+
+    @Test
+    void interruptedSettlementRequiresATerminalInterruptedCapableStatus() {
+        assertEquals(
+                TurnStatus.INTERRUPTED,
+                new InterruptedRunHandler.Settlement(TurnStatus.INTERRUPTED, "host lost").status());
+        assertEquals(
+                TurnStatus.CANCELLED,
+                new InterruptedRunHandler.Settlement(TurnStatus.CANCELLED, "user stop").status());
+        assertEquals(
+                TurnStatus.FAILED,
+                new InterruptedRunHandler.Settlement(TurnStatus.FAILED, "error").status());
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> new InterruptedRunHandler.Settlement(TurnStatus.RUNNING, "nope"));
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> new InterruptedRunHandler.Settlement(TurnStatus.SUCCEEDED, "nope"));
+    }
+
+    @Test
     void completedModelSurvivesCrashBeforeStateApplication() throws Exception {
         var model = new ScriptedModel(false);
         var crash = new AtomicBoolean();

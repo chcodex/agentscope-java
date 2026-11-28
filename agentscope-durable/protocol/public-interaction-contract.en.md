@@ -22,7 +22,8 @@ but operation scope, state conditions, identities, idempotency, events and error
 - requestId identifies admission/control. turnId/runId/stepId/messageId/eventId/interactionId/executionId
   have distinct scopes and are not interchangeable.
 - Session idle is derived from queue/Turn state. QUEUED/RUNNING/WAITING/PAUSING/PAUSED/CANCELLING are nonterminal;
-  SUCCEEDED/FAILED/CANCELLED/CONVERTED are terminal. TurnView.output is public JSON; AgentScope returns Message.
+  SUCCEEDED/FAILED/CANCELLED/INTERRUPTED/CONVERTED are terminal. TurnView.output is public JSON; AgentScope returns
+  Message.
 - DurableRuntime is Java's sole assembly, business-operation and lifecycle entry. It creates, gets
   and lists Sessions directly. Session/Thread/Turn handles retain rehydratable identities.
 - API-only Runtime needs no Agent/model/Executor, scans or claims. Explicit start with execution
@@ -46,33 +47,33 @@ All page limits are 1..1000; cursor is explicitly string or null. List cursors d
 event cursors and bind query scope. Pagination is not a cross-page snapshot; newly admitted
 entries can appear on subsequent pages.
 
-| operation | payload (required unless schema says otherwise) | result |
-| --- | --- | --- |
-| capabilities | `{}` | protocolVersion, operations, registered definitions, checkpointHarnesses |
-| createSession | session, definition (registered name), metadata (nullable) | SessionView; atomically creates the primary Thread and pins its binding |
-| getSession / closeSession | session | SessionView; missing lookup is NOT_FOUND, never implicit creation |
-| listSessions | namespace, cursor, limit | SessionPage(items, cursor), namespace-scoped |
-| createThread | session, threadId, definition | ThreadView with pinned definition versions |
-| getThread / closeThread | session, threadId | ThreadView |
-| listThreads | session, cursor, limit | ThreadPage(items, cursor) |
-| listTurns / history | session, threadId, cursor, limit | TurnPage / HistoryPage, Thread admission order / first-message order |
-| submit | session, threadId, requestId, input | TurnReceipt(thread, requestId, turnId) |
-| getTurn | session, threadId, turnId | TurnView |
-| getTurnProgress | session, threadId, turnId | TurnProgress with a consistent cursor, blockers and retained verification facts |
-| getRun / listRuns | session, threadId, turnId, runId / cursor, limit | RunView / RunPage; read-only invocation history |
-| getStep / listSteps | session, threadId, turnId, runId, stepId / cursor, limit | StepView / StepPage scoped to the Run |
-| getModelCall / listModelCalls | session, threadId, turnId, runId, modelCallId / nullable stepId, cursor, limit | ModelCallView / ModelCallPage; read-only request provenance and usage |
-| control | session, threadId, command | CommandReceipt including requestId, turnId, operation, status, cursor, and acceptedAt for accepted commands |
-| cancelActiveTurns | session, requestId, optional threadId | ActiveTurnCancellation with the selected started Turn identities and acceptance time |
-| interactions | session, threadId, turnId | Pending Interactions for that Turn |
-| snapshot | session, optional filter | Scoped Snapshot consistent with sequence/cursor |
-| events | session, cursor, limit, optional filter | EventPage with events, cursor, highWatermark, scannedSequence, and highWatermarkSequence |
-| eventsBefore | session, cursor, limit | EventPage newest first, strictly before the cursor. A null cursor starts at the latest retained event |
-| toolOutput | session, threadId, turnId, executionId, offset | Accepted output page at a byte boundary |
-| getToolExecution | session, threadId, turnId, and exactly one of callId or executionId | Committed tool execution view |
-| checkpoints | session, threadId, after, limit | CheckpointMetadata list; after is a Thread checkpoint position, not event cursor |
-| restore | session, threadId, position, expectedPosition, requestId | CommitReceipt |
-| fork | session, threadId, position, target (ThreadKey), requestId | ThreadView; another Thread in the same namespace, inheriting the source binding |
+| operation                     | payload (required unless schema says otherwise)                                | result                                                                                                      |
+|-------------------------------|--------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------|
+| capabilities                  | `{}`                                                                           | protocolVersion, operations, registered definitions, checkpointHarnesses                                    |
+| createSession                 | session, definition (registered name), metadata (nullable)                     | SessionView; atomically creates the primary Thread and pins its binding                                     |
+| getSession / closeSession     | session                                                                        | SessionView; missing lookup is NOT_FOUND, never implicit creation                                           |
+| listSessions                  | namespace, cursor, limit                                                       | SessionPage(items, cursor), namespace-scoped                                                                |
+| createThread                  | session, threadId, definition                                                  | ThreadView with pinned definition versions                                                                  |
+| getThread / closeThread       | session, threadId                                                              | ThreadView                                                                                                  |
+| listThreads                   | session, cursor, limit                                                         | ThreadPage(items, cursor)                                                                                   |
+| listTurns / history           | session, threadId, cursor, limit                                               | TurnPage / HistoryPage, Thread admission order / first-message order                                        |
+| submit                        | session, threadId, requestId, input                                            | TurnReceipt(thread, requestId, turnId)                                                                      |
+| getTurn                       | session, threadId, turnId                                                      | TurnView                                                                                                    |
+| getTurnProgress               | session, threadId, turnId                                                      | TurnProgress with a consistent cursor, blockers and retained verification facts                             |
+| getRun / listRuns             | session, threadId, turnId, runId / cursor, limit                               | RunView / RunPage; read-only invocation history                                                             |
+| getStep / listSteps           | session, threadId, turnId, runId, stepId / cursor, limit                       | StepView / StepPage scoped to the Run                                                                       |
+| getModelCall / listModelCalls | session, threadId, turnId, runId, modelCallId / nullable stepId, cursor, limit | ModelCallView / ModelCallPage; read-only request provenance and usage                                       |
+| control                       | session, threadId, command                                                     | CommandReceipt including requestId, turnId, operation, status, cursor, and acceptedAt for accepted commands |
+| cancelActiveTurns             | session, requestId, optional threadId                                          | ActiveTurnCancellation with the selected started Turn identities and acceptance time                        |
+| interactions                  | session, threadId, turnId                                                      | Pending Interactions for that Turn                                                                          |
+| snapshot                      | session, optional filter                                                       | Scoped Snapshot consistent with sequence/cursor                                                             |
+| events                        | session, cursor, limit, optional filter                                        | EventPage with events, cursor, highWatermark, scannedSequence, and highWatermarkSequence                    |
+| eventsBefore                  | session, cursor, limit                                                         | EventPage newest first, strictly before the cursor. A null cursor starts at the latest retained event       |
+| toolOutput                    | session, threadId, turnId, executionId, offset                                 | Accepted output page at a byte boundary                                                                     |
+| getToolExecution              | session, threadId, turnId, and exactly one of callId or executionId            | Committed tool execution view                                                                               |
+| checkpoints                   | session, threadId, after, limit                                                | CheckpointMetadata list; after is a Thread checkpoint position, not event cursor                            |
+| restore                       | session, threadId, position, expectedPosition, requestId                       | CommitReceipt                                                                                               |
+| fork                          | session, threadId, position, target (ThreadKey), requestId                     | ThreadView; another Thread in the same namespace, inheriting the source binding                             |
 
 Creation with identical identity/parameters is idempotent; changed definitions or Session metadata conflict.
 Retrying creation after closure does not reopen the object. Admission and controls share Session + requestId
@@ -113,18 +114,18 @@ these placeholders. Deduplicate Session + requestId using the target Thread and 
 digest. Identical retries return the original receipt; changed content is CONFLICT.
 Validation, signal, public input and receipt commit in one authoritative transaction.
 
-| kind / Java method | target / value | Condition and effect |
-| --- | --- | --- |
-| STEER / `turn.steer(requestId, Input)` | null / Input | Active nonterminal Turn; instructions at the next native reasoning boundary |
-| EDIT_QUEUED / `thread.editQueuedInput(requestId, turnId, expectedInputRevision, input)` | null / Input | Updates an unstarted user Turn at the observed input revision and preserves message identity and position |
-| STEER_QUEUED / `thread.convertQueuedToSteer(requestId, sourceTurnId, targetTurnId, expectedInputRevision)` | Source Turn ID / null | Moves the observed queued input to the active Turn in the same Thread. The source becomes CONVERTED |
-| INJECT / `turn.inject(requestId, Input)` | null / Input | Same condition, context input; no system elevation or immediate model interruption |
-| WITHDRAW / `turn.withdraw(requestId, signalId)` | Original control requestId / null | Existing unapplied signal; atomic race with apply, already applied is CONFLICT |
-| CANCEL / `turn.cancel(requestId)` | null / null | QUEUED cancels immediately; active cancellation verifies outcome; terminal result stays unchanged |
-| RESPOND / `turn.respond(requestId, interactionId, response)` | Interaction.id / JSON | Same Turn, pending, non-automatic; boolean confirmation or JSON external_execution |
-| PAUSE / `turn.pause(requestId)` | null / null | Without an active owner, immediately PAUSED; active execution becomes PAUSING until a safe-boundary handoff |
-| RESUME / `turn.resume(requestId, expectedRevision)` | null / null | Only PAUSED with the observed revision; unsatisfied tool/interaction/signal conditions remain WAITING; never reopens terminal work |
-| SIGNAL / `turn.signal(requestId, key, value)` | `x.*` key / JSON | Extension only; cannot forge internal/input/interaction controls |
+| kind / Java method                                                                                         | target / value                    | Condition and effect                                                                                                               |
+|------------------------------------------------------------------------------------------------------------|-----------------------------------|------------------------------------------------------------------------------------------------------------------------------------|
+| STEER / `turn.steer(requestId, Input)`                                                                     | null / Input                      | Active nonterminal Turn; instructions at the next native reasoning boundary                                                        |
+| EDIT_QUEUED / `thread.editQueuedInput(requestId, turnId, expectedInputRevision, input)`                    | null / Input                      | Updates an unstarted user Turn at the observed input revision and preserves message identity and position                          |
+| STEER_QUEUED / `thread.convertQueuedToSteer(requestId, sourceTurnId, targetTurnId, expectedInputRevision)` | Source Turn ID / null             | Moves the observed queued input to the active Turn in the same Thread. The source becomes CONVERTED                                |
+| INJECT / `turn.inject(requestId, Input)`                                                                   | null / Input                      | Same condition, context input; no system elevation or immediate model interruption                                                 |
+| WITHDRAW / `turn.withdraw(requestId, signalId)`                                                            | Original control requestId / null | Existing unapplied signal; atomic race with apply, already applied is CONFLICT                                                     |
+| CANCEL / `turn.cancel(requestId)`                                                                          | null / null                       | QUEUED cancels immediately; active cancellation verifies outcome; terminal result stays unchanged                                  |
+| RESPOND / `turn.respond(requestId, interactionId, response)`                                               | Interaction.id / JSON             | Same Turn, pending, non-automatic; boolean confirmation or JSON external_execution                                                 |
+| PAUSE / `turn.pause(requestId)`                                                                            | null / null                       | Without an active owner, immediately PAUSED; active execution becomes PAUSING until a safe-boundary handoff                        |
+| RESUME / `turn.resume(requestId, expectedRevision)`                                                        | null / null                       | Only PAUSED with the observed revision; unsatisfied tool/interaction/signal conditions remain WAITING; never reopens terminal work |
+| SIGNAL / `turn.signal(requestId, key, value)`                                                              | `x.*` key / JSON                  | Extension only; cannot forge internal/input/interaction controls                                                                   |
 
 Except CANCEL and identical retries, terminal/cancelling controls conflict. A second
 response with a different requestId also conflicts until the first is validly withdrawn.
@@ -154,20 +155,20 @@ runId/stepId are null when inapplicable; task admission does not invent invocati
 string; cursor is opaque and Session-bound. Checkpoint positions, output byte offsets and Hands
 sequences are separate. Public views never expose native checkpoints or reasoning state.
 
-| Operation/fact | Public messages and events |
-| --- | --- |
-| submit | Atomic turn.queued + user message.completed. AgentScope emits input.applied with the original Message identity when native input enters a checkpoint |
-| steer / inject | signal.accepted + user message.completed; later applied or withdrawn |
-| convert queued to steer | signal.accepted + turn.converted in one transaction; turn.converted is visible to both Turns and carries the relocated message with its original ID |
-| respond | Same, with interactionId in message data; emits confirmation.applied on committed approval consumption and later interaction.resolved |
-| cancel | turn.cancel_requested; queued cancelled in the same transaction, active cancellation verifies real outcome |
-| cancelActiveTurns | turns.cancel_requested records the selected set, then turns.cancel_applied when all selected Turns settle |
-| Session activity | session.activity_changed records running, idle, exhausted recovery, or the outstanding manual interaction IDs |
-| pause / resume | turn.pause_requested, turn.paused, turn.resumed; no user chat message |
-| extension signal | signal.accepted; execution advances only after its waiting condition is satisfied |
-| restore / fork | checkpoint.restored after settled/idle/version/expectedPosition validation |
+| Operation/fact          | Public messages and events                                                                                                                           |
+|-------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------|
+| submit                  | Atomic turn.queued + user message.completed. AgentScope emits input.applied with the original Message identity when native input enters a checkpoint |
+| steer / inject          | signal.accepted + user message.completed; later applied or withdrawn                                                                                 |
+| convert queued to steer | signal.accepted + turn.converted in one transaction; turn.converted is visible to both Turns and carries the relocated message with its original ID  |
+| respond                 | Same, with interactionId in message data; emits confirmation.applied on committed approval consumption and later interaction.resolved                |
+| cancel                  | turn.cancel_requested; queued cancelled in the same transaction, active cancellation verifies real outcome                                           |
+| cancelActiveTurns       | turns.cancel_requested records the selected set, then turns.cancel_applied when all selected Turns settle                                            |
+| Session activity        | session.activity_changed records running, idle, exhausted recovery, or the outstanding manual interaction IDs                                        |
+| pause / resume          | turn.pause_requested, turn.paused, turn.resumed; no user chat message                                                                                |
+| extension signal        | signal.accepted; execution advances only after its waiting condition is satisfied                                                                    |
+| restore / fork          | checkpoint.restored after settled/idle/version/expectedPosition validation                                                                           |
 
-Public input message ID is `input:` + hash([turnId, requestId, inputKind]) using the current
+Public input message ID is `input:` + hash ([turnId, requestId, inputKind]) using the current
 DurableJson canonical digest. inputKind is submit/steer/inject/respond and requires requestId
 and Message; respond requires interactionId. A structured manual tool response
 `{type:"tool_response",error,content[]}` retains its content and reports `toolError` in history.
@@ -210,8 +211,8 @@ native state, often a new Run/Step after recovery; `data.origin` remains unchang
 application, and a stopped original invocation does not prevent accepting late Hands results. This contract
 replaces string appliedResults directly, without old-format readers or writers.
 
-| Call event | Payload and behavior |
-| --- | --- |
+| Call event          | Payload and behavior                                                                                                                                                                                |
+|---------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | tool.call.arguments | callId, messageId, attempt, revision, text; include name when known and retain it across unnamed fragments; assemble argumentsText by message version and stop appending once full arguments arrive |
 | tool.call.updated | callId, status; optional name, arguments, messageId, content, reason. Status is REQUESTED/RUNNING/WAITING/SUCCEEDED/FAILED/CANCELLED/DENIED/UNKNOWN |
 | tool.call.progress | callId, content; append public progress without treating it as a model tool result; late progress does not reopen a terminal call |
@@ -298,15 +299,15 @@ Harness recovery/media/events and Executor query/cancel/output. API-only Runtime
 unbound restore is INCOMPATIBLE. Native checkpoints must match harness/definitionVersion/stateVersion.
 Portable public protocols do not imply native cross-Harness checkpoint conversion.
 
-| Error | Handling |
-| --- | --- |
-| INVALID | Fix fields/types/ranges/cursors/operation rather than blind retry |
-| NOT_FOUND | Session/Thread/Turn/interaction is absent in the requested scope |
-| CONFLICT | State/revision/definition/idempotency mismatch; query before choosing a new action |
-| INCOMPATIBLE | Current Harness/codec/protocol capability is unsupported; no downgrade or effect replay |
-| CURSOR_EXPIRED | Obtain a consistent snapshot/new cursor, without task resubmission |
-| UNAVAILABLE | Outcome can be uncertain; retry the same requestId/content or query, never assume non-admission |
-| FENCED | Internal ownership lost; stale executor stops writing, not a request to resubmit user work |
+| Error          | Handling                                                                                        |
+|----------------|-------------------------------------------------------------------------------------------------|
+| INVALID        | Fix fields/types/ranges/cursors/operation rather than blind retry                               |
+| NOT_FOUND      | Session/Thread/Turn/interaction is absent in the requested scope                                |
+| CONFLICT       | State/revision/definition/idempotency mismatch; query before choosing a new action              |
+| INCOMPATIBLE   | Current Harness/codec/protocol capability is unsupported; no downgrade or effect replay         |
+| CURSOR_EXPIRED | Obtain a consistent snapshot/new cursor, without task resubmission                              |
+| UNAVAILABLE    | Outcome can be uncertain; retry the same requestId/content or query, never assume non-admission |
+| FENCED         | Internal ownership lost; stale executor stops writing, not a request to resubmit user work      |
 
 Authentication/authorization belongs to the HTTP host and must prevent unauthorized invocation.
 Durable state is authoritative; notifications only prompt checks. Brain scans/lease takeover run
@@ -343,16 +344,16 @@ sequences and public input. Java local/HTTP share UserApiContract, including con
 interactions, recovery and lifecycle. Shared vectors are conformance targets for other implementations;
 the supplied language binding is Java. Other implementations must validate the same contract independently.
 
-| Harness concern | AgentScope Java mapping/constraint |
-| --- | --- |
-| Input/output | DurableMessages ↔ Msg; final public Message, no native objects in user protocol |
-| Scheduling identity | ThreadKey isolates state; Durable Turn → turnId; native AgentRun shares RunView's runId, no AgentSession dispatcher |
-| steer/inject | Invocation-scoped AgentExecutionHost applies/records consumption before reasoning, retaining user role |
-| Approval/manual tools | Pending interaction → atomic respond → native recovery; no forged automatic results |
-| Tool handoff | Atomic checkpoint/intent; Backend result resumes original Turn; native checkpoint precedes applied |
-| Recovery | Codec checks versions/settled and restores logs/state/allowed resources; no replay of unverifiable effects |
-| Public projection | Input published once; assistant attempt/revision replacement, no private state |
-| Unsupported capability | Explicit rejection, never changed semantics or fabricated terminal outcomes |
+| Harness concern        | AgentScope Java mapping/constraint                                                                                  |
+|------------------------|---------------------------------------------------------------------------------------------------------------------|
+| Input/output           | DurableMessages ↔ Msg; final public Message, no native objects in user protocol                                     |
+| Scheduling identity    | ThreadKey isolates state; Durable Turn → turnId; native AgentRun shares RunView's runId, no AgentSession dispatcher |
+| steer/inject           | Invocation-scoped AgentExecutionHost applies/records consumption before reasoning, retaining user role              |
+| Approval/manual tools  | Pending interaction → atomic respond → native recovery; no forged automatic results                                 |
+| Tool handoff           | Atomic checkpoint/intent; Backend result resumes original Turn; native checkpoint precedes applied                  |
+| Recovery               | Codec checks versions/settled and restores logs/state/allowed resources; no replay of unverifiable effects          |
+| Public projection      | Input published once; assistant attempt/revision replacement, no private state                                      |
+| Unsupported capability | Explicit rejection, never changed semantics or fabricated terminal outcomes                                         |
 
 ## Child delegation protocol
 
@@ -369,11 +370,11 @@ cancellation affects only the mapped child Turn. Cancellation arriving first res
 no Thread/Turn. Original Run/Step and request digests stay fixed. Reject cross-Session targets, same-Thread
 queues and dependency cycles formed by unfinished delegations.
 
-| Event | Scope and payload |
-| --- | --- |
-| tool.delegated | Parent Thread/Turn and original Run/Step; executionId, callId, child |
-| tool.delegation.cancel_requested | Parent scope; executionId, callId, nullable child. Acknowledges intent, not proof that the child stopped |
-| turn.delegated | Child Thread/Turn with null Run/Step; payload is the parent reference, never the parent's Run misattributed to the child |
+| Event                            | Scope and payload                                                                                                        |
+|----------------------------------|--------------------------------------------------------------------------------------------------------------------------|
+| tool.delegated                   | Parent Thread/Turn and original Run/Step; executionId, callId, child                                                     |
+| tool.delegation.cancel_requested | Parent scope; executionId, callId, nullable child. Acknowledges intent, not proof that the child stopped                 |
+| turn.delegated                   | Child Thread/Turn with null Run/Step; payload is the parent reference, never the parent's Run misattributed to the child |
 
 The actual child result still enters the parent through Executor query/result handoff and commits its
 application with the parent's checkpoint. Queries reconstruct the relationship from a child's parent or a

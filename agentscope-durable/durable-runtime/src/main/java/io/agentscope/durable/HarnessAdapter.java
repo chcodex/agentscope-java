@@ -50,12 +50,16 @@ public interface HarnessAdapter extends AutoCloseable {
     void execute(HarnessContext context) throws Exception;
 
     /**
-     * Settle FAILED or CANCELLED only after external operations settle. Clear native pending work
-     * without inference before committing the terminal task, so the next Turn can use this Thread.
+     * Settle FAILED, CANCELLED, or INTERRUPTED only after external operations settle. Clear native
+     * pending work without inference before committing the terminal task, so the next Turn can use
+     * this Thread.
      */
     default void settle(HarnessContext context, TurnStatus status, String error) throws Exception {
-        if (status != TurnStatus.CANCELLED && status != TurnStatus.FAILED)
-            throw new IllegalArgumentException("Settlement requires FAILED or CANCELLED");
+        if (status != TurnStatus.CANCELLED
+                && status != TurnStatus.FAILED
+                && status != TurnStatus.INTERRUPTED)
+            throw new IllegalArgumentException(
+                    "Settlement requires FAILED, CANCELLED, or INTERRUPTED");
         context.refreshFrame();
         var frame = context.frameWithCheckpoint();
         context.commit(

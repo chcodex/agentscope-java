@@ -989,7 +989,6 @@ public final class DurableRuntime implements AutoCloseable {
                 // Live events are best effort; cleanup must never mask the durable outcome.
                 reportError(key.session(), cleanupFailure);
             } finally {
-                // Do not leak a cancellation interrupt into the next session on this pooled worker.
                 Thread.interrupted();
             }
         }

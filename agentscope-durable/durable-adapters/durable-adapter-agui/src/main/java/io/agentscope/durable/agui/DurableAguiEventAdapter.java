@@ -129,6 +129,7 @@ public final class DurableAguiEventAdapter {
             case "step.ended" -> stepEnded(event);
             case "message.delta" -> messageDelta(event);
             case "message.completed" -> message(event);
+            case "model.call.ended" -> stoppedPartial(event);
             case "tool.call.updated" -> tool(event);
             case "turn.waiting" -> waiting(event);
             default -> extension(event);
@@ -418,6 +419,46 @@ public final class DurableAguiEventAdapter {
                             event.runId(),
                             "agentscope.message_reconciled",
                             DurableJson.convert(message, Object.class)));
+        result.add(new AguiEvent.TextMessageEnd(event.threadId(), event.runId(), messageId));
+        messages.remove(messageId);
+        messageText.remove(messageId);
+        return List.copyOf(result);
+    }
+
+    /**
+     * Renders a stopped model call's assembled partial as a closed text message. It shares the
+     * Step's message id so it reconciles with the live preview instead of duplicating it: a
+     * client that already showed the text only closes the bubble, while a reconnect that never
+     * saw the deltas opens it from this committed fact.
+     */
+    private List<AguiEvent> stoppedPartial(PublicEvent event) {
+        if (event.runId() == null) return List.of();
+        var partial = event.data().path("partial");
+        String text = partial.path("text").asText("");
+        if (!partial.isObject() || text.isEmpty()) return List.of();
+        String messageId = event.data().path("messageId").asText(null);
+        if (messageId == null || messageId.isEmpty())
+            messageId = "stopped:" + event.data().path("modelCallId").asText(event.eventId());
+        var result = new ArrayList<AguiEvent>();
+        closeReasoning(event.threadId(), event.runId(), result);
+        if (!messages.contains(messageId))
+            result.addAll(
+                    startMessage(
+                            event.threadId(),
+                            event.runId(),
+                            DurableJson.value(Map.of("messageId", messageId))));
+        String preview = messageText.get(messageId).toString();
+        if (text.startsWith(preview) && text.length() > preview.length())
+            result.add(
+                    new AguiEvent.TextMessageContent(
+                            event.threadId(),
+                            event.runId(),
+                            messageId,
+                            text.substring(preview.length())));
+        else if (!text.equals(preview))
+            result.add(
+                    new AguiEvent.TextMessageContent(
+                            event.threadId(), event.runId(), messageId, text));
         result.add(new AguiEvent.TextMessageEnd(event.threadId(), event.runId(), messageId));
         messages.remove(messageId);
         messageText.remove(messageId);

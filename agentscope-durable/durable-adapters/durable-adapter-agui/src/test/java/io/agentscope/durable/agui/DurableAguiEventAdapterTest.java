@@ -466,6 +466,53 @@ class DurableAguiEventAdapterTest {
                 nativeId);
     }
 
+    @Test
+    void stoppedPartialOpensStoppedBubbleOnReplay() {
+        var events = adapter.committed(stopped("call-1", "message-9", "hello"));
+        assertEquals(3, events.size());
+        assertInstanceOf(AguiEvent.TextMessageStart.class, events.get(0));
+        assertEquals("hello", ((AguiEvent.TextMessageContent) events.get(1)).delta());
+        assertInstanceOf(AguiEvent.TextMessageEnd.class, events.get(2));
+    }
+
+    @Test
+    void stoppedPartialAfterLivePreviewOnlyClosesTheBubble() {
+        adapter.map(started("message-9"));
+        adapter.map(delta("message-9", "hello"));
+        var events = adapter.committed(stopped("call-1", "message-9", "hello"));
+        assertEquals(1, events.size());
+        assertInstanceOf(AguiEvent.TextMessageEnd.class, events.get(0));
+    }
+
+    @Test
+    void stoppedPartialWithoutTextIsIgnored() {
+        var empty =
+                committed(
+                        "model.call.ended",
+                        "run",
+                        "step",
+                        Map.of("modelCallId", "call-1", "status", "CANCELLED", "endedAt", 1L));
+        assertEquals(List.of(), adapter.committed(empty));
+    }
+
+    private PublicEvent stopped(String callId, String messageId, String text) {
+        return committed(
+                "model.call.ended",
+                "run",
+                "step",
+                Map.of(
+                        "modelCallId",
+                        callId,
+                        "status",
+                        "CANCELLED",
+                        "endedAt",
+                        1L,
+                        "messageId",
+                        messageId,
+                        "partial",
+                        Map.of("text", text, "interrupted", true)));
+    }
+
     private PublicEvent committedDelta(String nativeId, String id, String text) {
         return new PublicEvent(
                 "1",

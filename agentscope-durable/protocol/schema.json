@@ -34,6 +34,7 @@
         "SUCCEEDED",
         "FAILED",
         "CANCELLED",
+        "INTERRUPTED",
         "CONVERTED"
       ]
     },
@@ -1113,6 +1114,7 @@
                 "turn.succeeded",
                 "turn.failed",
                 "turn.cancelled",
+                "turn.interrupted",
                 "turn.cancel_requested",
                 "turn.pause_requested",
                 "turn.paused"
@@ -1712,6 +1714,28 @@
                       "type": "null"
                     }
                   ]
+                },
+                "messageId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256
+                },
+                "partial": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "text",
+                    "interrupted"
+                  ],
+                  "properties": {
+                    "text": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "interrupted": {
+                      "const": true
+                    }
+                  }
                 }
               }
             },
@@ -2301,6 +2325,7 @@
                 "turn.succeeded",
                 "turn.failed",
                 "turn.cancelled",
+                "turn.interrupted",
                 "turn.cancel_requested",
                 "turn.pause_requested",
                 "turn.paused"
@@ -2928,6 +2953,28 @@
                       "type": "null"
                     }
                   ]
+                },
+                "messageId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256
+                },
+                "partial": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "text",
+                    "interrupted"
+                  ],
+                  "properties": {
+                    "text": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "interrupted": {
+                      "const": true
+                    }
+                  }
                 }
               }
             },
@@ -3467,7 +3514,8 @@
             "PAUSED",
             "SUCCEEDED",
             "FAILED",
-            "CANCELLED"
+            "CANCELLED",
+            "INTERRUPTED"
           ]
         },
         "waiting": {

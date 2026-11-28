@@ -132,10 +132,15 @@ public final class DurableTypes {
         SUCCEEDED,
         FAILED,
         CANCELLED,
+        INTERRUPTED,
         CONVERTED;
 
         public boolean terminal() {
-            return this == SUCCEEDED || this == FAILED || this == CANCELLED || this == CONVERTED;
+            return this == SUCCEEDED
+                    || this == FAILED
+                    || this == CANCELLED
+                    || this == INTERRUPTED
+                    || this == CONVERTED;
         }
     }
 

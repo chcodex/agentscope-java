@@ -77,7 +77,11 @@ class WorkspaceContextMiddlewareSandboxTest {
         String prompt = collectMaterials(mw);
         assertNotNull(prompt);
         assertTrue(prompt.contains("File and shell paths follow the configured execution backend"));
-        assertTrue(prompt.contains("No artifact delivery tool is configured"));
+        assertTrue(
+                prompt.contains(
+                        "Unless your tool list includes a delivery or upload tool, files remain"
+                                + " in the configured execution backend"));
+        assertFalse(prompt.contains("No artifact delivery tool"));
     }
 
     @Test
@@ -93,7 +97,7 @@ class WorkspaceContextMiddlewareSandboxTest {
     }
 
     @Test
-    void sessionContext_usesHostPlatform(@TempDir Path workspace) {
+    void sessionContext_omitsHostFactsForSandboxBackend(@TempDir Path workspace) {
         FakeSandboxFilesystem fs = new FakeSandboxFilesystem("sbox-8", "/workspace");
         fs.osReleaseResponse = new ExecuteResponse("Ubuntu 22.04", 0, false);
         fs.tempdirResponse = new ExecuteResponse("/sandbox-tmp", 0, false);
@@ -102,15 +106,18 @@ class WorkspaceContextMiddlewareSandboxTest {
 
         String prompt = collectMaterials(mw);
         assertNotNull(prompt);
-        // The prompt describes the host JVM, not the execution backend's os-release/tmpdir.
-        assertTrue(prompt.contains(System.getProperty("os.name")));
-        assertTrue(prompt.contains(System.getProperty("java.io.tmpdir")));
+        // Host facts are not actionable inside a sandbox and would contradict the workspace
+        // paragraph, so they stay out even when the backend platform is probeable.
+        assertTrue(prompt.contains("## Runtime Environment"));
+        assertFalse(prompt.contains("The host operating system is:"));
+        assertFalse(prompt.contains("The host workspace directory is:"));
+        assertFalse(prompt.contains("The host JVM temporary directory is:"));
         assertFalse(prompt.contains("Ubuntu 22.04"));
         assertFalse(prompt.contains("/sandbox-tmp"));
     }
 
     @Test
-    void sessionContext_fallsBackToHostOnSandboxFailure(@TempDir Path workspace) {
+    void sessionContext_omitsHostFactsWhenSandboxProbeFails(@TempDir Path workspace) {
         FakeSandboxFilesystem fs = new FakeSandboxFilesystem("sbox-9", "/workspace");
         fs.osReleaseResponse = new ExecuteResponse("", 1, false);
         fs.unameResponse = new ExecuteResponse("", 1, false);
@@ -120,8 +127,10 @@ class WorkspaceContextMiddlewareSandboxTest {
 
         String prompt = collectMaterials(mw);
         assertNotNull(prompt);
-        assertTrue(prompt.contains(System.getProperty("os.name")));
-        assertTrue(prompt.contains(System.getProperty("java.io.tmpdir")));
+        assertTrue(prompt.contains("## Runtime Environment"));
+        assertFalse(prompt.contains("The host operating system is:"));
+        assertFalse(prompt.contains("The host workspace directory is:"));
+        assertFalse(prompt.contains("The host JVM temporary directory is:"));
     }
 
     @Test

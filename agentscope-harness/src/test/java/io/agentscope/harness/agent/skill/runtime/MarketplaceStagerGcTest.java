@@ -39,6 +39,10 @@ import org.junit.jupiter.api.io.TempDir;
  * <p>Staged layout is {@code .skills-cache/&lt;scope&gt;/&lt;source-ns&gt;/&lt;skill&gt;} and GC
  * only reclaims entries untouched for a full grace window, so deletion assertions backdate the
  * orphan's mtime instead of expecting immediate removal.
+ *
+ * <p>Source identifiers such as {@code owner/repo} are mapped to one safe directory segment
+ * (slashes are sanitised with a digest suffix), so multi-level tests resolve the real directory
+ * from the {@link MarketplaceStager.StageResult} instead of the raw identifier.
  */
 class MarketplaceStagerGcTest {
 
@@ -157,14 +161,18 @@ class MarketplaceStagerGcTest {
         StubRepo repo = new StubRepo(List.of(skill), "git-owner/repo");
         MarketplaceStager stager = new MarketplaceStager(tempWorkspace);
 
-        stager.stage(
-                List.of(new MarketplaceStager.RepoBound(skill, repo)),
-                Map.of(repo, "git-owner/repo"));
+        Map<String, MarketplaceStager.StageResult> result =
+                stager.stage(
+                        List.of(new MarketplaceStager.RepoBound(skill, repo)),
+                        Map.of(repo, "git-owner/repo"));
 
-        // The intermediate directories (git-owner/, git-owner/repo/) must not
-        // be deleted by GC — the skill file at the leaf must survive.
+        // The intermediate directories (git-owner/, git-owner/repo/) never exist on disk:
+        // the source identifier is mapped to one safe segment, so the skill file at the
+        // leaf must survive under the resolved namespace directory.
+        String ns =
+                ((MarketplaceStager.StageResult.Cached) result.get("my-skill")).sourceNamespace();
         assertTrue(
-                Files.exists(stagedFile(tempWorkspace, "git-owner/repo", "my-skill", "f.txt")),
+                Files.exists(stagedFile(tempWorkspace, ns, "my-skill", "f.txt")),
                 "skill under multi-level namespace should survive GC");
     }
 
@@ -181,22 +189,35 @@ class MarketplaceStagerGcTest {
         StubRepo repo = new StubRepo(List.of(skill), "git-owner/repo");
         MarketplaceStager stager = new MarketplaceStager(tempWorkspace, Duration.ofHours(6));
 
-        stager.stage(
-                List.of(new MarketplaceStager.RepoBound(skill, repo)),
-                Map.of(repo, "git-owner/repo"));
+        String ns =
+                ((MarketplaceStager.StageResult.Cached)
+                                stager.stage(
+                                                List.of(
+                                                        new MarketplaceStager.RepoBound(
+                                                                skill, repo)),
+                                                Map.of(repo, "git-owner/repo"))
+                                        .get("old-skill"))
+                        .sourceNamespace();
 
-        Path staged = stagedFile(tempWorkspace, "git-owner/repo", "old-skill", "o.txt");
+        Path staged = stagedFile(tempWorkspace, ns, "old-skill", "o.txt");
         assertTrue(Files.exists(staged));
 
         // Backdate so the orphan is past the grace window
         Files.setLastModifiedTime(
-                skillDir(tempWorkspace, "git-owner/repo", "old-skill"),
+                skillDir(tempWorkspace, ns, "old-skill"),
                 FileTime.from(Instant.now().minus(Duration.ofDays(7))));
 
         // Re-stage with empty visible list → old-skill is a stale orphan
         stager.stage(List.of(), Map.of(repo, "git-owner/repo"));
 
         assertFalse(Files.exists(staged), "orphan skill under multi-level ns should be deleted");
+        assertTrue(
+                Files.notExists(
+                        tempWorkspace
+                                .resolve(MarketplaceStager.CACHE_DIR)
+                                .resolve(MarketplaceStager.SHARED_SCOPE)
+                                .resolve(ns)),
+                "empty sanitized namespace dir should also be cleaned up");
     }
 
     @Test
@@ -219,20 +240,25 @@ class MarketplaceStagerGcTest {
         StubRepo repo = new StubRepo(List.of(keep, drop), "git-owner/repo");
         MarketplaceStager stager = new MarketplaceStager(tempWorkspace, Duration.ofHours(6));
 
-        stager.stage(
-                List.of(
-                        new MarketplaceStager.RepoBound(keep, repo),
-                        new MarketplaceStager.RepoBound(drop, repo)),
-                Map.of(repo, "git-owner/repo"));
+        String ns =
+                ((MarketplaceStager.StageResult.Cached)
+                                stager.stage(
+                                                List.of(
+                                                        new MarketplaceStager.RepoBound(keep, repo),
+                                                        new MarketplaceStager.RepoBound(
+                                                                drop, repo)),
+                                                Map.of(repo, "git-owner/repo"))
+                                        .get("keep"))
+                        .sourceNamespace();
 
-        Path kept = stagedFile(tempWorkspace, "git-owner/repo", "keep", "k.txt");
-        Path dropped = stagedFile(tempWorkspace, "git-owner/repo", "drop", "d.txt");
+        Path kept = stagedFile(tempWorkspace, ns, "keep", "k.txt");
+        Path dropped = stagedFile(tempWorkspace, ns, "drop", "d.txt");
         assertTrue(Files.exists(kept));
         assertTrue(Files.exists(dropped));
 
         // Backdate the dropped skill so only it is past the grace window
         Files.setLastModifiedTime(
-                skillDir(tempWorkspace, "git-owner/repo", "drop"),
+                skillDir(tempWorkspace, ns, "drop"),
                 FileTime.from(Instant.now().minus(Duration.ofDays(7))));
 
         // Re-stage with only 'keep'

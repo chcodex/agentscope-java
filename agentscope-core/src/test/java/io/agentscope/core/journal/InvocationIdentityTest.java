@@ -164,10 +164,12 @@ class InvocationIdentityTest {
                         .toList();
         assertFalse(outputs.isEmpty());
         outputs.forEach(e -> assertEquals(model, e.data().get("modelCallId")));
-        // Streaming chunks are committed so recovery can rebuild the model response identity.
-        assertEquals(1, facts.stream().filter(e -> e.type().equals("model/chunk")).count());
+        // Streaming fragments are previews; the committed model/response carries the identity.
+        assertEquals(0, facts.stream().filter(e -> e.type().equals("model/chunk")).count());
         assertEquals(1, facts.stream().filter(e -> e.type().equals("model/response")).count());
-        assertTrue(facts.stream().noneMatch(e -> e.type().equals("presentation/text")));
+        // Presentation deltas stay live-only: no committed partial to replace on replay.
+        var previews = facts.stream().filter(e -> e.type().equals("presentation/text")).toList();
+        assertTrue(previews.isEmpty());
     }
 
     @ParameterizedTest

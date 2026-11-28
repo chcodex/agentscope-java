@@ -20,7 +20,7 @@ Java 是它的绑定；其他语言可使用自己的 Future/Promise、回调或
   暂停先持久化意图，PAUSED 确认已到达安全边界；恢复需要观察到的版本。
 - requestId 标识提交或控制。turnId/runId/stepId/messageId/eventId/interactionId/executionId 各有自己的范围，不能互换。
 - Session “空闲”从队列和 Turn 状态推导。QUEUED/RUNNING/WAITING/PAUSING/PAUSED/CANCELLING 不是终态；
-  SUCCEEDED/FAILED/CANCELLED/CONVERTED 为终态。TurnView.output 为公开 JSON，AgentScope 输出标准 Message。
+  SUCCEEDED/FAILED/CANCELLED/INTERRUPTED/CONVERTED 为终态。TurnView.output 为公开 JSON，AgentScope 输出标准 Message。
 - `DurableRuntime` 是 Java 唯一装配、业务操作和生命周期入口，直接创建、查询和列举
   Session。Session/Thread/Turn 是可重新查找的身份句柄。
 - API-only Runtime 不需要 Agent/模型/Executor，不扫描或认领任务。配置执行能力并显式 start
@@ -41,33 +41,33 @@ Java 是它的绑定；其他语言可使用自己的 Future/Promise、回调或
 下面所有分页 limit 均为 1..1000；cursor 必须显式为字符串或 null。列表游标与事件游标不同。
 列表游标绑定查询范围，不提供跨页快照隔离；查询期间的新受理项可能在后续页出现。
 
-| operation | payload（字段均为必填，除 schema 明确可选项） | result |
-| --- | --- | --- |
-| capabilities | `{}` | protocolVersion、operations、已注册 definitions、checkpointHarnesses |
-| createSession | session、definition（注册名称）、metadata（可为 null） | SessionView；原子创建主 Thread 并冻结其绑定 |
-| getSession / closeSession | session | SessionView；查询缺失为 NOT_FOUND，不隐式创建 |
-| listSessions | namespace、cursor、limit | SessionPage(items, cursor)；按 namespace 限定 |
-| createThread | session、threadId、definition | ThreadView；固定该 Thread 的定义版本 |
-| getThread / closeThread | session、threadId | ThreadView |
-| listThreads | session、cursor、limit | ThreadPage(items, cursor) |
-| listTurns / history | session、threadId、cursor、limit | TurnPage / HistoryPage；按该 Thread 的受理顺序 / 消息首次提交顺序 |
-| submit | session、threadId、requestId、input | TurnReceipt(thread, requestId, turnId) |
-| getTurn | session、threadId、turnId | TurnView |
-| getTurnProgress | session、threadId、turnId | TurnProgress，包含一致的游标、阻塞原因和可保留的验收事实 |
-| getRun / listRuns | session、threadId、turnId、runId / cursor、limit | RunView / RunPage；一次实际执行的只读记录 |
-| getStep / listSteps | session、threadId、turnId、runId、stepId / cursor、limit | StepView / StepPage；限定所属 Run |
-| getModelCall / listModelCalls | session、threadId、turnId、runId、modelCallId / stepId（可为 null）、cursor、limit | ModelCallView / ModelCallPage；只读请求来源与用量 |
-| control | session、threadId、command | CommandReceipt 包含 requestId、turnId、operation、status、cursor，已受理命令另有 acceptedAt |
-| cancelActiveTurns | session、requestId、可选 threadId | ActiveTurnCancellation，包含选中的已开始 Turn 身份和受理时间 |
-| interactions | session、threadId、turnId | 该 Turn 的 pending Interaction 列表 |
-| snapshot | session、可选 filter | 与 sequence/cursor 一致且按范围过滤的 Snapshot |
-| events | session、cursor、limit、可选 filter | EventPage 包含 events、cursor、highWatermark、scannedSequence 和 highWatermarkSequence |
-| eventsBefore | session、cursor、limit | 最新事件优先，严格早于 cursor。cursor 为 null 时从最新保留事件开始 |
-| toolOutput | session、threadId、turnId、executionId、offset | 指定字节边界的已受理输出页 |
-| getToolExecution | session、threadId、turnId、callId 或 executionId（两者选一） | 已提交的工具执行视图 |
-| checkpoints | session、threadId、after、limit | CheckpointMetadata 列表；after 是 Thread checkpoint 位置，非事件游标 |
-| restore | session、threadId、position、expectedPosition、requestId | CommitReceipt |
-| fork | session、threadId、position、target（ThreadKey）、requestId | ThreadView；目标为同 namespace 的其他 Thread，继承源冻结绑定 |
+| operation                     | payload（字段均为必填，除 schema 明确可选项）                                      | result                                                                                      |
+|-------------------------------|------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------|
+| capabilities                  | `{}`                                                                               | protocolVersion、operations、已注册 definitions、checkpointHarnesses                        |
+| createSession                 | session、definition（注册名称）、metadata（可为 null）                             | SessionView；原子创建主 Thread 并冻结其绑定                                                 |
+| getSession / closeSession     | session                                                                            | SessionView；查询缺失为 NOT_FOUND，不隐式创建                                               |
+| listSessions                  | namespace、cursor、limit                                                           | SessionPage(items, cursor)；按 namespace 限定                                               |
+| createThread                  | session、threadId、definition                                                      | ThreadView；固定该 Thread 的定义版本                                                        |
+| getThread / closeThread       | session、threadId                                                                  | ThreadView                                                                                  |
+| listThreads                   | session、cursor、limit                                                             | ThreadPage(items, cursor)                                                                   |
+| listTurns / history           | session、threadId、cursor、limit                                                   | TurnPage / HistoryPage；按该 Thread 的受理顺序 / 消息首次提交顺序                           |
+| submit                        | session、threadId、requestId、input                                                | TurnReceipt(thread, requestId, turnId)                                                      |
+| getTurn                       | session、threadId、turnId                                                          | TurnView                                                                                    |
+| getTurnProgress               | session、threadId、turnId                                                          | TurnProgress，包含一致的游标、阻塞原因和可保留的验收事实                                    |
+| getRun / listRuns             | session、threadId、turnId、runId / cursor、limit                                   | RunView / RunPage；一次实际执行的只读记录                                                   |
+| getStep / listSteps           | session、threadId、turnId、runId、stepId / cursor、limit                           | StepView / StepPage；限定所属 Run                                                           |
+| getModelCall / listModelCalls | session、threadId、turnId、runId、modelCallId / stepId（可为 null）、cursor、limit | ModelCallView / ModelCallPage；只读请求来源与用量                                           |
+| control                       | session、threadId、command                                                         | CommandReceipt 包含 requestId、turnId、operation、status、cursor，已受理命令另有 acceptedAt |
+| cancelActiveTurns             | session、requestId、可选 threadId                                                  | ActiveTurnCancellation，包含选中的已开始 Turn 身份和受理时间                                |
+| interactions                  | session、threadId、turnId                                                          | 该 Turn 的 pending Interaction 列表                                                         |
+| snapshot                      | session、可选 filter                                                               | 与 sequence/cursor 一致且按范围过滤的 Snapshot                                              |
+| events                        | session、cursor、limit、可选 filter                                                | EventPage 包含 events、cursor、highWatermark、scannedSequence 和 highWatermarkSequence      |
+| eventsBefore                  | session、cursor、limit                                                             | 最新事件优先，严格早于 cursor。cursor 为 null 时从最新保留事件开始                          |
+| toolOutput                    | session、threadId、turnId、executionId、offset                                     | 指定字节边界的已受理输出页                                                                  |
+| getToolExecution              | session、threadId、turnId、callId 或 executionId（两者选一）                       | 已提交的工具执行视图                                                                        |
+| checkpoints                   | session、threadId、after、limit                                                    | CheckpointMetadata 列表；after 是 Thread checkpoint 位置，非事件游标                        |
+| restore                       | session、threadId、position、expectedPosition、requestId                           | CommitReceipt                                                                               |
+| fork                          | session、threadId、position、target（ThreadKey）、requestId                        | ThreadView；目标为同 namespace 的其他 Thread，继承源冻结绑定                                |
 
 创建同身份/同参数幂等，改变定义或会话 metadata 冲突；关闭后重试原创建请求不会重新打开对象。
 提交和控制共用 Session + requestId 去重范围，摘要包括目标 Thread/Turn、操作和内容；改变任一项 CONFLICT。
@@ -96,18 +96,18 @@ STEER_QUEUED 使用输入版本，其他控制为 0。Java 方法隐藏这些内
 以 Session + requestId 去重，摘要覆盖目标 Thread 和整个命令；相同请求返回最初回执，内容变化 CONFLICT。
 校验、信号、用户消息和回执在同一权威事务中提交，不依赖客户端先读后写。
 
-| kind / Java 方法 | target / value | 状态约束与效果 |
-| --- | --- | --- |
-| STEER / `turn.steer(requestId, Input)` | null / Input | 仅活动非终态 Turn；下一原生 reasoning 安全边界应用用户指令 |
-| EDIT_QUEUED / `thread.editQueuedInput(requestId, turnId, expectedInputRevision, input)` | null / Input | 按观察到的输入版本编辑尚未开始的用户 Turn，保留消息身份和历史位置 |
-| STEER_QUEUED / `thread.convertQueuedToSteer(requestId, sourceTurnId, targetTurnId, expectedInputRevision)` | 来源 Turn ID / null | 按观察到的输入版本移入同 Thread 内的活动 Turn，来源进入 CONVERTED |
-| INJECT / `turn.inject(requestId, Input)` | null / Input | 同上，注入上下文；不提升为 system 权限、不承诺即时打断模型 |
-| WITHDRAW / `turn.withdraw(requestId, signalId)` | 原控制 requestId / null | 必须存在未应用信号；与应用竞争，已应用 CONFLICT |
-| CANCEL / `turn.cancel(requestId)` | null / null | QUEUED 立即取消；活动任务进入取消流程，核实后终态；已终态保持原结果 |
-| RESPOND / `turn.respond(requestId, interactionId, response)` | Interaction.id / JSON | 校验同 Turn、pending、非 automatic；confirmation 为 boolean，external_execution 为 JSON |
-| PAUSE / `turn.pause(requestId)` | null / null | 无活动所有者时直接 PAUSED；活动执行先 PAUSING，在安全边界交接后 PAUSED |
-| RESUME / `turn.resume(requestId, expectedRevision)` | null / null | 只继续 revision 匹配的 PAUSED；未满足的工具/交互/信号条件仍保持 WAITING，不重启终态 |
-| SIGNAL / `turn.signal(requestId, key, value)` | `x.*` key / JSON | 高级扩展；不能冒充 input、interaction 或框架内部 key |
+| kind / Java 方法                                                                                           | target / value          | 状态约束与效果                                                                          |
+|------------------------------------------------------------------------------------------------------------|-------------------------|-----------------------------------------------------------------------------------------|
+| STEER / `turn.steer(requestId, Input)`                                                                     | null / Input            | 仅活动非终态 Turn；下一原生 reasoning 安全边界应用用户指令                              |
+| EDIT_QUEUED / `thread.editQueuedInput(requestId, turnId, expectedInputRevision, input)`                    | null / Input            | 按观察到的输入版本编辑尚未开始的用户 Turn，保留消息身份和历史位置                       |
+| STEER_QUEUED / `thread.convertQueuedToSteer(requestId, sourceTurnId, targetTurnId, expectedInputRevision)` | 来源 Turn ID / null     | 按观察到的输入版本移入同 Thread 内的活动 Turn，来源进入 CONVERTED                       |
+| INJECT / `turn.inject(requestId, Input)`                                                                   | null / Input            | 同上，注入上下文；不提升为 system 权限、不承诺即时打断模型                              |
+| WITHDRAW / `turn.withdraw(requestId, signalId)`                                                            | 原控制 requestId / null | 必须存在未应用信号；与应用竞争，已应用 CONFLICT                                         |
+| CANCEL / `turn.cancel(requestId)`                                                                          | null / null             | QUEUED 立即取消；活动任务进入取消流程，核实后终态；已终态保持原结果                     |
+| RESPOND / `turn.respond(requestId, interactionId, response)`                                               | Interaction.id / JSON   | 校验同 Turn、pending、非 automatic；confirmation 为 boolean，external_execution 为 JSON |
+| PAUSE / `turn.pause(requestId)`                                                                            | null / null             | 无活动所有者时直接 PAUSED；活动执行先 PAUSING，在安全边界交接后 PAUSED                  |
+| RESUME / `turn.resume(requestId, expectedRevision)`                                                        | null / null             | 只继续 revision 匹配的 PAUSED；未满足的工具/交互/信号条件仍保持 WAITING，不重启终态     |
+| SIGNAL / `turn.signal(requestId, key, value)`                                                              | `x.*` key / JSON        | 高级扩展；不能冒充 input、interaction 或框架内部 key                                    |
 
 除 CANCEL 及原请求重试外，终态/取消中的控制返回 CONFLICT。重复审批的新 requestId 也被拒绝，
 直到原响应被合法撤回。用户响应不能覆盖自动 Worker 结果。普通客户端无需拼接内部信号 key；
@@ -134,20 +134,20 @@ runId/stepId 按适用性为 null；任务受理不伪造执行身份，Step 事
 sequence 是十进制字符串，cursor 不透明且绑定 Session；checkpoint 位置、输出字节 offset、
 Hands sequence 均不能代替它。用户公开视图不包含私有 checkpoint 或推理状态。
 
-| 操作/事实 | 公共消息和事件 |
-| --- | --- |
-| submit | 原子提交 turn.queued 与 user message.completed。AgentScope 在输入进入原生检查点时提交 input.applied，沿用原 Message 身份 |
-| steer / inject | signal.accepted + user message.completed；后续 applied 或 withdrawn |
-| 排队转 steer | 同事务提交 signal.accepted 和 turn.converted。两个 Turn 都可观察到 turn.converted，事件中的输入保留原消息 ID |
-| respond | 同上，message.data 包含 interactionId。审批应答消费提交后产生 confirmation.applied，交互结清产生 interaction.resolved |
-| cancel | turn.cancel_requested；排队任务同事务 cancelled，活动任务核实后 cancelled 或真实终态 |
-| cancelActiveTurns | turns.cancel_requested 记录固定目标，全部选中 Turn 结清后产生 turns.cancel_applied |
-| Session 运行状态 | session.activity_changed 记录运行、空闲、恢复耗尽或尚待应答的手动交互 ID |
-| pause / resume | turn.pause_requested、turn.paused、turn.resumed；不生成用户聊天内容 |
-| 扩展 signal | signal.accepted；等待条件满足后才可推进 |
-| restore / fork | 校验 settled、目标空闲、版本和 expectedPosition 后提交 checkpoint.restored |
+| 操作/事实         | 公共消息和事件                                                                                                           |
+|-------------------|--------------------------------------------------------------------------------------------------------------------------|
+| submit            | 原子提交 turn.queued 与 user message.completed。AgentScope 在输入进入原生检查点时提交 input.applied，沿用原 Message 身份 |
+| steer / inject    | signal.accepted + user message.completed；后续 applied 或 withdrawn                                                      |
+| 排队转 steer      | 同事务提交 signal.accepted 和 turn.converted。两个 Turn 都可观察到 turn.converted，事件中的输入保留原消息 ID             |
+| respond           | 同上，message.data 包含 interactionId。审批应答消费提交后产生 confirmation.applied，交互结清产生 interaction.resolved    |
+| cancel            | turn.cancel_requested；排队任务同事务 cancelled，活动任务核实后 cancelled 或真实终态                                     |
+| cancelActiveTurns | turns.cancel_requested 记录固定目标，全部选中 Turn 结清后产生 turns.cancel_applied                                       |
+| Session 运行状态  | session.activity_changed 记录运行、空闲、恢复耗尽或尚待应答的手动交互 ID                                                 |
+| pause / resume    | turn.pause_requested、turn.paused、turn.resumed；不生成用户聊天内容                                                      |
+| 扩展 signal       | signal.accepted；等待条件满足后才可推进                                                                                  |
+| restore / fork    | 校验 settled、目标空闲、版本和 expectedPosition 后提交 checkpoint.restored                                               |
 
-公开输入消息 ID 为 `input:` + hash([turnId, requestId, inputKind])，hash 使用当前 DurableJson
+公开输入消息 ID 为 `input:` + hash ([turnId, requestId, inputKind])，hash 使用当前 DurableJson
 规范摘要。inputKind 为 submit/steer/inject/respond，伴随 requestId 和结构化 Message；respond
 必须有 interactionId。结构化手动工具响应 `{type:"tool_response",error,content[]}` 保留内容，
 对应历史项包含 `toolError`。其他 JSON 响应以 JSON 文本记入历史。消息记录受理，撤回时以
@@ -184,8 +184,8 @@ appliedAt 为 null，不虚构 Run/Step。
 恢复后通常属于新的 Run/Step；`data.origin` 保留原位置。结果接收不代表已经应用，
 原始调用终止也不阻止接收 Hands 的迟到结果。此协议直接替换字符串 appliedResults，不保留旧格式读写。
 
-| 调用事件 | 载荷与作用 |
-| --- | --- |
+| 调用事件            | 载荷与作用                                                                                                                                             |
+|---------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------|
 | tool.call.arguments | callId、messageId、attempt、revision、text；已知时携带 name，后续无名称分片不清除已有名称；按消息版本组装 argumentsText，完整 arguments 到达后不再追加 |
 | tool.call.updated | callId、status；可附 name、arguments、messageId、content、reason。状态为 REQUESTED/RUNNING/WAITING/SUCCEEDED/FAILED/CANCELLED/DENIED/UNKNOWN |
 | tool.call.progress | callId、content；追加公开进度，不作为模型工具结果；终态后的迟到进度不重新打开调用 |
@@ -259,15 +259,15 @@ Harness 恢复/媒体/事件能力、Executor 查询/取消/输出能力通过 `
 API-only Runtime 可以绑定 codec；未绑定的恢复返回 INCOMPATIBLE。原生 checkpoint 必须匹配
 harness/definitionVersion/stateVersion；公开协议可跨语言不意味着原生状态可跨 Harness 转换。
 
-| 错误 | 处理规则 |
-| --- | --- |
-| INVALID | 修正字段、类型、范围、分页游标或非法操作；不盲目重试 |
-| NOT_FOUND | Session/Thread/Turn/interaction 不存在于请求范围 |
-| CONFLICT | 状态、修订号、定义或幂等内容冲突；重新查询后决定下一操作 |
-| INCOMPATIBLE | 当前 Harness/codec/协议能力不支持；不降级转换或重跑副作用 |
-| CURSOR_EXPIRED | 取得一致快照及新 cursor 后继续；不是重新提交任务 |
-| UNAVAILABLE | 传输结果可能不确定；用相同 requestId/内容重试或查询，不能换 ID 猜测未受理 |
-| FENCED | 内部执行所有权失效；旧实例停止写入，不能当成用户重试任务 |
+| 错误           | 处理规则                                                                  |
+|----------------|---------------------------------------------------------------------------|
+| INVALID        | 修正字段、类型、范围、分页游标或非法操作；不盲目重试                      |
+| NOT_FOUND      | Session/Thread/Turn/interaction 不存在于请求范围                          |
+| CONFLICT       | 状态、修订号、定义或幂等内容冲突；重新查询后决定下一操作                  |
+| INCOMPATIBLE   | 当前 Harness/codec/协议能力不支持；不降级转换或重跑副作用                 |
+| CURSOR_EXPIRED | 取得一致快照及新 cursor 后继续；不是重新提交任务                          |
+| UNAVAILABLE    | 传输结果可能不确定；用相同 requestId/内容重试或查询，不能换 ID 猜测未受理 |
+| FENCED         | 内部执行所有权失效；旧实例停止写入，不能当成用户重试任务                  |
 
 Framework 不提供统一身份系统：认证失败/拒绝授权由 HTTP 宿主映射并阻止调用。
 持久状态是权威，通知只提示检查。Brain 启动扫描/租约接管与用户查询、SSE、resume 独立；
@@ -298,16 +298,16 @@ HarnessAdapter 使用 settle(context, status, error) 统一失败与取消的原
 类型化控制竞争、交互、恢复和生命周期在同一契约套件验收。共用向量是其他语言实现的对齐目标，
 当前提供 Java 语言绑定；其他实现需要独立验证同一契约。
 
-| Harness 接入项 | AgentScope Java 对应实现/约束 |
-| --- | --- |
-| 输入与结果 | DurableMessages ↔ Msg；最终公开 Message，原生对象不出现在用户协议 |
-| 调度身份 | ThreadKey 隔离状态；Durable Turn → turnId；原生 AgentRun 与 RunView 共用 runId，不启动 AgentSession dispatcher |
-| steer/inject | 调用级 AgentExecutionHost 在 reasoning 前应用并记录消费；用户输入保持 user 权限 |
-| 审批/手动工具 | pending interaction → 原子 respond → 原生恢复；自动工具不可由用户伪造 |
-| 工具交付 | checkpoint 与 intent 同事务；结果进入 Backend 后恢复原 Turn，原生 checkpoint 提交后 applied |
-| 恢复 | codec 校验版本/settled，恢复原生日志、状态及允许资源；不重跑不可核实效果 |
-| 公共投影 | input 原子发布一次，assistant attempt/revision 替代；不泄漏私有状态 |
-| 能力不足 | 明确拒绝；不得改写操作含义或伪造终态 |
+| Harness 接入项 | AgentScope Java 对应实现/约束                                                                                  |
+|----------------|----------------------------------------------------------------------------------------------------------------|
+| 输入与结果     | DurableMessages ↔ Msg；最终公开 Message，原生对象不出现在用户协议                                              |
+| 调度身份       | ThreadKey 隔离状态；Durable Turn → turnId；原生 AgentRun 与 RunView 共用 runId，不启动 AgentSession dispatcher |
+| steer/inject   | 调用级 AgentExecutionHost 在 reasoning 前应用并记录消费；用户输入保持 user 权限                                |
+| 审批/手动工具  | pending interaction → 原子 respond → 原生恢复；自动工具不可由用户伪造                                          |
+| 工具交付       | checkpoint 与 intent 同事务；结果进入 Backend 后恢复原 Turn，原生 checkpoint 提交后 applied                    |
+| 恢复           | codec 校验版本/settled，恢复原生日志、状态及允许资源；不重跑不可核实效果                                       |
+| 公共投影       | input 原子发布一次，assistant attempt/revision 替代；不泄漏私有状态                                            |
+| 能力不足       | 明确拒绝；不得改写操作含义或伪造终态                                                                           |
 
 ## 子委派协议
 
@@ -321,9 +321,9 @@ Thread，必须属于父 Session、使用相同 ThreadBinding。父 executionId 
 父暂停不传递给子任务；父取消只作用于映射中的子 Turn。取消先到时不解析目标、不创建 Thread/Turn。
 Run/Step 来源和固定请求摘要在整个流程中保持不变。跨 Session、同 Thread 和未完成委派的依赖环均被拒绝。
 
-| 事件 | 作用域与载荷 |
-| --- | --- |
-| tool.delegated | 父 Thread/Turn 及原始 Run/Step；executionId、callId、child |
+| 事件                             | 作用域与载荷                                                                  |
+|----------------------------------|-------------------------------------------------------------------------------|
+| tool.delegated                   | 父 Thread/Turn 及原始 Run/Step；executionId、callId、child                    |
 | tool.delegation.cancel_requested | 父作用域；executionId、callId、可空 child。只确认取消意图，不宣称子任务已停止 |
 | turn.delegated | 子 Thread/Turn，Run/Step 为空；载荷为父引用，不把父 Run 错当成子 Run |
 

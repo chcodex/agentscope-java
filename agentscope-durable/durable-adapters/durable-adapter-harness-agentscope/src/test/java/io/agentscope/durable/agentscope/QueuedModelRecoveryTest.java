@@ -19,6 +19,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.agentscope.core.ReActAgent;
@@ -30,6 +31,7 @@ import io.agentscope.core.model.ChatResponse;
 import io.agentscope.core.model.Model;
 import io.agentscope.core.tool.Tool;
 import io.agentscope.core.tool.Toolkit;
+import io.agentscope.durable.DurableException;
 import io.agentscope.durable.DurableJson;
 import io.agentscope.durable.DurableRuntime;
 import io.agentscope.durable.DurableTypes.LiveEvent;
@@ -172,6 +174,52 @@ class QueuedModelRecoveryTest {
             assertEquals(TurnStatus.FAILED, turn.status().status());
             assertTrue(turn.status().error().contains(request.callId()), turn.status()::toString);
             assertTrue(turn.status().error().contains("sequence " + missing));
+        }
+    }
+
+    @Test
+    @Timeout(30)
+    void failedReplyPreservesStreamedPartialAsCommittedFact() throws Exception {
+        var db = directory.resolve("partial.db");
+        var sent = new AtomicReference<QueuedModelRequest>();
+        try (var first = runtime(db, sent::set, LiveEvents.none(), Duration.ofMillis(800))) {
+            var turn = first.createSession(KEY, "agent").submit("request", "hello");
+            first.tick(THREAD);
+        }
+        try (var next =
+                runtime(
+                        db,
+                        QueuedModelRecoveryTest::unexpectedDispatch,
+                        LiveEvents.none(),
+                        Duration.ofHours(1))) {
+            var request = sent.get();
+            var turn = next.getSession(KEY).getTurn(request.turnId());
+            for (int seq = 0; seq <= 1; seq++) {
+                var signal = QueuedModelRequest.reply(request.callId(), seq, text("part"), false);
+                turn.signal(signal.id(), signal.key(), signal.value());
+            }
+            next.tick(THREAD);
+            assertEquals(TurnStatus.FAILED, turn.status().status());
+        }
+        // The failed model call keeps what it had streamed as one committed partial instead of
+        // per-token chunks, so a reconnect can render the stopped text without replaying deltas.
+        try (var reader = new TransactionalSessionBackend(JdbcRecordStore.sqlite(db))) {
+            var ended =
+                    reader.events(KEY, null, 1000).events().stream()
+                            .filter(e -> e.type().equals("model.call.ended"))
+                            .findFirst()
+                            .orElseThrow();
+            assertEquals("FAILED", ended.data().required("status").asText());
+            assertEquals("partpart", ended.data().path("partial").path("text").asText());
+            assertTrue(ended.data().path("partial").path("interrupted").asBoolean());
+            assertTrue(
+                    ended.data().hasNonNull("messageId"),
+                    "the partial must share the Step message id for preview reconciliation");
+            var chunks =
+                    reader.events(KEY, null, 1000).events().stream()
+                            .filter(e -> e.type().equals("message.delta"))
+                            .toList();
+            assertTrue(chunks.isEmpty(), "streaming deltas stay live-only on the abort path too");
         }
     }
 
@@ -382,7 +430,9 @@ class QueuedModelRecoveryTest {
                     events.stream().map(e -> e.data().path("text").asText()).toList());
             for (var event : events) {
                 assertEquals(1, event.data().required("attempt").asInt());
-                assertEquals(1, event.data().required("revision").asInt());
+                // Streaming deltas are live-only: replay carries no committed partial,
+                // so the resumed preview stays at revision 0.
+                assertEquals(0, event.data().required("revision").asInt());
             }
         }
     }
@@ -652,16 +702,21 @@ class QueuedModelRecoveryTest {
         try (var next = effectRuntime(db, resumed::set, false);
                 var operator = new TransactionalSessionBackend(JdbcRecordStore.sqlite(db))) {
             var turn = next.getSession(KEY).getTurn(sent.get().turnId());
-            var evidenceWait =
-                    new WaitCondition(
-                            WaitCondition.NATIVE_TOOL_RECONCILIATION, 0, List.of("effect-1"));
             long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
-            while (!evidenceWait.equals(turn.status().waiting()) && System.nanoTime() < until) {
+            var parked = turn.status().waiting();
+            while ((parked == null
+                            || !WaitCondition.NATIVE_TOOL_RECONCILIATION.equals(parked.key())
+                            || !List.of("effect-1").equals(parked.targets()))
+                    && System.nanoTime() < until) {
                 next.tick(THREAD);
                 Thread.sleep(25);
+                parked = turn.status().waiting();
             }
             assertEquals(TurnStatus.WAITING, turn.status().status());
-            assertEquals(evidenceWait, turn.status().waiting());
+            var waiting = turn.status().waiting();
+            assertEquals(WaitCondition.NATIVE_TOOL_RECONCILIATION, waiting.key());
+            assertEquals(List.of("effect-1"), waiting.targets());
+            assertTrue(waiting.deadline() > 0, "reconciliation waits carry a bounded deadline");
             assertEquals(ToolExecutionStatus.UNKNOWN, turn.getToolCall("effect-1").status());
             assertNull(turn.status().recovery());
             assertNull(resumed.get());
@@ -688,5 +743,159 @@ class QueuedModelRecoveryTest {
             assertEquals(TurnStatus.SUCCEEDED, turn.status().status());
             assertEquals(List.of("effect-1"), Files.readAllLines(directory.resolve("receipts")));
         }
+    }
+
+    @Test
+    @Timeout(120)
+    void unconfirmedNativeToolEscalatesToUnknownAfterBoundedWaits() throws Exception {
+        Path db = directory.resolve("effect-unknown.db");
+        var sent = new AtomicReference<QueuedModelRequest>();
+        try (var first = effectRuntime(db, sent::set, false)) {
+            var turn = first.createSession(KEY, "agent").submit("request", "record receipt");
+            first.tick(THREAD);
+            var call = ToolUseBlock.builder().id("effect-1").name("effect").input(Map.of()).build();
+            var result =
+                    QueuedModelRequest.reply(
+                            sent.get().callId(),
+                            0,
+                            ChatResponse.builder().content(List.of(call)).build(),
+                            true);
+            turn.signal(result.id(), result.key(), result.value());
+        }
+        runCrashingChild(db, "effect", 23);
+        assertEquals(List.of("effect-1"), Files.readAllLines(directory.resolve("receipts")));
+        var resumed = new AtomicReference<QueuedModelRequest>();
+        try (var next = effectRuntime(db, resumed::set, false);
+                var operator = new TransactionalSessionBackend(JdbcRecordStore.sqlite(db))) {
+            var turn = next.getSession(KEY).getTurn(sent.get().turnId());
+            long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            var parked = turn.status().waiting();
+            while ((parked == null
+                            || !WaitCondition.NATIVE_TOOL_RECONCILIATION.equals(parked.key()))
+                    && System.nanoTime() < until) {
+                next.tick(THREAD);
+                Thread.sleep(25);
+                parked = turn.status().waiting();
+            }
+            assertEquals(TurnStatus.WAITING, turn.status().status());
+            // Thirty mismatched evidences park thirty times without confirming effect-1; the
+            // thirty-first wakeup settles it as UNKNOWN instead of parking forever.
+            for (int i = 0; i < 30; i++) {
+                var decoy =
+                        ToolResultBlock.text("decoy")
+                                .withIdAndName("effect-other", "effect")
+                                .withState(ToolResultState.SUCCESS);
+                new NativeToolReconciliation(
+                                "verify-" + i, "audit:receipt/effect-1", List.of(decoy))
+                        .submit(operator, THREAD, turn.turnId());
+                next.tick(THREAD);
+                assertNull(next.lastFailure(THREAD));
+                if (turn.status().status().terminal()) break;
+            }
+            assertEquals(TurnStatus.SUCCEEDED, turn.status().status());
+            assertEquals(ToolExecutionStatus.UNKNOWN, turn.getToolCall("effect-1").status());
+            assertNull(resumed.get(), "UNKNOWN settlement must not re-invoke the model");
+            assertEquals(List.of("effect-1"), Files.readAllLines(directory.resolve("receipts")));
+            var texts = new java.util.ArrayList<String>();
+            var unknownCount = 0;
+            for (var event : operator.events(KEY, null, 1000).events()) {
+                if (!event.type().equals("tool.call.updated")) continue;
+                if (!event.data().path("status").asText().equals("UNKNOWN")) continue;
+                if (!event.data().path("callId").asText().equals("effect-1")) continue;
+                unknownCount++;
+                texts.addAll(event.data().findValuesAsText("text"));
+            }
+            assertTrue(unknownCount >= 1, "one UNKNOWN update for the unconfirmed call");
+            assertTrue(
+                    texts.stream().anyMatch(text -> text.contains("Outcome unknown")),
+                    "settled UNKNOWN results carry the model-facing warning");
+        }
+    }
+
+    @Test
+    @Timeout(120)
+    void lateEvidenceAfterUnknownSettlementCannotResurrectTheTurn() throws Exception {
+        Path db = directory.resolve("effect-unknown-late.db");
+        var sent = new AtomicReference<QueuedModelRequest>();
+        try (var first = effectRuntime(db, sent::set, false)) {
+            var turn = first.createSession(KEY, "agent").submit("request", "record receipt");
+            first.tick(THREAD);
+            var call = ToolUseBlock.builder().id("effect-1").name("effect").input(Map.of()).build();
+            var result =
+                    QueuedModelRequest.reply(
+                            sent.get().callId(),
+                            0,
+                            ChatResponse.builder().content(List.of(call)).build(),
+                            true);
+            turn.signal(result.id(), result.key(), result.value());
+        }
+        runCrashingChild(db, "effect", 23);
+        assertEquals(List.of("effect-1"), Files.readAllLines(directory.resolve("receipts")));
+        var resumed = new AtomicReference<QueuedModelRequest>();
+        try (var next = effectRuntime(db, resumed::set, false);
+                var operator = new TransactionalSessionBackend(JdbcRecordStore.sqlite(db))) {
+            var turn = next.getSession(KEY).getTurn(sent.get().turnId());
+            long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            var parked = turn.status().waiting();
+            while ((parked == null
+                            || !WaitCondition.NATIVE_TOOL_RECONCILIATION.equals(parked.key()))
+                    && System.nanoTime() < until) {
+                next.tick(THREAD);
+                Thread.sleep(25);
+                parked = turn.status().waiting();
+            }
+            assertEquals(TurnStatus.WAITING, turn.status().status());
+            // Exhaust the bounded wait with mismatched evidence so the turn settles UNKNOWN.
+            for (int i = 0; i < 30; i++) {
+                var decoy =
+                        ToolResultBlock.text("decoy")
+                                .withIdAndName("effect-other", "effect")
+                                .withState(ToolResultState.SUCCESS);
+                new NativeToolReconciliation(
+                                "verify-late-" + i, "audit:receipt/effect-1", List.of(decoy))
+                        .submit(operator, THREAD, turn.turnId());
+                next.tick(THREAD);
+                assertNull(next.lastFailure(THREAD));
+                if (turn.status().status().terminal()) break;
+            }
+            assertEquals(TurnStatus.SUCCEEDED, turn.status().status());
+            assertEquals(ToolExecutionStatus.UNKNOWN, turn.getToolCall("effect-1").status());
+            long updatesBefore = countToolUpdates(operator, turn.turnId());
+            // Genuine evidence arriving after the terminal settlement must be refused: the turn
+            // is over and its UNKNOWN outcome stands, with no resurrection, no duplicate
+            // settlement and no model re-invocation.
+            var lateProof =
+                    ToolResultBlock.text("verified receipt")
+                            .withIdAndName("effect-1", "effect")
+                            .withState(ToolResultState.SUCCESS);
+            var rejected =
+                    assertThrows(
+                            DurableException.class,
+                            () ->
+                                    new NativeToolReconciliation(
+                                                    "verify-late",
+                                                    "audit:receipt/effect-1",
+                                                    List.of(lateProof))
+                                            .submit(operator, THREAD, turn.turnId()));
+            assertEquals(DurableException.Code.CONFLICT, rejected.code());
+            next.tick(THREAD);
+            assertNull(next.lastFailure(THREAD));
+            assertEquals(TurnStatus.SUCCEEDED, turn.status().status());
+            assertEquals(ToolExecutionStatus.UNKNOWN, turn.getToolCall("effect-1").status());
+            assertNull(resumed.get(), "late evidence must not re-invoke the model");
+            assertEquals(updatesBefore, countToolUpdates(operator, turn.turnId()));
+            assertEquals(List.of("effect-1"), Files.readAllLines(directory.resolve("receipts")));
+        }
+    }
+
+    private static long countToolUpdates(TransactionalSessionBackend backend, String turnId)
+            throws Exception {
+        long count = 0;
+        for (var event : backend.events(KEY, null, 1000).events()) {
+            if (!event.type().equals("tool.call.updated")) continue;
+            if (!event.data().path("callId").asText().equals("effect-1")) continue;
+            count++;
+        }
+        return count;
     }
 }

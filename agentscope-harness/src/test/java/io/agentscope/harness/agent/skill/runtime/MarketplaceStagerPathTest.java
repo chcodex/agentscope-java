@@ -320,14 +320,17 @@ class MarketplaceStagerPathTest {
     void legacyNestedCacheIsRebuiltAndCollectedAfterGrace() throws IOException {
         Path workspace = temp.resolve("workspace");
         Path legacyNamespace = workspace.resolve(".skills-cache/_shared/git-owner/repo");
-        Files.createDirectories(legacyNamespace.resolve("valid"));
-        Files.writeString(legacyNamespace.resolve("valid/marker.txt"), "legacy");
-        Files.setLastModifiedTime(
-                legacyNamespace,
-                FileTime.from(
-                        Instant.now()
-                                .minus(MarketplaceStager.DEFAULT_ORPHAN_GRACE)
-                                .minusSeconds(1)));
+        Path legacySkill = legacyNamespace.resolve("valid");
+        Files.createDirectories(legacySkill);
+        Files.writeString(legacySkill.resolve("marker.txt"), "legacy");
+        // Orphan GC recognises skill directories by their SKILL.md, and every really
+        // staged skill contains one — so the legacy fixture must include it too.
+        Files.writeString(legacySkill.resolve("SKILL.md"), "---\nname: valid\n---\n");
+        Instant stale = Instant.now().minus(MarketplaceStager.DEFAULT_ORPHAN_GRACE).minusSeconds(1);
+        // GC measures staleness per skill directory, so backdate the skill dir itself;
+        // the namespace dir is backdated too since the whole legacy tree predates migration.
+        Files.setLastModifiedTime(legacySkill, FileTime.from(stale));
+        Files.setLastModifiedTime(legacyNamespace, FileTime.from(stale));
         AgentSkillRepository repo = repository("git-owner/repo");
 
         StageResult.Cached cached =

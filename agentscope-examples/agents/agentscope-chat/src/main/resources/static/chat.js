@@ -1,9 +1,10 @@
-import { activeTurn, pendingInteractions, items } from './chat-view.mjs';
+import {activeTurn, items, pendingInteractions} from './chat-view.mjs';
 
 const $ = id => document.getElementById(id);
 const labels = {
     RUNNING: '执行中', WAITING: '等待结果或补充', PAUSING: '正在暂停', PAUSED: '已暂停',
     CANCELLING: '正在取消', SUCCEEDED: '已完成', FAILED: '执行失败', CANCELLED: '已取消',
+    INTERRUPTED: '已中断',
     QUEUED: '已排队', CONVERTED: '已转为插话', GENERATING_ARGUMENTS: '生成参数中', REQUESTED: '等待执行',
     DISPATCHED: '已派发', SUCCESS: '已完成', ERROR: '执行失败', DENIED: '已拒绝', UNKNOWN: '结果待核实',
     SUSPENDED: '等待补充', INTERRUPTED: '已停止', completed: '已完成', generating: '生成中'

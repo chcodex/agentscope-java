@@ -15,10 +15,15 @@
  */
 package io.agentscope.core.journal;
 
+import io.agentscope.core.agent.AgentExecutionPosition;
+import io.agentscope.core.message.ToolResultBlock;
+import io.agentscope.core.state.TaskVerification;
 import java.time.Duration;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.NoSuchElementException;
+import java.util.Set;
 import java.util.function.BiFunction;
 
 /** Blocking persistence SPI; runtime integration schedules it off reactive event-loop threads. */
@@ -56,17 +61,46 @@ public interface ThreadJournal {
     }
 
     /**
-     * Snapshot of a recovery view. This does not contain all historical recovery facts, so core
-     * journal readers currently replay the full committed prefix even when a seed is supplied.
+     * Snapshot of a recovery view. A seed carries every recovery fact committed at or before
+     * {@code asOfSeq} that a suffix-only scan cannot reconstruct: tool outcomes and
+     * verifications/extensions folded into the checkpoint state, the message identities they
+     * used, applied inputs, run history, and the checkpoint chain link. Facts committed after
+     * {@code asOfSeq} are always read from the journal, so a seed never hides newer history.
+     * Backends return {@code null} when no checkpoint proves the required coverage, and readers
+     * fall back to a full replay.
      */
     record ProjectionSeed(
             long asOfSeq,
             String stateJson,
-            java.util.Set<String> uncertainToolCalls,
-            java.util.Set<String> activeRuns,
+            Set<String> uncertainToolCalls,
+            Set<String> activeRuns,
             String positionTurnId,
             String positionRunId,
-            io.agentscope.core.agent.AgentExecutionPosition executionPosition) {}
+            AgentExecutionPosition executionPosition,
+            String checkpointId,
+            Map<String, ToolResultBlock> results,
+            List<TaskVerification> verifications,
+            List<JournalEvent> extensions,
+            Set<String> messageIds,
+            Set<String> appliedInputs,
+            String latestRun,
+            String latestTurn,
+            boolean finished,
+            String interruptedStep,
+            String pendingModelCallId,
+            String modelAnswerId,
+            String modelContinuationTurnId) {
+        public ProjectionSeed {
+            uncertainToolCalls =
+                    uncertainToolCalls == null ? Set.of() : Set.copyOf(uncertainToolCalls);
+            activeRuns = activeRuns == null ? Set.of() : Set.copyOf(activeRuns);
+            results = results == null ? Map.of() : java.util.Map.copyOf(results);
+            verifications = verifications == null ? List.of() : List.copyOf(verifications);
+            extensions = extensions == null ? List.of() : List.copyOf(extensions);
+            messageIds = messageIds == null ? Set.of() : Set.copyOf(messageIds);
+            appliedInputs = appliedInputs == null ? Set.of() : Set.copyOf(appliedInputs);
+        }
+    }
 
     /** Recovery seed at the latest checkpoint, or {@code null} to replay from the beginning. */
     default ProjectionSeed projectionSeed() {

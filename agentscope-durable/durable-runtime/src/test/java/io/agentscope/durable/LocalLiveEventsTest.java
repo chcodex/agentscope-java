@@ -28,14 +28,68 @@ class LocalLiveEventsTest {
     private final SessionKey session = new SessionKey("tenant", "session");
 
     @Test
-    void aReconnectReplaysTheDeltasOfTheCurrentStep() throws Exception {
+    void aReconnectReplaysOneAccumulatedDeltaForTheCurrentStep() throws Exception {
         var events = new LocalLiveEvents();
         events.publish(live("main", "step-1", "a"));
         events.publish(live("main", "step-1", "b"));
 
         var received = new ArrayList<LiveEvent>();
         try (var ignored = events.subscribe(session, "main", received::add)) {
-            assertEquals(List.of("a", "b"), texts(received));
+            assertEquals(List.of("ab"), texts(received));
+        }
+    }
+
+    @Test
+    void aReconnectReceivesOneDeltaInsteadOfEveryToken() throws Exception {
+        var events = new LocalLiveEvents();
+        var expected = new StringBuilder();
+        for (int i = 0; i < 1200; i++) {
+            String text = "t" + i + ";";
+            expected.append(text);
+            events.publish(live("main", "step-1", text));
+        }
+
+        var received = new ArrayList<LiveEvent>();
+        try (var ignored = events.subscribe(session, "main", received::add)) {
+            assertEquals(1, received.size());
+            assertEquals(expected.toString(), received.get(0).data().path("text").asText());
+        }
+    }
+
+    @Test
+    void toolOutputPreviewsKeepABoundedTailWithoutAffectingText() throws Exception {
+        var events = new LocalLiveEvents();
+        events.publish(live("main", "step-1", "text"));
+        for (int index = 0; index < 200; index++) events.publish(output("main", "step-1", index));
+
+        var received = new ArrayList<LiveEvent>();
+        try (var ignored = events.subscribe(session, "main", received::add)) {
+            assertEquals(
+                    List.of("text"),
+                    received.stream()
+                            .filter(event -> "message.delta".equals(event.type()))
+                            .map(event -> event.data().path("text").asText())
+                            .toList());
+            var outputs =
+                    received.stream()
+                            .filter(event -> "tool.output.delta".equals(event.type()))
+                            .toList();
+            assertEquals(128, outputs.size());
+            assertEquals(72, outputs.get(0).data().path("offset").asInt());
+            assertEquals(199, outputs.get(127).data().path("offset").asInt());
+        }
+    }
+
+    @Test
+    void anOversizedBlockLosesItsPreviewWithoutAffectingOtherBlocks() throws Exception {
+        var events = new LocalLiveEvents();
+        for (int index = 0; index < 3; index++)
+            events.publish(live("main", "step-1", "x".repeat(100_000)));
+        events.publish(liveBlock("main", "step-1", "block-b", "keep"));
+
+        var received = new ArrayList<LiveEvent>();
+        try (var ignored = events.subscribe(session, "main", received::add)) {
+            assertEquals(List.of("keep"), texts(received));
         }
     }
 
@@ -168,5 +222,49 @@ class LocalLiveEventsTest {
                 1,
                 "message.delta",
                 DurableJson.value(Map.of("messageId", "message-1", "text", text)));
+    }
+
+    private LiveEvent liveBlock(String threadId, String stepId, String blockId, String text) {
+        return new LiveEvent(
+                "1",
+                "event-" + threadId + "-" + stepId + "-" + blockId + "-" + text.hashCode(),
+                session,
+                threadId,
+                "turn-1",
+                "run-1",
+                stepId,
+                1,
+                "message.delta",
+                DurableJson.value(
+                        Map.of("messageId", "message-1", "blockId", blockId, "text", text)));
+    }
+
+    private LiveEvent output(String threadId, String stepId, int offset) {
+        return new LiveEvent(
+                "1",
+                "output-" + threadId + "-" + offset,
+                session,
+                threadId,
+                "turn-1",
+                "run-1",
+                stepId,
+                1,
+                "tool.output.delta",
+                DurableJson.value(
+                        Map.of(
+                                "callId",
+                                "call-1",
+                                "executionId",
+                                "execution-1",
+                                "attempt",
+                                1,
+                                "revision",
+                                0,
+                                "offset",
+                                offset,
+                                "nextOffset",
+                                offset + 1,
+                                "data",
+                                "AA==")));
     }
 }

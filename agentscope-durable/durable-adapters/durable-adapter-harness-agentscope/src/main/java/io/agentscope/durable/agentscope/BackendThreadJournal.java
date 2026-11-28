@@ -24,6 +24,7 @@ import io.agentscope.core.journal.JournalEventTypes;
 import io.agentscope.core.journal.ThreadJournal;
 import io.agentscope.core.message.Msg;
 import io.agentscope.core.message.ToolResultBlock;
+import io.agentscope.core.message.ToolResultState;
 import io.agentscope.core.message.ToolUseBlock;
 import io.agentscope.core.model.ChatResponse;
 import io.agentscope.core.state.AgentState;
@@ -48,6 +49,7 @@ import io.agentscope.durable.DurableTypes.TokenUsage;
 import io.agentscope.durable.DurableTypes.ToolCall;
 import io.agentscope.durable.DurableTypes.TurnStatus;
 import io.agentscope.durable.DurableTypes.VerificationView;
+import io.agentscope.durable.DurableTypes.WaitCondition;
 import io.agentscope.durable.HarnessContext;
 import io.agentscope.durable.ToolBinding;
 import io.agentscope.durable.codec.agentscope.AgentScopeCheckpointCodec;
@@ -60,6 +62,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 
@@ -98,6 +101,13 @@ final class BackendThreadJournal implements ThreadJournal {
 
     private final Map<String, ModelCapture> captures =
             new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * Recovery seed is fixed at construction; later appends are covered by scanning to head().
+     */
+    private ProjectionSeed projectionCache;
+
+    private long projectionCacheFrom = -1;
 
     private ObjectNode cached;
 
@@ -149,10 +159,12 @@ final class BackendThreadJournal implements ThreadJournal {
         cached.putArray("events");
         cached.putObject("receipts");
         cached.put("lastCommit", checkpoint.path("lastCommit").asText(null));
-        // A state checkpoint alone does not capture pending interactions, finalization, message
-        // identities or the run history needed by consumers of this journal. Until a seed contains
-        // those facts, replay the complete prefix instead of treating a step boundary as proof.
-        baseSeq = 0;
+        // Anchor the replay at the latest quiet checkpoint instead of the Durable position: the
+        // position may sit inside an open step, whose start the suffix replay would then miss.
+        // Without a quiet point, replay fully.
+        long durPos = checkpoint.isNull() ? 0 : checkpoint.path("position").asLong(0);
+        JournalEvent anchor = quietCheckpoint(durPos);
+        baseSeq = anchor == null ? 0 : anchor.seq();
         long position = baseSeq;
         long lastCheckpoint = baseSeq;
         while (true) {
@@ -255,15 +267,14 @@ final class BackendThreadJournal implements ThreadJournal {
 
     /**
      * Forwards a streaming delta as soon as it is appended instead of waiting for the next batched
-     * commit. Presentation is best effort: failures stay out of the durable path, and a re-delivery
-     * repeats at most a preview that the committed {@code message.completed} replaces.
+     * commit. The attempt boundary is a stream-time fact: the adapter accumulates chunk usage as
+     * the model streams, so the reset must run when request_started is appended. Resetting when
+     * the batch commits would wipe chunks that streamed before a commit that batches
+     * request_started with its request_ended (append-merged attempts). Committed events never
+     * produce live output on the commit path, so each event is published exactly once.
      */
     @Override
     public void live(JournalEvent event) {
-        // Attempt boundaries are stream-time facts, not commit-time facts. The adapter accumulates
-        // chunk usage as the model streams, so the reset must run when request_started is appended.
-        // Resetting when the batch commits would wipe chunks that streamed before a commit that
-        // batches request_started with its request_ended (append-merged attempts).
         if ("model/request_started".equals(event.type())) {
             var capture = captures.get(String.valueOf(event.data().get("modelCallId")));
             if (capture != null) capture.nextAttempt();
@@ -368,6 +379,28 @@ final class BackendThreadJournal implements ThreadJournal {
             TurnStatus turnStatus,
             String terminalError,
             boolean invocationFacts) {
+        return commit(
+                writer,
+                batchId,
+                expected,
+                events,
+                turnStatus,
+                terminalError,
+                invocationFacts,
+                List.of(),
+                null);
+    }
+
+    private Head commit(
+            Writer writer,
+            String batchId,
+            long expected,
+            List<JournalEvent> events,
+            TurnStatus turnStatus,
+            String terminalError,
+            boolean invocationFacts,
+            List<EventInput> extraPublic,
+            WaitCondition waiting) {
         events = events.stream().map(this::capture).toList();
         var state = checkpoint();
         String digest =
@@ -422,8 +455,6 @@ final class BackendThreadJournal implements ThreadJournal {
                         DurableException.Code.CONFLICT, "Non-contiguous native batch");
             state.withArray("events").add(DurableJson.value(event));
             var data = event.data();
-            var modelEvent = modelEvent(event);
-            if (modelEvent != null) publicEvents.add(modelEvent);
             if ("verification/result".equals(event.type()) && data.get("verification") != null) {
                 var check =
                         JsonUtils.getJsonCodec()
@@ -549,6 +580,15 @@ final class BackendThreadJournal implements ThreadJournal {
             }
             var message = nextMessages.accept(event);
             if (message.durable() != null) publicEvents.add(message.durable());
+            // Resolve the Step message id against the machine that just accepted this event:
+            // a stopped partial must reconcile with the Step's live preview, and its request
+            // may share this very batch.
+            var modelEvent = modelEvent(event, nextMessages);
+            if (modelEvent != null) {
+                publicEvents.add(firstPublicEvent, modelEvent);
+            }
+            // Live previews are published when events are appended through the live mirror,
+            // never here: the commit path would otherwise deliver every delta a second time.
             publicEvents.addAll(nextToolEvents.accept(event, nextMessages));
             var toolPreview = nextToolEvents.preview(event, context.lease().epoch());
             if (toolPreview != null) liveEvents.add(toolPreview);
@@ -570,6 +610,9 @@ final class BackendThreadJournal implements ThreadJournal {
         Head result = head(state);
         state.withObject("/receipts")
                 .set(batchId, DurableJson.value(Map.of("digest", digest, "head", result)));
+        // Caller-supplied public events (for example the UNKNOWN tool updates of a parking
+        // commit) ride the same Backend transaction as the journal facts above.
+        publicEvents.addAll(extraPublic);
         var frame = context.frame();
         var applied =
                 frame.tools().stream()
@@ -603,7 +646,7 @@ final class BackendThreadJournal implements ThreadJournal {
                         consumed,
                         publicEvents,
                         turnStatus,
-                        null,
+                        waiting,
                         null,
                         terminalError,
                         new JournalAppend(
@@ -648,7 +691,7 @@ final class BackendThreadJournal implements ThreadJournal {
                 details);
     }
 
-    private static EventInput modelEvent(JournalEvent event) {
+    private static EventInput modelEvent(JournalEvent event, AgentScopeMessageEvents committed) {
         String type =
                 switch (event.type()) {
                     case "request/prepared" -> "model.call.started";
@@ -671,6 +714,21 @@ final class BackendThreadJournal implements ThreadJournal {
             data.put("status", nativeData.required("status").asText().toUpperCase(Locale.ROOT));
             data.put("endedAt", event.occurredAt());
             data.put("usage", usage(nativeData.get("usage")));
+            // A stopped model call carries the assembled partial as one committed fact so a
+            // reconnect can render it without replaying per-token deltas. The Step message id
+            // lets the client reconcile it with the live preview it may already have shown.
+            var outcome = nativeData.path(ModelCapture.OUTCOME);
+            String partial = outcome.path("partial").path("text").asText(null);
+            if (partial != null && !partial.isEmpty()) {
+                String callId = nativeData.path("modelCallId").asText(null);
+                String messageId = callId == null ? null : committed.stepMessageId(callId);
+                var stopped = new LinkedHashMap<String, Object>();
+                stopped.put("text", partial);
+                stopped.put("interrupted", true);
+                data.put("partial", stopped);
+                // Top-level like message.completed so preview tracking reconciles by Step.
+                if (messageId != null) data.put("messageId", messageId);
+            }
         } else {
             data.put("requestId", nativeData.required("requestId").asText());
             if (type.equals("model.request.started")) {
@@ -742,6 +800,324 @@ final class BackendThreadJournal implements ThreadJournal {
         return context.lease().thread().threadId();
     }
 
+    private record WindowScan(JournalEvent anchor, List<JournalEvent> entries, long from) {}
+
+    /**
+     * Fetches the replay window ending at {@code upper} and finds the latest quiet checkpoint in
+     * it. Pages backward (up to four extra pages) until a full checkpoint is covered, so the
+     * seed can account for every fact the anchor state does not fold. Returns a null anchor when
+     * no quiet point proves the required coverage.
+     */
+    private WindowScan scanWindow(long upper) {
+        if (upper == 0) return new WindowScan(null, List.of(), 0);
+        long from = Math.max(0, upper - 500);
+        var entries = new ArrayList<JournalEvent>();
+        for (var entry : context.journal(from, (int) (upper - from)))
+            entries.add(DurableJson.convert(entry, JournalEvent.class));
+        for (int page = 0; page < 4 && from > 0 && !hasFullCheckpoint(entries); page++) {
+            long next = Math.max(0, from - 1000);
+            var prefix = new ArrayList<JournalEvent>();
+            for (var entry : context.journal(next, (int) (from - next)))
+                prefix.add(DurableJson.convert(entry, JournalEvent.class));
+            prefix.addAll(entries);
+            entries = prefix;
+            from = next;
+        }
+        int start = 0;
+        if (from > 0) {
+            // A window that starts mid-step cannot prove there is no earlier open step/tool.
+            // Resume from the latest step-boundary checkpoint inside the window, or replay fully.
+            start = -1;
+            for (int i = 0; i < entries.size(); i++) {
+                var candidate = entries.get(i);
+                if ("state/checkpoint".equals(candidate.type())
+                        && "step_boundary".equals(candidate.data().get("reason"))) start = i + 1;
+            }
+            if (start < 0) return new WindowScan(null, entries, from);
+        }
+        var openSteps = new java.util.LinkedHashSet<String>();
+        var openTools = new java.util.LinkedHashSet<String>();
+        JournalEvent quiet = null;
+        // Open/close tracking runs from the window start, but only checkpoints at or after the
+        // step boundary can anchor: a close observed post-start proves nothing about a request
+        // that predates the window, while an open that predates it must block every later
+        // checkpoint. Tracking from 0 (instead of start) keeps pre-boundary opens visible, so a
+        // checkpoint after their resolution is still judged non-quiet.
+        for (int i = 0; i < entries.size(); i++) {
+            var event = entries.get(i);
+            var data = event.data();
+            switch (event.type()) {
+                case "step/start" -> {
+                    if (data.get("stepId") instanceof String id) openSteps.add(id);
+                }
+                case "step/end" -> {
+                    if (data.get("stepId") instanceof String id
+                            && Set.of("completed", "continued").contains(data.get("status")))
+                        openSteps.remove(id);
+                }
+                case "tool/requested" -> {
+                    if (data.get("call") instanceof Map<?, ?> call
+                            && call.get("id") instanceof String id) openTools.add(id);
+                }
+                case "interaction/requested" -> {
+                    if (data.get("requestId") != null)
+                        openTools.add(String.valueOf(data.get("requestId")));
+                }
+                case "action/end" -> {
+                    if (data.get("toolCallId") instanceof String id) openTools.remove(id);
+                }
+                case "tool/result" -> {
+                    // State application closes what action/end left open: synthetic settlement
+                    // results never pass through action/end, so without this their callIds
+                    // would pin openTools forever and no checkpoint could ever anchor again.
+                    var message = data.get("message");
+                    if (message != null) {
+                        try {
+                            var resultMessage =
+                                    JsonUtils.getJsonCodec().convertValue(message, Msg.class);
+                            for (var result : resultMessage.getContentBlocks(ToolResultBlock.class))
+                                openTools.remove(result.getId());
+                        } catch (RuntimeException ignored) {
+                            // Conservative: an unreadable result must not fake a quiet anchor.
+                        }
+                    }
+                }
+                case "interaction/resolved" -> {
+                    if (data.get("requestId") != null)
+                        openTools.remove(String.valueOf(data.get("requestId")));
+                }
+                case "state/checkpoint" -> {
+                    if (i >= start && openSteps.isEmpty() && openTools.isEmpty()) quiet = event;
+                }
+                default -> {}
+            }
+        }
+        return new WindowScan(quiet, entries, from);
+    }
+
+    private static boolean hasFullCheckpoint(List<JournalEvent> entries) {
+        for (var event : entries) if (isFullCheckpoint(event)) return true;
+        return false;
+    }
+
+    private static boolean isFullCheckpoint(JournalEvent event) {
+        return "state/checkpoint".equals(event.type())
+                && !"step_boundary".equals(event.data().get("reason"))
+                && !"periodic".equals(event.data().get("reason"));
+    }
+
+    private JournalEvent quietCheckpoint(long upper) {
+        return scanWindow(upper).anchor();
+    }
+
+    @Override
+    public ProjectionSeed projectionSeed(long fromSeq) {
+        if (projectionCache != null && projectionCacheFrom == fromSeq) return projectionCache;
+        long upper = Math.min(fromSeq, head().seq());
+        if (upper == 0) return null;
+        var scan = scanWindow(upper);
+        JournalEvent anchor = scan.anchor();
+        if (anchor == null) return null;
+        var entries = scan.entries();
+        // Facts the anchor state does not fold must be replayed from the latest full checkpoint.
+        int full = -1;
+        for (int i = 0; i < entries.size(); i++) {
+            var event = entries.get(i);
+            if (event.seq() <= anchor.seq() && isFullCheckpoint(event)) full = i;
+        }
+        if (full < 0) return null;
+        var data = anchor.data();
+        Object stateJson = data.get("stateJson");
+        if (stateJson == null) return null;
+        // The checkpoint event itself carries the run that wrote it. Scanning must stop at the
+        // checkpoint: a run/start after it belongs to a later run, not to this snapshot.
+        String positionRunId = anchor.executionRunId();
+        if (positionRunId == null) {
+            for (int i = entries.size() - 1; i >= 0 && entries.get(i).seq() < anchor.seq(); i--) {
+                var event = entries.get(i);
+                if ("run/start".equals(event.type())) {
+                    positionRunId = event.executionRunId();
+                    break;
+                }
+            }
+        }
+        // Without a run identity the seeded view cannot answer positionRunId(); that is the case
+        // for pause/fork paths whose run is only known from Durable state, so replay fully.
+        if (positionRunId == null) return null;
+        var uncertain = new java.util.LinkedHashSet<String>();
+        var activeRuns = new java.util.LinkedHashSet<String>();
+        for (var tool : context.frame().tools()) {
+            if (!tool.result().state().terminal()) {
+                uncertain.add(tool.request().call().callId());
+                var origin = tool.request().call().origin();
+                if (origin != null) activeRuns.add(origin.runId());
+            }
+        }
+        activeRuns.add(positionRunId);
+        var results = new LinkedHashMap<String, ToolResultBlock>();
+        var verifications = new ArrayList<TaskVerification>();
+        var extensions = new ArrayList<JournalEvent>();
+        var messageIds = new java.util.LinkedHashSet<String>();
+        var appliedInputs = new java.util.LinkedHashSet<String>();
+        String latestRun = null;
+        String latestTurn = null;
+        boolean finished = false;
+        String interruptedStep = null;
+        for (int i = full + 1; i < entries.size() && entries.get(i).seq() <= anchor.seq(); i++) {
+            var event = entries.get(i);
+            var facts = event.data();
+            switch (event.type()) {
+                case "state/checkpoint",
+                        "state/initialized",
+                        "migration/baseline",
+                        "state/restored" -> {
+                    verifications.clear();
+                    extensions.clear();
+                    if (Set.of("state/initialized", "state/restored").contains(event.type())) {
+                        latestRun = null;
+                        latestTurn = null;
+                        interruptedStep = null;
+                        appliedInputs.clear();
+                        finished = true;
+                    }
+                    messageIds.addAll(historyMessageIds(event));
+                }
+                case "verification/result" -> {
+                    if (facts.get("verification") != null)
+                        verifications.add(
+                                JsonUtils.getJsonCodec()
+                                        .convertValue(
+                                                facts.get("verification"), TaskVerification.class));
+                    messageIds.addAll(historyMessageIds(event));
+                }
+                case "tool/dispatch" -> {
+                    uncertain.add((String) facts.get("toolCallId"));
+                    messageIds.addAll(historyMessageIds(event));
+                }
+                case "action/end" -> {
+                    if (facts.get("result") != null) {
+                        String id = (String) facts.get("toolCallId");
+                        var result =
+                                JsonUtils.getJsonCodec()
+                                        .convertValue(facts.get("result"), ToolResultBlock.class);
+                        if (result.hasUnknownOutcome()
+                                || uncertain.contains(id)
+                                        && result.getState() == ToolResultState.INTERRUPTED) {
+                            uncertain.add(id);
+                            results.remove(id);
+                        } else {
+                            uncertain.remove(id);
+                            results.put(id, result);
+                        }
+                    }
+                    messageIds.addAll(historyMessageIds(event));
+                }
+                case "run/start" -> {
+                    latestRun = event.executionRunId();
+                    latestTurn = event.turnId();
+                    finished = false;
+                    activeRuns.add(event.executionRunId());
+                    messageIds.addAll(historyMessageIds(event));
+                }
+                case "run/end" -> {
+                    activeRuns.remove(event.executionRunId());
+                    if (Objects.equals(latestRun, event.executionRunId()))
+                        finished =
+                                Set.of("completed", "cancelled").contains(facts.get("status"))
+                                        || "MAX_ITERATIONS".equals(facts.get("reason"))
+                                        || "ALL_TOOLS_DENIED".equals(facts.get("reason"));
+                    messageIds.addAll(historyMessageIds(event));
+                }
+                case "input/applied" -> {
+                    if (facts.get("inputId") != null)
+                        appliedInputs.add(String.valueOf(facts.get("inputId")));
+                    messageIds.addAll(historyMessageIds(event));
+                }
+                case "step/start" -> {
+                    interruptedStep = (String) facts.get("stepId");
+                    messageIds.addAll(historyMessageIds(event));
+                }
+                case "step/end" -> {
+                    if (Set.of("completed", "continued").contains(facts.get("status")))
+                        interruptedStep = null;
+                    messageIds.addAll(historyMessageIds(event));
+                }
+                case "recovery/applied" -> {
+                    Object interrupted = facts.get("interruptedRuns");
+                    if (interrupted instanceof List<?> ids) ids.forEach(activeRuns::remove);
+                    Object resolved = facts.get("resolvedToolCallIds");
+                    if (resolved instanceof List<?> ids) ids.forEach(uncertain::remove);
+                    messageIds.addAll(historyMessageIds(event));
+                }
+                default -> {
+                    if (!JournalEventTypes.BUILTIN.contains(event.type())) extensions.add(event);
+                    messageIds.addAll(historyMessageIds(event));
+                }
+            }
+        }
+        // The anchor state already folds every message recorded at or before it.
+        try {
+            var restored = AgentState.fromJsonString(String.valueOf(stateJson));
+            for (var message : restored.getContext()) messageIds.add(message.getId());
+        } catch (RuntimeException ignored) {
+            // A state that cannot be restored cannot seed recovery either.
+            return null;
+        }
+        io.agentscope.core.agent.AgentExecutionPosition position =
+                data.get("executionPosition") == null
+                        ? null
+                        : JsonUtils.getJsonCodec()
+                                .convertValue(
+                                        data.get("executionPosition"),
+                                        io.agentscope.core.agent.AgentExecutionPosition.class);
+        projectionCacheFrom = fromSeq;
+        projectionCache =
+                new ProjectionSeed(
+                        anchor.seq(),
+                        String.valueOf(stateJson),
+                        uncertain,
+                        activeRuns,
+                        anchor.turnId(),
+                        positionRunId,
+                        position,
+                        data.get("checkpointId") instanceof String id ? id : null,
+                        results,
+                        verifications,
+                        extensions,
+                        messageIds,
+                        appliedInputs,
+                        latestRun,
+                        latestTurn,
+                        finished,
+                        interruptedStep,
+                        data.get("pendingModelCallId") instanceof String id ? id : null,
+                        data.get("modelAnswerId") instanceof String id ? id : null,
+                        anchor.turnId());
+        return projectionCache;
+    }
+
+    /**
+     * Message identities one journal event carries, mirroring the recorder's history view.
+     */
+    private List<String> historyMessageIds(JournalEvent event) {
+        return historyMessages(event).stream().map(Msg::getId).toList();
+    }
+
+    private List<Msg> historyMessages(JournalEvent event) {
+        if (Set.of("state/initialized", "migration/baseline", "state/restored", "state/checkpoint")
+                .contains(event.type())) {
+            String state = (String) materialize(event).data().get("stateJson");
+            return state == null ? List.of() : AgentState.fromJsonString(state).getContext();
+        }
+        if (Set.of("message/user", "message/assistant", "tool/result", "run/output")
+                .contains(event.type())) {
+            Object value = event.data().get("message");
+            if (value != null)
+                return List.of(JsonUtils.getJsonCodec().convertValue(value, Msg.class));
+        }
+        return List.of();
+    }
+
     @Override
     public long checkpointGap() {
         return checkpointGap;
@@ -777,6 +1153,38 @@ final class BackendThreadJournal implements ThreadJournal {
     /** Native settlement and the terminal task outcome share one Backend transaction. */
     synchronized void append(
             String turnId, List<Map.Entry<String, Object>> facts, TurnStatus status, String error) {
+        append(turnId, facts, status, error, null);
+    }
+
+    /**
+     * Settlement variant that attributes message-like facts to the interrupted native Run.
+     * A null {@code executionRunId} keeps the historical writer-owner marker; message facts
+     * need the real Run so their public events rejoin the interrupted Run instead of naming
+     * a Run that was never created.
+     */
+    synchronized void append(
+            String turnId,
+            List<Map.Entry<String, Object>> facts,
+            TurnStatus status,
+            String error,
+            String executionRunId) {
+        appendWaiting(turnId, facts, status, error, List.of(), null, executionRunId);
+    }
+
+    /**
+     * Journal facts plus caller-supplied public events plus the waiting condition share one
+     * Backend transaction. Parking a native-tool wait must not split the marker from the
+     * WAITING status: a journal-only commit would clear the wait, and a status-only commit
+     * would lose the attempt count on crash.
+     */
+    synchronized void appendWaiting(
+            String turnId,
+            List<Map.Entry<String, Object>> facts,
+            TurnStatus status,
+            String error,
+            List<EventInput> extraPublic,
+            WaitCondition waiting,
+            String executionRunId) {
         var writer = acquire("adapter:" + UUID.randomUUID(), Duration.ofMinutes(1));
         try {
             long sequence = head().seq();
@@ -789,7 +1197,7 @@ final class BackendThreadJournal implements ThreadJournal {
                                 ++sequence,
                                 System.currentTimeMillis(),
                                 fact.getKey(),
-                                writer.owner(),
+                                executionRunId != null ? executionRunId : writer.owner(),
                                 turnId,
                                 true,
                                 JsonUtils.getJsonCodec().toJson(fact.getValue())));
@@ -800,7 +1208,9 @@ final class BackendThreadJournal implements ThreadJournal {
                     events,
                     status,
                     error,
-                    false);
+                    false,
+                    extraPublic,
+                    waiting);
         } finally {
             release(writer);
         }

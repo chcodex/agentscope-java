@@ -15,32 +15,51 @@
  */
 package io.agentscope.durable;
 
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.agentscope.durable.DurableTypes.LiveEvent;
 import io.agentscope.durable.DurableTypes.SessionKey;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.Consumer;
 
 /**
  * In-process best-effort fan-out. A slow listener must hand work off immediately.
  *
- * <p>Besides fan-out this keeps a small replay window per Thread: the most recent streaming
- * deltas of the current Step. A reconnect within the same process can therefore resume the
- * partial message without every delta being committed; the committed {@code message.completed}
- * remains the only source of truth and replaces the preview.
+ * <p>Besides fan-out this keeps a small replay window per Thread so a reconnect within the same
+ * process can resume the current Step. Deltas of one block are merged into a single accumulated
+ * entry: the window holds the text once instead of the whole sequence, so a reconnect receives the
+ * current text in one frame and then continues with the live deltas. The committed
+ * {@code message.completed} remains the only source of truth and replaces the preview.
+ *
+ * <p>Accounting uses character counts rather than serializing payloads, so recording an event
+ * costs one map lookup and one append on the streaming thread.
  */
 final class LocalLiveEvents implements LiveEvents {
-    /** Upper bound of replayed deltas per Thread; protects memory for long Steps. */
-    private static final int RECENT_EVENTS = 2000;
+    /**
+     * Maximum accumulated characters per Thread. Exceeding it drops the offending block instead of
+     * truncating: a preview that starts mid-message would be rendered as if it were the whole text.
+     */
+    private static final int RECENT_CHARS = 256 * 1024;
 
-    /** Upper bound of replayed payload size per Thread. */
-    private static final int RECENT_BYTES = 1 << 20;
+    /**
+     * Bounded ring of tool output previews; older chunks are dropped and text is unaffected.
+     */
+    private static final int TOOL_OUTPUT_EVENTS = 128;
+
+    /**
+     * Maximum Base64 payload kept per tool output preview. Tool outputs are opaque chunks, so
+     * unlike text blocks they cannot be accumulated; an oversized single frame is dropped instead
+     * of retained, keeping the per-thread replay window bounded while live fan-out is unaffected.
+     */
+    private static final int TOOL_OUTPUT_MAX_CHARS = 64 * 1024;
 
     private static final int SEEN_EVENTS = 4096;
 
@@ -106,17 +125,34 @@ final class LocalLiveEvents implements LiveEvents {
 
     private final List<Listener> listeners = new CopyOnWriteArrayList<>();
 
-    /** Recent deltas of the current Step, keyed by Session and Thread. */
-    private final Map<ThreadRef, Recent> recent = new LinkedHashMap<>();
-
-    private final Object recentLock = new Object();
+    private final Map<ThreadRef, Recent> recent = new ConcurrentHashMap<>();
 
     private record ThreadRef(SessionKey session, String threadId) {}
 
+    /**
+     * One accumulated block, materialized as a single delta when a subscriber reconnects.
+     */
+    private static final class Accumulated {
+        private final LiveEvent template;
+        private final StringBuilder text = new StringBuilder();
+        private int chars;
+
+        private Accumulated(LiveEvent template) {
+            this.template = template;
+        }
+
+        private void append(String value) {
+            text.append(value);
+            chars += value.length();
+        }
+    }
+
     private static final class Recent {
         private String stepId;
-        private final ArrayDeque<LiveEvent> events = new ArrayDeque<>();
-        private int bytes;
+        private final Map<String, Accumulated> blocks = new LinkedHashMap<>();
+        private final ArrayDeque<LiveEvent> toolOutput = new ArrayDeque<>();
+        private final Set<String> dropped = new LinkedHashSet<>();
+        private int chars;
     }
 
     @Override
@@ -146,40 +182,47 @@ final class LocalLiveEvents implements LiveEvents {
     public AutoCloseable subscribe(
             SessionKey session, String threadId, Consumer<LiveEvent> callback) {
         Objects.requireNonNull(session, "session");
+        Objects.requireNonNull(callback, "callback");
         if (threadId == null) {
-            var listener = new Listener(Objects.requireNonNull(callback), session, null);
+            var listener = new Listener(callback, session, null);
             listeners.add(listener);
             return () -> listeners.remove(listener);
         }
-        var listener = new Listener(Objects.requireNonNull(callback), session, threadId);
-        // Mark the listener as replaying, snapshot and register under the lock, then deliver the
-        // replay outside it. Live frames that publish during the replay are queued by the
-        // listener and delivered after the snapshot, so a slow callback cannot stall other
-        // publishers, subscribers or cleanup.
+        var listener = new Listener(callback, session, threadId);
+        // Snapshot and register under the same monitor that guards the window, then deliver the
+        // replay outside it. Frames published during the replay are queued by the listener, so a
+        // slow callback cannot stall other publishers and no delta is lost or repeated.
         listener.beginReplay();
         List<LiveEvent> replay;
-        synchronized (recentLock) {
+        // Snapshot and register atomically: remember() takes the same monitor when it creates
+        // and fills a window, so a frame published between the lookup and the registration is
+        // either in the replay or queued by the already-replaying listener — never lost.
+        synchronized (recent) {
             var buffer = recent.get(new ThreadRef(session, threadId));
-            replay = buffer == null ? List.of() : List.copyOf(buffer.events);
-            listeners.add(listener);
-        }
-        try {
-            for (var event : replay) {
-                try {
-                    listener.deliver(event);
-                } catch (RuntimeException ignored) {
-                    // Replay is best effort; the durable path is unaffected.
+            if (buffer == null) {
+                replay = List.of();
+                listeners.add(listener);
+            } else {
+                synchronized (buffer) {
+                    replay = snapshot(buffer);
+                    listeners.add(listener);
                 }
             }
-        } finally {
+        }
+        for (var event : replay) {
             try {
-                listener.endReplay();
-            } catch (RuntimeException failed) {
-                // The caller's callback failed while the queued live frames were drained. Fail
-                // the subscription instead of returning a handle for a listener that was removed.
-                listeners.remove(listener);
-                throw failed;
+                listener.deliver(event);
+            } catch (RuntimeException ignored) {
+                // Replay is best effort; the durable path is unaffected.
             }
+        }
+        try {
+            listener.endReplay();
+        } catch (RuntimeException failed) {
+            // The caller's callback failed while the queued live frames were drained. Fail the
+            // subscription instead of returning a handle for a listener that was removed.
+            listeners.remove(listener);
+            throw failed;
         }
         return () -> listeners.remove(listener);
     }
@@ -191,40 +234,44 @@ final class LocalLiveEvents implements LiveEvents {
     @Override
     public void clear(SessionKey session, String threadId) {
         if (session == null || threadId == null) return;
-        synchronized (recentLock) {
-            recent.remove(new ThreadRef(session, threadId));
-        }
+        recent.remove(new ThreadRef(session, threadId));
     }
 
     private void remember(LiveEvent event) {
+        if (event.threadId() == null) return;
         try {
-            synchronized (recentLock) {
+            // Same monitor as subscribe(): creation and fill are atomic against snapshot and
+            // registration, so a concurrent subscriber can neither miss this frame nor see a
+            // half-filled window.
+            synchronized (recent) {
                 var buffer =
                         recent.computeIfAbsent(
                                 new ThreadRef(event.session(), event.threadId()),
                                 ignored -> new Recent());
-                // Only a real Step transition replaces the preview window. Run-scoped live events
-                // (for example x.result_metadata) carry a null stepId and must not wipe the
-                // current Step's deltas.
-                if (buffer.stepId != null
-                        && event.stepId() != null
-                        && !buffer.stepId.equals(event.stepId())) {
-                    buffer.events.clear();
-                    buffer.bytes = 0;
-                }
-                if (event.stepId() != null) buffer.stepId = event.stepId();
-                int size = utf8Length(event);
-                // A single oversized preview must not bypass the memory bound. Its committed
-                // counterpart still reaches the client, so dropping the preview is safe.
-                if (size > RECENT_BYTES) return;
-                buffer.events.addLast(event);
-                buffer.bytes += size;
-                if (buffer.events.size() > RECENT_EVENTS || buffer.bytes > RECENT_BYTES) {
-                    // Replaying the tail of a truncated preview would start mid-message (the
-                    // message.started frame is gone). Drop the window instead: the committed
-                    // message is the complete source and a resume starts a fresh preview.
-                    buffer.events.clear();
-                    buffer.bytes = 0;
+                synchronized (buffer) {
+                    // Only a real Step transition replaces the window. Run-scoped live events carry
+                    // a
+                    // null stepId and must not wipe the current Step's preview.
+                    if (buffer.stepId != null
+                            && event.stepId() != null
+                            && !buffer.stepId.equals(event.stepId())) {
+                        buffer.blocks.clear();
+                        buffer.toolOutput.clear();
+                        buffer.dropped.clear();
+                        buffer.chars = 0;
+                    }
+                    if (event.stepId() != null) buffer.stepId = event.stepId();
+                    switch (event.type()) {
+                        case "message.delta", "tool.arguments.delta" -> accumulate(buffer, event);
+                        case "tool.output.delta" -> {
+                            if (event.data().path("data").asText("").length()
+                                    > TOOL_OUTPUT_MAX_CHARS) break;
+                            buffer.toolOutput.addLast(event);
+                            if (buffer.toolOutput.size() > TOOL_OUTPUT_EVENTS)
+                                buffer.toolOutput.removeFirst();
+                        }
+                        default -> {}
+                    }
                 }
             }
         } catch (RuntimeException ignored) {
@@ -232,7 +279,64 @@ final class LocalLiveEvents implements LiveEvents {
         }
     }
 
-    private static int utf8Length(LiveEvent event) {
-        return event.data().toString().getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+    private static void accumulate(Recent buffer, LiveEvent event) {
+        String key = blockKey(event);
+        String text = event.data().path("text").asText("");
+        if (text.isEmpty()) return;
+        var block = buffer.blocks.get(key);
+        if (block == null) {
+            if (buffer.dropped.contains(key)) return;
+            block = new Accumulated(event);
+            buffer.blocks.put(key, block);
+        }
+        if (buffer.chars + text.length() > RECENT_CHARS) {
+            // Starting a preview mid-message would show a fragment as if it were the whole text.
+            buffer.blocks.remove(key);
+            buffer.dropped.add(key);
+            buffer.chars -= block.chars;
+            return;
+        }
+        block.append(text);
+        buffer.chars += text.length();
+    }
+
+    private static String blockKey(LiveEvent event) {
+        var data = event.data();
+        if ("tool.arguments.delta".equals(event.type()))
+            return "arguments:" + data.path("toolCallId").asText("");
+        return event.type()
+                + ":"
+                + data.path("messageId").asText("")
+                + ":"
+                + data.path("blockId").asText("");
+    }
+
+    /**
+     * One accumulated delta per block followed by the retained tool output previews.
+     */
+    private static List<LiveEvent> snapshot(Recent buffer) {
+        var replay = new ArrayList<LiveEvent>(buffer.blocks.size() + buffer.toolOutput.size());
+        for (var entry : buffer.blocks.entrySet())
+            replay.add(materialize(entry.getKey(), entry.getValue()));
+        replay.addAll(buffer.toolOutput);
+        return replay;
+    }
+
+    private static LiveEvent materialize(String key, Accumulated block) {
+        var data = (ObjectNode) block.template.data().deepCopy();
+        data.put("text", block.text.toString());
+        return new LiveEvent(
+                block.template.schemaVersion(),
+                // A distinct id: the live stream never emitted this frame, so per-listener
+                // deduplication must not discard the replay.
+                "replay:" + key + ":" + block.chars,
+                block.template.session(),
+                block.template.threadId(),
+                block.template.turnId(),
+                block.template.runId(),
+                block.template.stepId(),
+                block.template.occurredAt(),
+                block.template.type(),
+                data);
     }
 }

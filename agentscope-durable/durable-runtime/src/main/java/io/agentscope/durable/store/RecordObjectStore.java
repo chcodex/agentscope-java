@@ -59,20 +59,78 @@ public final class RecordObjectStore implements ObjectStore {
                                     DurableException.Code.CONFLICT, "Immutable object changed");
                         return null;
                     }
-                    for (int offset = 0; offset < bytes.length; offset += CHUNK_BYTES) {
-                        byte[] chunk =
-                                Arrays.copyOfRange(
-                                        bytes,
-                                        offset,
-                                        Math.min(bytes.length, offset + CHUNK_BYTES));
-                        tx.put(
-                                "chunk:" + offset / CHUNK_BYTES,
-                                DurableJson.value(Base64.getEncoder().encodeToString(chunk)));
-                    }
-                    tx.put("", DurableJson.value(reference));
+                    for (var part : objectParts(reference, bytes).entrySet())
+                        tx.put(part.getKey(), part.getValue());
                     return null;
                 });
         return reference;
+    }
+
+    /**
+     * Batch form of {@link #put}: one model call externalizes several payloads (for example its
+     * request/prepared and model/end entries), and the plain path costs one transaction per
+     * object. This collapses a batch into one {@link RecordStore#writeScopes} call, so a store
+     * sharing one connection commits every object at once.
+     *
+     * <p>Semantics match {@link #put}: an existing object with a different header still fails
+     * with {@code CONFLICT}, already stored objects are skipped without rewriting them, and
+     * references keep the input order (duplicates included).
+     *
+     * <p>Single-writer only, like the rest of the journal: object keys carry the SHA-256 of
+     * their bytes, so two batches racing on the same key necessarily carry identical bytes and
+     * converge (last-writer-wins is a no-op). A different header under the same key would imply
+     * store corruption or a hash collision, both outside the threat model, and still surfaces
+     * as {@code CONFLICT} on the check-then-write path.
+     */
+    public java.util.List<Reference> putAll(String scope, java.util.List<byte[]> contents) {
+        if (contents.isEmpty()) return java.util.List.of();
+        if (contents.size() == 1) return java.util.List.of(put(scope, contents.get(0)));
+        var references = new java.util.ArrayList<Reference>(contents.size());
+        for (byte[] bytes : contents) references.add(ObjectStore.reference(id(), scope, bytes));
+        var distinct = new java.util.LinkedHashMap<String, Reference>(references.size());
+        var payloads = new java.util.LinkedHashMap<String, byte[]>(references.size());
+        for (int i = 0; i < references.size(); i++)
+            if (distinct.putIfAbsent(references.get(i).key(), references.get(i)) == null)
+                payloads.put(references.get(i).key(), contents.get(i));
+        var keys = new java.util.ArrayList<String>(distinct.size());
+        for (var key : distinct.keySet()) keys.add("object:" + key);
+        var stored = records.readScopes(keys, java.util.List.of(""));
+        var writes = new java.util.LinkedHashMap<String, java.util.Map<String, JsonNode>>();
+        for (var entry : distinct.entrySet()) {
+            var reference = entry.getValue();
+            var existing = stored.get("object:" + entry.getKey());
+            var header = existing == null ? null : existing.get("");
+            if (header != null) {
+                if (!reference.equals(DurableJson.convert(header, Reference.class)))
+                    throw new DurableException(
+                            DurableException.Code.CONFLICT, "Immutable object changed");
+                continue;
+            }
+            writes.put(
+                    "object:" + entry.getKey(),
+                    objectParts(reference, payloads.get(entry.getKey())));
+        }
+        if (!writes.isEmpty()) records.writeScopes(writes);
+        return java.util.List.copyOf(references);
+    }
+
+    /**
+     * Header plus chunk parts of one object. All parts of {@link #put} and {@link #putAll}
+     * commit inside a single transaction per scope, so a large object never costs one
+     * transaction per chunk.
+     */
+    private static java.util.LinkedHashMap<String, JsonNode> objectParts(
+            Reference reference, byte[] bytes) {
+        var parts = new java.util.LinkedHashMap<String, JsonNode>();
+        for (int offset = 0; offset < bytes.length; offset += CHUNK_BYTES) {
+            byte[] chunk =
+                    Arrays.copyOfRange(bytes, offset, Math.min(bytes.length, offset + CHUNK_BYTES));
+            parts.put(
+                    "chunk:" + offset / CHUNK_BYTES,
+                    DurableJson.value(Base64.getEncoder().encodeToString(chunk)));
+        }
+        parts.put("", DurableJson.value(reference));
+        return parts;
     }
 
     public byte[] read(Reference reference) {

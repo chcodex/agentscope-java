@@ -35,6 +35,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Properties;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
 
@@ -178,22 +179,7 @@ public final class JdbcRecordStore implements RecordStore {
         try (Connection c = connect()) {
             c.setAutoCommit(false);
             try {
-                try (var s =
-                        c.prepareStatement(
-                                "INSERT INTO durable_records(record_key,payload) VALUES (?,NULL) ON"
-                                        + " CONFLICT(record_key) DO NOTHING")) {
-                    s.setString(1, key);
-                    s.executeUpdate();
-                }
-                try (var s =
-                        c.prepareStatement(
-                                "SELECT payload FROM durable_records WHERE record_key=?"
-                                        + (dialect == Dialect.POSTGRESQL ? " FOR UPDATE" : ""))) {
-                    s.setString(1, key);
-                    try (var rs = s.executeQuery()) {
-                        if (!rs.next()) throw new SQLException("Missing transaction record");
-                    }
-                }
+                ensureLocked(c, key);
                 T result = action.apply(new Parts(c, key, time(c)));
                 c.commit();
                 return result;
@@ -207,6 +193,81 @@ public final class JdbcRecordStore implements RecordStore {
             }
         } catch (SQLException e) {
             throw unavailable(e);
+        }
+    }
+
+    /**
+     * One connection and one commit for every scope. {@code RecordObjectStore#putAll} batches a
+     * model call's externalized payloads (request/prepared plus model/end) into a single call
+     * here; without the override each scope would cost its own transaction.
+     */
+    @Override
+    public void writeScopes(Map<String, Map<String, JsonNode>> writes) {
+        if (writes == null || writes.isEmpty()) return;
+        // Sorted so concurrent multi-scope batches always lock rows in the same global
+        // order; opposite orders would deadlock two batches sharing scopes (AB-BA).
+        var scopes = new TreeMap<String, Map<String, JsonNode>>();
+        for (var entry : writes.entrySet()) {
+            if (entry.getKey() == null || entry.getKey().length() > 512)
+                throw new IllegalArgumentException("Invalid record key");
+            if (entry.getValue() == null || entry.getValue().isEmpty()) continue;
+            scopes.put(entry.getKey(), entry.getValue());
+        }
+        if (scopes.isEmpty()) return;
+        if (scopes.size() == 1) {
+            var only = scopes.entrySet().iterator().next();
+            transaction(
+                    only.getKey(),
+                    tx -> {
+                        for (var part : only.getValue().entrySet())
+                            tx.put(part.getKey(), part.getValue());
+                        return null;
+                    });
+            return;
+        }
+        try (Connection c = connect()) {
+            c.setAutoCommit(false);
+            try {
+                long now = time(c);
+                for (var scope : scopes.entrySet()) {
+                    ensureLocked(c, scope.getKey());
+                    var parts = new Parts(c, scope.getKey(), now);
+                    for (var part : scope.getValue().entrySet())
+                        parts.put(part.getKey(), part.getValue());
+                }
+                c.commit();
+            } catch (SQLException | RuntimeException | Error e) {
+                try {
+                    c.rollback();
+                } catch (SQLException rollback) {
+                    e.addSuppressed(rollback);
+                }
+                throw e;
+            }
+        } catch (SQLException e) {
+            throw unavailable(e);
+        }
+    }
+
+    /**
+     * Creates the record row when absent and holds it for this transaction.
+     */
+    private void ensureLocked(Connection c, String key) throws SQLException {
+        try (var s =
+                c.prepareStatement(
+                        "INSERT INTO durable_records(record_key,payload) VALUES (?,NULL) ON"
+                                + " CONFLICT(record_key) DO NOTHING")) {
+            s.setString(1, key);
+            s.executeUpdate();
+        }
+        try (var s =
+                c.prepareStatement(
+                        "SELECT payload FROM durable_records WHERE record_key=?"
+                                + (dialect == Dialect.POSTGRESQL ? " FOR UPDATE" : ""))) {
+            s.setString(1, key);
+            try (var rs = s.executeQuery()) {
+                if (!rs.next()) throw new SQLException("Missing transaction record");
+            }
         }
     }
 

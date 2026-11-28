@@ -168,12 +168,12 @@ public final class InvocationRecorder {
         this.writer = log.acquire(runId, LEASE);
         try {
             var history = new InvocationHistory(turnId);
-            // Recorder startup also validates all run identities and tracks historical message
-            // identities. ProjectionSeed does not carry those facts, so it cannot replace this
-            // full scan even when a backend supplies one for state-only reads.
+            var seed = log.projectionSeed();
+            if (seed != null) history.seedFrom(seed);
             initial =
                     JournalProjection.read(
                             log,
+                            seed,
                             event -> {
                                 if (runId.equals(event.executionRunId()))
                                     throw new JournalException(
@@ -186,6 +186,14 @@ public final class InvocationRecorder {
                                 for (var message : ThreadHistory.messages(log, event))
                                     recordedMessages.add(message.getId());
                             });
+            if (seed != null) {
+                // The seeded projection skipped the historical events that carried these ids.
+                if (initial.restore() != null)
+                    for (var message : initial.restore().getContext())
+                        recordedMessages.add(message.getId());
+                for (var id : seed.messageIds()) recordedMessages.add(id);
+                if (seed.checkpointId() != null) lastCheckpointId = seed.checkpointId();
+            }
             // The gap is journal-wide, not per-invocation: without this, short invocations
             // that append fewer than CHECKPOINT_EVERY events would let the interval grow
             // unbounded across invocations.
@@ -232,6 +240,19 @@ public final class InvocationRecorder {
 
         private InvocationHistory(String turnId) {
             this.turnId = turnId;
+        }
+
+        /**
+         * Restores the history view from a complete seed instead of replaying its prefix.
+         */
+        private void seedFrom(ThreadJournal.ProjectionSeed seed) {
+            this.latestRun = seed.latestRun();
+            this.latestTurn = seed.latestTurn();
+            this.finished = seed.finished();
+            this.interruptedStep = seed.interruptedStep();
+            this.pendingModelCallId = seed.pendingModelCallId();
+            this.modelAnswerId = seed.modelAnswerId();
+            this.modelContinuationTurnId = seed.modelContinuationTurnId();
         }
 
         private void accept(JournalEvent event) {

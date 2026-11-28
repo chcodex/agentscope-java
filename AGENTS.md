@@ -13,7 +13,8 @@ AI coding instructions for AgentScope Java.
 
 ### Simplicity first
 
-- Write the minimum code that solves the task; avoid unrequested features, abstractions, dependencies, and configuration.
+- Write the minimum code that solves the task; avoid unrequested features, abstractions, dependencies, and
+  configuration.
 - Add error handling only for failures supported by the contract or a realistic execution path.
 - Keep the diff small; trim it when it grows unnecessarily large.
 
@@ -80,7 +81,9 @@ AI coding instructions for AgentScope Java.
 - Use temporary directories and portable paths; do not use real credentials or provider services.
 - Do not weaken assertions for Windows-only flakes; mirror the production guard in the test.
 - Keep English and Chinese docs aligned; follow `.editorconfig`.
-- Keep repository documentation user-facing. Store research/development plans, implementation and test progress, validation reports, and data used solely for test acceptance outside the source repository, under `~/agentscope-3/docs`. Do not add these as repository documentation or unpublished site drafts.
+- Keep repository documentation user-facing. Store research/development plans, implementation and test progress,
+  validation reports, and data used solely for test acceptance outside the source repository, under
+  `~/agentscope-3/docs`. Do not add these as repository documentation or unpublished site drafts.
 
 ## 4. Commands
 
@@ -89,6 +92,11 @@ AI coding instructions for AgentScope Java.
 - Run from the repository root with `-T1C`.
 - Module tests: `mvn -T1C -pl <module> -am test`.
 - One test: add `-Dtest=<TestClass>` and confirm it ran.
+- Never drop `-am`, even for single-test runs: without it the reactor resolves
+  sibling modules from `~/.m2`, and stale installed SNAPSHOT jars silently replace
+  working-tree code — this has twice produced phantom failures misdiagnosed as
+  regressions. If a failure contradicts the working-tree code, reinstall the
+  dependency modules first, then rerun with `-am`.
 - Format: `mvn -T1C -pl <module> -am spotless:check`.
 - Full check: `mvn -B -T1C clean verify`.
 

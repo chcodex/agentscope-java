@@ -58,7 +58,6 @@ class DaytonaSandboxHydrateCommandTest {
     private static DaytonaSandboxState state() {
         DaytonaSandboxState state = new DaytonaSandboxState();
         state.setSandboxId("sandbox-1");
-        state.setWorkspaceRoot("/workspace");
         WorkspaceSpec workspaceSpec = new WorkspaceSpec();
         workspaceSpec.setRoot("/workspace");
         state.setWorkspaceSpec(workspaceSpec);

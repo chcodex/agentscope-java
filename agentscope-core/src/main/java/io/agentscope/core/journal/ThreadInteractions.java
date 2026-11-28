@@ -51,8 +51,13 @@ public final class ThreadInteractions {
     public static Map<String, JournalEvent> pending(ThreadJournal log) {
         long upper = log.head().seq();
         var result = new LinkedHashMap<String, JournalEvent>();
-        // A state checkpoint does not imply that earlier requests were resolved.
-        for (var event : log.scanMetadata(0, upper)) {
+        // A quiet anchor proves no interaction was left open before it: the anchor scan
+        // tracks opens from the window start but only accepts checkpoints at or after the
+        // step boundary, so an in-window request without a resolve blocks anchor selection.
+        // Requests older than the scan window are out of scope here; a genuinely pending
+        // request pins its turn (execute parks instead of committing), so the journal cannot
+        // advance thousands of entries past it while it stays open.
+        for (var event : log.scanMetadata(log.replayStart(), upper)) {
             if (event.type().equals("interaction/requested"))
                 result.put(String.valueOf(event.data().get("requestId")), event);
             if (event.type().equals("interaction/resolved"))

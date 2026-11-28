@@ -49,24 +49,37 @@ public record JournalProjection(
     }
 
     /**
-     * Reads a recovery view. The current seed does not contain all facts needed to reconstruct
-     * tool outcomes and run history, so it is not used as a replay boundary. The observer sees
-     * the complete committed prefix, just as in {@link #read(ThreadJournal, Consumer)}.
+     * Incremental form: starts at {@code seed.asOfSeq()} with the seeded state instead of
+     * replaying the whole committed prefix. The seed carries every pre-seed recovery fact
+     * (tool results, verifications, extensions, message and run history); only facts committed
+     * after the seed are scanned. With a null seed it is exactly {@link #read(ThreadJournal,
+     * Consumer)}. The observer sees only post-seed events; readers pre-seed their history views
+     * from the seed before scanning.
      */
     public static JournalProjection read(
             ThreadJournal log, ThreadJournal.ProjectionSeed seed, Consumer<JournalEvent> observer) {
-        long cursor = 0;
-        String state = null;
+        long cursor = seed == null ? 0 : seed.asOfSeq();
+        String state = seed == null ? null : seed.stateJson();
         JournalEvent checkpoint = null;
-        String positionTurnId = null;
-        String positionRunId = null;
-        var uncertain = new LinkedHashSet<String>();
-        var runs = new LinkedHashSet<String>();
-        var results = new LinkedHashMap<String, ToolResultBlock>();
-        var verifications = new ArrayList<io.agentscope.core.state.TaskVerification>();
-        var extensions = new ArrayList<JournalEvent>();
+        String positionTurnId = seed == null ? null : seed.positionTurnId();
+        String positionRunId = seed == null ? null : seed.positionRunId();
+        var uncertain =
+                seed == null
+                        ? new LinkedHashSet<String>()
+                        : new LinkedHashSet<>(seed.uncertainToolCalls());
+        var runs =
+                seed == null ? new LinkedHashSet<String>() : new LinkedHashSet<>(seed.activeRuns());
+        var results =
+                seed == null
+                        ? new LinkedHashMap<String, ToolResultBlock>()
+                        : new LinkedHashMap<>(seed.results());
+        var verifications =
+                seed == null
+                        ? new ArrayList<io.agentscope.core.state.TaskVerification>()
+                        : new ArrayList<>(seed.verifications());
+        var extensions =
+                seed == null ? new ArrayList<JournalEvent>() : new ArrayList<>(seed.extensions());
         long upper = log.head().seq();
-        // Checkpoints can repeat an earlier state and do not fold all recovery facts into it.
         for (var event : log.scanMetadata(cursor, upper)) {
             JournalEventTypes.validate(event);
             observer.accept(event);
@@ -129,7 +142,7 @@ public record JournalProjection(
             }
             cursor = event.seq();
         }
-        AgentExecutionPosition position = null;
+        AgentExecutionPosition position = seed == null ? null : seed.executionPosition();
         if (checkpoint != null) {
             var data = log.materialize(checkpoint).data();
             state = (String) data.get("stateJson");

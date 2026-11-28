@@ -17,6 +17,7 @@ package io.agentscope.core.journal;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.spy;
 
@@ -25,6 +26,7 @@ import io.agentscope.core.state.AgentState;
 import io.agentscope.core.util.JsonUtils;
 import java.time.Duration;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import org.junit.jupiter.api.Test;
 
@@ -38,6 +40,30 @@ class JournalProjectionIncrementalTest {
 
     private static String quoted(String value) {
         return JsonUtils.getJsonCodec().toJson(value);
+    }
+
+    private static ThreadJournal.ProjectionSeed seedOf(JournalProjection base) {
+        return new ThreadJournal.ProjectionSeed(
+                base.asOfSeq(),
+                base.stateJson(),
+                base.uncertainToolCalls(),
+                base.activeRuns(),
+                base.positionTurnId(),
+                base.positionRunId(),
+                base.executionPosition(),
+                null,
+                Map.of(),
+                List.of(),
+                List.of(),
+                Set.of(),
+                Set.of(),
+                null,
+                null,
+                false,
+                null,
+                null,
+                null,
+                null);
     }
 
     @Test
@@ -60,15 +86,7 @@ class JournalProjectionIncrementalTest {
                                         + ",\"projectorVersion\":1,\"reason\":\"test\"}")));
 
         var base = JournalProjection.read(log);
-        var seed =
-                new ThreadJournal.ProjectionSeed(
-                        base.asOfSeq(),
-                        base.stateJson(),
-                        base.uncertainToolCalls(),
-                        base.activeRuns(),
-                        base.positionTurnId(),
-                        base.positionRunId(),
-                        base.executionPosition());
+        var seed = seedOf(base);
 
         log.commit(
                 writer,
@@ -88,6 +106,47 @@ class JournalProjectionIncrementalTest {
         assertEquals(full.positionTurnId(), incremental.positionTurnId());
         assertEquals(full.positionRunId(), incremental.positionRunId());
         assertEquals(full.executionPosition(), incremental.executionPosition());
+    }
+
+    @Test
+    void seededProjectionRestoresExecutionPositionWithoutNewCheckpoint() {
+        var log = new InMemoryThreadJournalStore().open(new ThreadKey("u", "a", "s", "main"), null);
+        var writer = log.acquire("w", Duration.ofMinutes(2));
+        String stateJson = AgentState.builder().build().toJson();
+        String positionJson =
+                JsonUtils.getJsonCodec()
+                        .toJson(Map.of("reasoningIteration", 3, "actingIteration", 2));
+        log.commit(
+                writer,
+                "b1",
+                0,
+                List.of(
+                        event(1, "run/start", "r1", "{}"),
+                        event(
+                                2,
+                                "state/checkpoint",
+                                "r1",
+                                "{\"stateJson\":"
+                                        + quoted(stateJson)
+                                        + ",\"projectorVersion\":1,\"reason\":\"test\","
+                                        + "\"executionPosition\":"
+                                        + positionJson
+                                        + "}")));
+
+        var base = JournalProjection.read(log);
+        var seed = seedOf(base);
+        // A suffix without any new checkpoint must keep the seeded execution position instead
+        // of dropping it: the recorder resumes from the restored position, not from zero.
+        log.commit(
+                writer,
+                "b2",
+                2,
+                List.of(event(3, "tool/dispatch", "r1", "{\"toolCallId\":\"call-1\"}")));
+
+        var incremental = JournalProjection.read(log, seed, ignored -> {});
+        assertEquals(base.executionPosition(), incremental.executionPosition());
+        assertEquals(3, incremental.executionPosition().reasoningIteration());
+        assertEquals(2, incremental.executionPosition().actingIteration());
     }
 
     @Test
@@ -115,12 +174,37 @@ class JournalProjectionIncrementalTest {
         log.release(writer);
         doReturn(
                         new ThreadJournal.ProjectionSeed(
-                                3, stateJson, Set.of(), Set.of(), "t", "used-run", null))
+                                3,
+                                stateJson,
+                                Set.of(),
+                                Set.of(),
+                                "t",
+                                "used-run",
+                                null,
+                                "parent",
+                                Map.of(),
+                                List.of(),
+                                List.of(),
+                                Set.of(),
+                                Set.of(),
+                                null,
+                                null,
+                                false,
+                                null,
+                                null,
+                                null,
+                                null))
                 .when(log)
                 .projectionSeed();
+        var writer2 = log.acquire("w2", Duration.ofMinutes(2));
+        try {
+            log.commit(writer2, "batch-2", 3, List.of(event(4, "run/start", "other-run", "{}")));
+        } finally {
+            log.release(writer2);
+        }
 
         assertThrows(
-                JournalException.class, () -> new InvocationRecorder(log, "t", "used-run", null));
+                JournalException.class, () -> new InvocationRecorder(log, "t", "other-run", null));
         var recorder = new InvocationRecorder(log, "t", "new-run", null);
         try {
             recorder.start(List.of(), AgentState.builder().build()).block(Duration.ofSeconds(5));
@@ -135,7 +219,7 @@ class JournalProjectionIncrementalTest {
     }
 
     @Test
-    void pendingInteractionsIncludeRequestsBeforeReplayStart() {
+    void pendingInteractionsAfterReplayStartStayVisible() {
         var log =
                 spy(
                         new InMemoryThreadJournalStore()
@@ -153,7 +237,9 @@ class JournalProjectionIncrementalTest {
                                 "{\"requestId\":\"call\",\"kind\":\"external_execution\"}"),
                         event(2, "run/end", "run", "{\"status\":\"suspended\"}")));
         log.release(writer);
-        doReturn(2L).when(log).replayStart();
+        // A quiet anchor proves nothing was left open before it, so only the suffix after
+        // the replay start can hold a pending request.
+        doReturn(0L).when(log).replayStart();
         assertEquals(
                 "call",
                 ThreadInteractions.continuationRequests(log, Set.of("call"))
@@ -162,8 +248,12 @@ class JournalProjectionIncrementalTest {
                         .get("requestId"));
     }
 
+    /**
+     * A seed is a contract: the backend guarantees every pre-seed fact is folded into it.
+     * Here the dispatch precedes the seed, so a seeded read must still report it as uncertain.
+     */
     @Test
-    void incompleteSeedCannotHideAnActiveRunOrUncertainTool() {
+    void seededReadKeepsPreSeedUncertainToolsFromTheSeed() {
         var log = new InMemoryThreadJournalStore().open(new ThreadKey("u", "a", "s", "main"), null);
         var writer = log.acquire("w", Duration.ofMinutes(2));
         String state = AgentState.builder().build().toJson();
@@ -181,12 +271,32 @@ class JournalProjectionIncrementalTest {
                                 "{\"stateJson\":"
                                         + quoted(state)
                                         + ",\"projectorVersion\":1,\"reason\":\"step_boundary\"}")));
-        var incomplete =
-                new ThreadJournal.ProjectionSeed(3, state, Set.of(), Set.of(), "t", "run", null);
+        var seed =
+                new ThreadJournal.ProjectionSeed(
+                        3,
+                        state,
+                        Set.of("call"),
+                        Set.of("run"),
+                        "t",
+                        "run",
+                        null,
+                        null,
+                        Map.of(),
+                        List.of(),
+                        List.of(),
+                        Set.of(),
+                        Set.of(),
+                        "run",
+                        "t",
+                        false,
+                        null,
+                        null,
+                        null,
+                        null);
         var seen = new java.util.ArrayList<JournalEvent>();
-        var result = JournalProjection.read(log, incomplete, seen::add);
+        var result = JournalProjection.read(log, seed, seen::add);
         assertEquals(Set.of("run"), result.activeRuns());
         assertEquals(Set.of("call"), result.uncertainToolCalls());
-        assertEquals(3, seen.size());
+        assertTrue(seen.isEmpty());
     }
 }

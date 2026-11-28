@@ -75,7 +75,7 @@ class ModelWorkerTest {
     @TempDir Path directory;
 
     @Test
-    void directModelUsesTheExistingJournalSizeThreshold() {
+    void directModelKeepsChunksLiveOnly() {
         var longText = "x".repeat(17_000);
         var model =
                 new Model() {
@@ -106,7 +106,10 @@ class ModelWorkerTest {
                 assertEquals(
                         "small-" + longText,
                         turn.status().output().path("content").get(0).path("text").asText());
-                assertEquals(List.of(false, true), journalChunkReferences(records, objects));
+                // Chunks stay live-only previews: the committed model/response carries the
+                // identity and model/end the outcome, so even a 17k chunk leaves no journal
+                // reference behind. Replaying them would duplicate the live deltas.
+                assertTrue(journalChunkReferences(records, objects).isEmpty());
             }
         }
     }
@@ -245,10 +248,10 @@ class ModelWorkerTest {
                 assertNotNull(second);
                 assertEquals(1, providerCalls.get());
                 assertTrue(local.inputs.isEmpty());
-                var chunkReferences = journalChunkReferences(readerRecords, readerObjects);
-                assertTrue(chunkReferences.size() >= 2);
-                boolean external = !"sqlite".equals(outputBackend);
-                assertTrue(chunkReferences.stream().allMatch(reference -> reference == external));
+                // Batches persist in the worker ledger (asserted above via query/readOutput),
+                // not in the journal: chunks stay live-only previews, so the journal holds no
+                // chunk references to externalize.
+                assertTrue(journalChunkReferences(readerRecords, readerObjects).isEmpty());
                 if (!"sqlite".equals(outputBackend)) {
                     readerRecords.transaction(
                             SESSION.storageKey(),

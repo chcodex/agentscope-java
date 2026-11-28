@@ -146,6 +146,31 @@ public interface RecordStore extends AutoCloseable {
         return result;
     }
 
+    /**
+     * Writes the same part set to several independent scopes in as few round trips as the store
+     * supports. Externalized objects live in one scope each, so uploading the entries of one
+     * commit (for example a model call's request/prepared and model/end payloads) would
+     * otherwise cost one transaction per object.
+     *
+     * <p>The default keeps per-scope transactional semantics so existing stores stay correct;
+     * stores sharing one connection should override it to commit all scopes at once. A null
+     * part value deletes that part, matching {@link Transaction#put} implementations that
+     * treat null as a deletion.
+     */
+    default void writeScopes(Map<String, Map<String, JsonNode>> writes) {
+        if (writes == null || writes.isEmpty()) return;
+        for (var scope : writes.entrySet()) {
+            var parts = scope.getValue();
+            if (parts == null || parts.isEmpty()) continue;
+            transaction(
+                    scope.getKey(),
+                    tx -> {
+                        for (var part : parts.entrySet()) tx.put(part.getKey(), part.getValue());
+                        return null;
+                    });
+        }
+    }
+
     default <T> T transact(String key, Function<Record, Update<T>> action) {
         return transaction(
                 key,

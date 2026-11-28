@@ -58,12 +58,21 @@ public interface InterruptedRunHandler {
         }
     }
 
-    /** Terminal status used when the host declines to resume. */
+    /**
+     * Terminal status used when the host declines to resume.
+     *
+     * <p>CANCELLED means an operator stopped the Turn. INTERRUPTED means the previous host went
+     * away (crash, lease loss, shutdown) without a user cancellation; the Turn ends instead of
+     * resuming, but nothing claims the unfinished work failed. FAILED keeps its meaning: the work
+     * itself reported an error.
+     */
     record Settlement(TurnStatus status, String reason) {
         public Settlement {
-            if (status != TurnStatus.CANCELLED && status != TurnStatus.FAILED) {
+            if (status != TurnStatus.CANCELLED
+                    && status != TurnStatus.FAILED
+                    && status != TurnStatus.INTERRUPTED) {
                 throw new IllegalArgumentException(
-                        "Settlement requires TurnStatus.CANCELLED or TurnStatus.FAILED");
+                        "Settlement requires TurnStatus.CANCELLED, FAILED, or INTERRUPTED");
             }
             Objects.requireNonNull(reason, "reason");
         }

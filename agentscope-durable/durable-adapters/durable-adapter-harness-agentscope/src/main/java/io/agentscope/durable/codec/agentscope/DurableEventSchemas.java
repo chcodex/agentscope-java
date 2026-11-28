@@ -32,6 +32,7 @@ public final class DurableEventSchemas {
     public static final String TOOL_POLICY = "durable/tool_policy";
     public static final String TOOL_NORMALIZED = "durable/tool_normalized";
     public static final String RESULT_METADATA = "durable/result_metadata";
+    public static final String WAIT_RECONCILING = "durable/wait_reconciling";
 
     public static void register(JournalEventCodecRegistry registry) {
         registry.register(
@@ -122,6 +123,30 @@ public final class DurableEventSchemas {
         registry.register(
                 RESULT_METADATA,
                 new JournalEventCodecRegistry.Codec(data -> {}, (state, data) -> {}));
+        // One native-reconciliation wait episode: attempt and window start for the bounded
+        // UNKNOWN settlement. `deadline` is optional so markers written before it existed
+        // still validate; readers treat a missing deadline as already expired. Recovery
+        // replays it like any other marker; the wait condition itself stays on the Backend
+        // commit.
+        registry.register(
+                WAIT_RECONCILING,
+                new JournalEventCodecRegistry.Codec(
+                        data -> {
+                            if (!(data.get("startedAt") instanceof Number started)
+                                    || started.longValue() < 0)
+                                throw new IllegalArgumentException("Missing wait start");
+                            if (!(data.get("attempt") instanceof Number attempt)
+                                    || attempt.intValue() < 1)
+                                throw new IllegalArgumentException("Missing wait attempt");
+                            if (!(data.get("pending") instanceof List<?>))
+                                throw new IllegalArgumentException("Missing waited tool calls");
+                            Object deadline = data.get("deadline");
+                            if (deadline != null
+                                    && (!(deadline instanceof Number)
+                                            || ((Number) deadline).longValue() < 0))
+                                throw new IllegalArgumentException("Invalid wait deadline");
+                        },
+                        (state, data) -> {}));
     }
 
     private DurableEventSchemas() {}

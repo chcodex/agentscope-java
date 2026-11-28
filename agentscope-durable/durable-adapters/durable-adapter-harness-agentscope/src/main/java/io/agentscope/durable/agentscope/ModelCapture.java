@@ -126,7 +126,17 @@ final class ModelCapture {
                             .finishReason(finishReason)
                             .build();
             outcome.put("responses", List.of(freeze(response)));
-        } else outcome.put("responses", List.of());
+        } else {
+            // A stopped Run keeps what it had streamed so far as one committed fact instead of
+            // per-token chunks: reconnect renders the partial as stopped without replaying deltas.
+            var message = content.buildFinalMessage();
+            String text = message == null ? "" : message.getTextContent();
+            if (!text.isEmpty()) {
+                outcome.put("interrupted", true);
+                outcome.put("partial", Map.of("text", text));
+            }
+            outcome.put("responses", List.of());
+        }
         return freeze(outcome);
     }
 

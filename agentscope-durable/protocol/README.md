@@ -29,13 +29,13 @@ deployment choices and recovery limits.
 
 ## Authoritative files and packaging
 
-| File | Purpose |
-| --- | --- |
-| [schema.json](schema.json) | JSON Schema 2020-12 definitions for requests, responses, domain records, checkpoints, public events, and execution messages |
-| [vectors.json](vectors.json) | Canonical digests, execution identities, valid contract values, and invalid JSON or number cases |
-| [projection-vector.json](projection-vector.json) | Message/tool projection and replay, including sequences above JavaScript's safe integer range |
-| [user-workflows.json](user-workflows.json) | Shared user-operation and lifecycle fixtures |
-| [public-interaction-contract.en.md](public-interaction-contract.en.md) | Detailed public operations, controls, state conditions, messages, and event semantics |
+| File                                                                   | Purpose                                                                                                                     |
+|------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------|
+| [schema.json](schema.json)                                             | JSON Schema 2020-12 definitions for requests, responses, domain records, checkpoints, public events, and execution messages |
+| [vectors.json](vectors.json)                                           | Canonical digests, execution identities, valid contract values, and invalid JSON or number cases                            |
+| [projection-vector.json](projection-vector.json)                       | Message/tool projection and replay, including sequences above JavaScript's safe integer range                               |
+| [user-workflows.json](user-workflows.json)                             | Shared user-operation and lifecycle fixtures                                                                                |
+| [public-interaction-contract.en.md](public-interaction-contract.en.md) | Detailed public operations, controls, state conditions, messages, and event semantics                                       |
 
 This directory is not a Maven module. The
 [durable-runtime POM](../durable-runtime/pom.xml) packages the four JSON files under
@@ -49,13 +49,13 @@ not prove that a commit, cancellation, or replay is correct.
 
 ## Boundaries and Java bindings
 
-| Boundary | Responsibility | Java entry points |
-| --- | --- | --- |
-| Public user API | Session/Thread/Turn operations, controls, history, and observation | `DurableRuntime` and its Session/Thread/Turn handles; `DurableProtocol.Endpoint.USER` |
-| Backend | Durable facts, admission, leases, atomic commits, checkpoints, and replay | `SessionBackend`; `Endpoint.BACKEND` |
-| Native Harness | Interpretation and restoration of native agent state | `HarnessAdapter` |
-| Executor | Independently queryable side effects, cancellation, and output | `Executor`; `Endpoint.EXECUTOR` |
-| Queued Brain–Hands transport | Immutable execution commands and result/output delivery | `ExecutionMessages`, `QueuedExecutor`, and Worker components |
+| Boundary                     | Responsibility                                                            | Java entry points                                                                     |
+|------------------------------|---------------------------------------------------------------------------|---------------------------------------------------------------------------------------|
+| Public user API              | Session/Thread/Turn operations, controls, history, and observation        | `DurableRuntime` and its Session/Thread/Turn handles; `DurableProtocol.Endpoint.USER` |
+| Backend                      | Durable facts, admission, leases, atomic commits, checkpoints, and replay | `SessionBackend`; `Endpoint.BACKEND`                                                  |
+| Native Harness               | Interpretation and restoration of native agent state                      | `HarnessAdapter`                                                                      |
+| Executor                     | Independently queryable side effects, cancellation, and output            | `Executor`; `Endpoint.EXECUTOR`                                                       |
+| Queued Brain–Hands transport | Immutable execution commands and result/output delivery                   | `ExecutionMessages`, `QueuedExecutor`, and Worker components                          |
 
 `DurableTypes` defines execution and storage records. `DurableMessages` defines
 typed Input, Message, Content, Source, and Artifact records. `DurableProtocol`
@@ -73,15 +73,15 @@ execution identity is not an access credential.
 
 ## Resource and execution model
 
-| Resource | Meaning and scope |
-| --- | --- |
-| Session | Identified by `{namespace, sessionId}`; owns metadata, lifecycle, and a Thread directory |
-| Thread | Identified by `{session, threadId}`; owns context, FIFO admission, checkpoints, and an execution lease |
-| Turn | A persistent logical task admitted to one Thread |
-| Run | One native invocation within a Turn |
-| Step | One execution step within a Run |
-| Execution | One independently tracked external tool operation |
-| Message | A public conversation item with a stable logical message ID |
+| Resource  | Meaning and scope                                                                                      |
+|-----------|--------------------------------------------------------------------------------------------------------|
+| Session   | Identified by `{namespace, sessionId}`; owns metadata, lifecycle, and a Thread directory               |
+| Thread    | Identified by `{session, threadId}`; owns context, FIFO admission, checkpoints, and an execution lease |
+| Turn      | A persistent logical task admitted to one Thread                                                       |
+| Run       | One native invocation within a Turn                                                                    |
+| Step      | One execution step within a Run                                                                        |
+| Execution | One independently tracked external tool operation                                                      |
+| Message   | A public conversation item with a stable logical message ID                                            |
 
 Session creation atomically creates the primary Thread, `main`. Each Thread pins
 a `ThreadBinding` containing Harness, definition version, and state version.
@@ -90,7 +90,7 @@ head Turn blocks later work in the same Thread.
 
 Sessions and Threads are `OPEN` or `CLOSED`. Nonterminal work prevents closure.
 Closing does not erase history, and retrying creation does not reopen a closed
-resource. Turn terminal states are `SUCCEEDED`, `FAILED`, `CANCELLED`, and `CONVERTED`.
+resource. Turn terminal states are `SUCCEEDED`, `FAILED`, `CANCELLED`, `INTERRUPTED`, and `CONVERTED`.
 Recovery preserves `turnId` while creating new Run/Step identities.
 
 ## Envelopes and validation
@@ -156,15 +156,15 @@ Native state remains private regardless of its transport representation.
 
 ### Errors and uncertain outcomes
 
-| Code | Default HTTP status | Client action |
-| --- | --- | --- |
-| `INVALID` | 400 | Correct the payload or operation; unchanged retries cannot fix validation |
-| `INCOMPATIBLE` | 400 | Use the supported protocol, definition, and state versions |
-| `NOT_FOUND` | 404 | Check the requested resource or receipt identity |
-| `CONFLICT` | 409 | Re-read state and resolve a content or lifecycle conflict |
-| `FENCED` | 409 | Stop using the stale lease; ownership must be acquired again |
-| `CURSOR_EXPIRED` | 410 | Replace the local projection with a snapshot and resume from its cursor |
-| `UNAVAILABLE` | 503 | Treat write outcome as unconfirmed and resolve it using the original identity |
+| Code             | Default HTTP status | Client action                                                                 |
+|------------------|---------------------|-------------------------------------------------------------------------------|
+| `INVALID`        | 400                 | Correct the payload or operation; unchanged retries cannot fix validation     |
+| `INCOMPATIBLE`   | 400                 | Use the supported protocol, definition, and state versions                    |
+| `NOT_FOUND`      | 404                 | Check the requested resource or receipt identity                              |
+| `CONFLICT`       | 409                 | Re-read state and resolve a content or lifecycle conflict                     |
+| `FENCED`         | 409                 | Stop using the stale lease; ownership must be acquired again                  |
+| `CURSOR_EXPIRED` | 410                 | Replace the local projection with a snapshot and resume from its cursor       |
+| `UNAVAILABLE`    | 503                 | Treat write outcome as unconfirmed and resolve it using the original identity |
 
 The HTTP handlers return 403 for authorization failures. Transport failures,
 lost responses, and malformed success responses do not prove that a write failed.
@@ -201,20 +201,20 @@ The following operations belong to the USER endpoint. Payload summaries omit the
 common envelope; consult `userRequest` and the operation-specific definitions in
 [schema.json](schema.json) for exact required fields and nullability.
 
-| Operations | Payload and result |
-| --- | --- |
-| `capabilities` | Empty payload; returns protocol version, public operations, registered definitions, and checkpoint Harnesses |
-| `createSession` | `session, definition, metadata`; returns SessionView and creates `main` atomically |
-| `getSession / closeSession` | `session`; returns SessionView |
-| `listSessions` | `namespace, cursor, limit`; returns SessionPage |
-| `createThread` | `session, threadId, definition`; returns ThreadView with pinned versions |
-| `getThread / closeThread` | `session, threadId`; returns ThreadView |
-| `listThreads` | `session, cursor, limit`; returns ThreadPage |
-| `submit` | `session, threadId, requestId, input`; returns TurnReceipt |
-| `getTurn / listTurns` | Thread scope plus `turnId` or `cursor, limit`; returns TurnView or TurnPage |
-| `history` | `session, threadId, cursor, limit`; returns projected public message history |
-| `getRun / listRuns` | Thread/Turn scope plus `runId` or pagination; returns RunView or RunPage |
-| `getStep / listSteps` | Thread/Turn/Run scope plus `stepId` or pagination; returns StepView or StepPage |
+| Operations                      | Payload and result                                                                                           |
+|---------------------------------|--------------------------------------------------------------------------------------------------------------|
+| `capabilities`                  | Empty payload; returns protocol version, public operations, registered definitions, and checkpoint Harnesses |
+| `createSession`                 | `session, definition, metadata`; returns SessionView and creates `main` atomically                           |
+| `getSession / closeSession`     | `session`; returns SessionView                                                                               |
+| `listSessions`                  | `namespace, cursor, limit`; returns SessionPage                                                              |
+| `createThread`                  | `session, threadId, definition`; returns ThreadView with pinned versions                                     |
+| `getThread / closeThread`       | `session, threadId`; returns ThreadView                                                                      |
+| `listThreads`                   | `session, cursor, limit`; returns ThreadPage                                                                 |
+| `submit`                        | `session, threadId, requestId, input`; returns TurnReceipt                                                   |
+| `getTurn / listTurns`           | Thread scope plus `turnId` or `cursor, limit`; returns TurnView or TurnPage                                  |
+| `history`                       | `session, threadId, cursor, limit`; returns projected public message history                                 |
+| `getRun / listRuns`             | Thread/Turn scope plus `runId` or pagination; returns RunView or RunPage                                     |
+| `getStep / listSteps`           | Thread/Turn/Run scope plus `stepId` or pagination; returns StepView or StepPage                              |
 | `getModelCall / listModelCalls` | Thread/Turn/Run scope plus `modelCallId` or nullable `stepId, cursor, limit`; returns model-call diagnostics |
 | `control` | `session, threadId, command`; returns a CommandReceipt |
 | `interactions` | `session, threadId, turnId`; returns pending interactions |
@@ -244,26 +244,26 @@ cross-Session fork requires the target Session to exist first.
 The BACKEND endpoint is privileged infrastructure. These operations include
 private state and execution authority and must not be exposed as public user RPC.
 
-| Operations | Purpose |
-| --- | --- |
-| `capabilities` | Report actual persistence and sharing guarantees |
-| `create / session / closeSession` | Create, read, and close Session resources |
-| `createThread / thread / threads / closeThread` | Manage Thread resources |
-| `sessions / listSessions` | Internal storage-key discovery / namespace-scoped public listing |
-| `submit / admission` | Admit work and query the original Session-scoped receipt |
-| `turn / turns / history / interactions / control / withdraw / cancel / signal` | Task reads and transactional controls |
-| `ready` | Select runnable work for supported Harness/version bindings |
-| `claim / renew / release` | Manage fenced Thread ownership; durations and delays are milliseconds |
-| `prepareRun / run / runs / step / steps` | Prepare native invocations and read invocation history |
-| `modelCall / modelCalls` | Read model-call provenance and usage |
-| `frame / journal` | Read private recovery state under a lease |
-| `commit / receipt / recordFailure` | Atomically commit progress, resolve commit receipts, and record recovery failures |
-| `execution / beginDispatch / acceptResult / acceptExecutionEvent` | Read persisted intent, fence dispatch, and accept execution results/events |
-| `delegate / delegation / cancelDelegation` | Atomically admit child work, retain its mapping, and persist cancellation |
-| `snapshot / events / pruneEvents` | Read public projections and replay, or prune retained events |
-| `checkpoints / checkpoint / checkpointJournal / checkpointResources / restore` | Inspect and restore retained recovery boundaries |
-| `resource` | Resolve recovery resources under fenced access |
-| `putObject / readObject / invokeObject` | Transfer private objects and invoke referenced request envelopes |
+| Operations                                                                     | Purpose                                                                           |
+|--------------------------------------------------------------------------------|-----------------------------------------------------------------------------------|
+| `capabilities`                                                                 | Report actual persistence and sharing guarantees                                  |
+| `create / session / closeSession`                                              | Create, read, and close Session resources                                         |
+| `createThread / thread / threads / closeThread`                                | Manage Thread resources                                                           |
+| `sessions / listSessions`                                                      | Internal storage-key discovery / namespace-scoped public listing                  |
+| `submit / admission`                                                           | Admit work and query the original Session-scoped receipt                          |
+| `turn / turns / history / interactions / control / withdraw / cancel / signal` | Task reads and transactional controls                                             |
+| `ready`                                                                        | Select runnable work for supported Harness/version bindings                       |
+| `claim / renew / release`                                                      | Manage fenced Thread ownership; durations and delays are milliseconds             |
+| `prepareRun / run / runs / step / steps`                                       | Prepare native invocations and read invocation history                            |
+| `modelCall / modelCalls`                                                       | Read model-call provenance and usage                                              |
+| `frame / journal`                                                              | Read private recovery state under a lease                                         |
+| `commit / receipt / recordFailure`                                             | Atomically commit progress, resolve commit receipts, and record recovery failures |
+| `execution / beginDispatch / acceptResult / acceptExecutionEvent`              | Read persisted intent, fence dispatch, and accept execution results/events        |
+| `delegate / delegation / cancelDelegation`                                     | Atomically admit child work, retain its mapping, and persist cancellation         |
+| `snapshot / events / pruneEvents`                                              | Read public projections and replay, or prune retained events                      |
+| `checkpoints / checkpoint / checkpointJournal / checkpointResources / restore` | Inspect and restore retained recovery boundaries                                  |
+| `resource`                                                                     | Resolve recovery resources under fenced access                                    |
+| `putObject / readObject / invokeObject`                                        | Transfer private objects and invoke referenced request envelopes                  |
 
 A `HarnessSelector` contains `harness, definitionVersion, stateVersion`.
 Static registrations select an exact version pair before limiting results.
@@ -368,13 +368,13 @@ cursor; disconnecting does not cancel a Turn.
 
 ## Executor operations
 
-| Operation | Payload | Meaning |
-| --- | --- | --- |
-| `capabilities` | Empty object | Report `idempotentStart`, `lookupByExecutionId`, `cancellation`, and `output` |
-| `start` | Frozen `request`, optional nullable `handle` | Start or recover the same logical execution |
-| `query` | Frozen `request`, optional nullable `handle` | Observe the original execution |
-| `cancel` | Frozen `request`, optional nullable `handle` | Request cancellation and report the observed outcome |
-| `output` | Frozen `request` and byte `offset` | Read an output page when supported |
+| Operation      | Payload                                      | Meaning                                                                       |
+|----------------|----------------------------------------------|-------------------------------------------------------------------------------|
+| `capabilities` | Empty object                                 | Report `idempotentStart`, `lookupByExecutionId`, `cancellation`, and `output` |
+| `start`        | Frozen `request`, optional nullable `handle` | Start or recover the same logical execution                                   |
+| `query`        | Frozen `request`, optional nullable `handle` | Observe the original execution                                                |
+| `cancel`       | Frozen `request`, optional nullable `handle` | Request cancellation and report the observed outcome                          |
+| `output`       | Frozen `request` and byte `offset`           | Read an output page when supported                                            |
 
 Capabilities describe actual guarantees. `NOT_FOUND` is a query observation,
 not a persisted execution outcome. An unconfirmed external outcome is `UNKNOWN`;

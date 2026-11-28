@@ -102,7 +102,7 @@ public final class DelegationExecutor implements Executor {
                 switch (turn.status()) {
                     case SUCCEEDED -> ExecutionState.SUCCEEDED;
                     case FAILED -> ExecutionState.FAILED;
-                    case CANCELLED -> ExecutionState.CANCELLED;
+                    case CANCELLED, INTERRUPTED -> ExecutionState.CANCELLED;
                     default -> ExecutionState.RUNNING;
                 };
         return new ExecutionResult(state, turn.turnId(), turn.output(), turn.error());

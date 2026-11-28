@@ -191,7 +191,10 @@ public final class SessionEventStream implements AutoCloseable {
                 if (replayCaughtUp) delivered += drainLive(sink);
                 if (filter.threadId() != null) sink.cursor(current.cursor());
                 if (expired(until)) return;
-                if (delivered == 0 && Objects.equals(before, current.cursor())) {
+                // Idle only when nothing new arrived AND the live queue is drained: a batch
+                // whose events were all filtered still leaves work behind, and waiting a
+                // whole interval for it would add latency without saving any work.
+                if (delivered == 0 && live.isEmpty() && Objects.equals(before, current.cursor())) {
                     sink.idle();
                     current.awaitChanges(waitTime(until, pollInterval));
                 }
@@ -216,7 +219,7 @@ public final class SessionEventStream implements AutoCloseable {
 
     private int drainLive(Sink sink) {
         int delivered = 0;
-        for (int i = 0; i < EventStreamOptions.LIVE_BUFFER_CAPACITY; i++) {
+        for (int i = 0; i < EventStreamOptions.LIVE_DRAIN_BATCH; i++) {
             LiveEvent event = live.poll();
             if (event == null || closed.get()) break;
             if (!previews.accepts(event)) continue;

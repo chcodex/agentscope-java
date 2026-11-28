@@ -107,8 +107,6 @@ public final class SessionEventSubscription implements AutoCloseable {
                                                         && live.offer(event)) {
                                                     changed();
                                                 }
-                                                live.add(event);
-                                                changed();
                                             });
                 } catch (RuntimeException error) {
                     logLiveFailure(error);
@@ -136,9 +134,6 @@ public final class SessionEventSubscription implements AutoCloseable {
                 signalled = true;
                 return;
             }
-            // A queued immediate delivery polls after this signal, so it observes the committed
-            // event; dropping the duplicate signal avoids an extra poll per live delta while a
-            // stream is running. Only a failed poll backs off to the interval below.
             if (immediate || (retryAfter != 0 && retryAfter - System.nanoTime() > 0)) return;
             if (scheduled != null) scheduled.cancel(false);
             schedule(0);
@@ -204,7 +199,7 @@ public final class SessionEventSubscription implements AutoCloseable {
 
     private int drainLive() {
         int delivered = 0;
-        for (int i = 0; i < EventStreamOptions.LIVE_BUFFER_CAPACITY; i++) {
+        for (int i = 0; i < EventStreamOptions.LIVE_DRAIN_BATCH; i++) {
             LiveEvent event = live.poll();
             if (event == null || closed) break;
             if (!previews.accepts(event)) continue;

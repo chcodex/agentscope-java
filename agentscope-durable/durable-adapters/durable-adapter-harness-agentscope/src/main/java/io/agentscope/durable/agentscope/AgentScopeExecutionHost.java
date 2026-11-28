@@ -686,6 +686,10 @@ final class AgentScopeExecutionHost implements AgentExecutionHost, ModelInvocati
                                                     callId, workerAttempt, seq.get());
                                     {
                                         observed.set(changed.get());
+                                        // Signals and time advance without a local commit while
+                                        // polling: refresh instead of trusting the cached frame,
+                                        // or a missing frame's deadline can never fire.
+                                        durable.refreshFrame();
                                         var frame = durable.frame();
                                         checkControl(frame.turn());
                                         if (!workerAttempt.equals(
@@ -838,6 +842,10 @@ final class AgentScopeExecutionHost implements AgentExecutionHost, ModelInvocati
                 Mono.defer(
                                 () -> {
                                     observed.set(version.get());
+                                    // Signals and time advance without a local commit while
+                                    // polling: refresh instead of trusting the cached frame, or
+                                    // a missing frame's deadline can never fire.
+                                    durable.refreshFrame();
                                     var frame = durable.frame();
                                     checkControl(frame.turn());
                                     var view = modelExecutions.query(key);

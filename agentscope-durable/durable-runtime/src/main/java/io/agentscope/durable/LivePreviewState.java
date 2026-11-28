@@ -43,6 +43,13 @@ final class LivePreviewState {
                             "output:"
                                     + EventProjection.toolId(
                                             event.threadId(), event.turnId(), event.data()));
+            case "model.call.ended" -> {
+                // A stopped partial replaces its Step's live preview, exactly like a completed
+                // message does: later live deltas for the same Step are stale replays.
+                var partial = event.data().path("partial");
+                if (partial.isObject() && event.data().hasNonNull("messageId"))
+                    remember("message:" + event.data().path("messageId").asText());
+            }
             default -> {}
         }
     }

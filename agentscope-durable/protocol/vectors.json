@@ -571,6 +571,23 @@
         }
       },
       {
+        "eventId": "model.call.ended-partial",
+        "type": "model.call.ended",
+        "runId": "run",
+        "stepId": "step",
+        "data": {
+          "modelCallId": "call",
+          "status": "CANCELLED",
+          "endedAt": 120,
+          "usage": null,
+          "messageId": "message:abc",
+          "partial": {
+            "text": "hello",
+            "interrupted": true
+          }
+        }
+      },
+      {
         "eventId": "model.request.started",
         "type": "model.request.started",
         "runId": "run",
@@ -620,6 +637,39 @@
       }
     ],
     "invalid": [
+      {
+        "eventId": "model.call.ended-partial-text-missing",
+        "type": "model.call.ended",
+        "runId": "run",
+        "stepId": "step",
+        "data": {
+          "modelCallId": "call",
+          "status": "CANCELLED",
+          "endedAt": 120,
+          "usage": null,
+          "messageId": "message:abc",
+          "partial": {
+            "interrupted": true
+          }
+        }
+      },
+            {
+        "eventId": "model.call.ended-partial-not-interrupted",
+        "type": "model.call.ended",
+        "runId": "run",
+        "stepId": "step",
+        "data": {
+          "modelCallId": "call",
+          "status": "CANCELLED",
+          "endedAt": 120,
+          "usage": null,
+          "messageId": "message:abc",
+          "partial": {
+            "text": "hello",
+            "interrupted": false
+          }
+        }
+      },
       {
         "eventId": "model.request.ended",
         "type": "model.request.ended",
